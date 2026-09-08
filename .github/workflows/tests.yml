@@ -20,8 +20,12 @@ jobs:
         include:
           - os: macos-latest
             python: "3.13"
+          - os: macos-latest
+            python: "3.14"
           - os: windows-latest
             python: "3.13"
+          - os: windows-latest
+            python: "3.14"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
