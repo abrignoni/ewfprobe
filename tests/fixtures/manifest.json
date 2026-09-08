@@ -1,0 +1,76 @@
+{
+  "raw": "source.raw",
+  "size": 3145728,
+  "sector_size": 512,
+  "sha256": "770be732aafc4962c6940a2076c35471419621d9d6ca57cda60cbd6e82a8b36f",
+  "media": [
+    {
+      "kind": "jpeg",
+      "offset": 4096,
+      "length": 10398,
+      "sha256": "c2e7569a37ae89e76ee22feedff690032efe984b6c7b5e5f0ea7c86a8c11a615"
+    },
+    {
+      "kind": "png",
+      "offset": 35840,
+      "length": 5556,
+      "sha256": "737aa0c7a2e9d0f804e863509816a07cd85ad1ea6b5d7e453406e9f9543e8c14"
+    },
+    {
+      "kind": "jpeg",
+      "offset": 49664,
+      "length": 17513,
+      "sha256": "b4738c64ca751a27a0a8419dcd63fda29622928f36deea0f30a40b089a28133c"
+    },
+    {
+      "kind": "gif",
+      "offset": 94208,
+      "length": 144,
+      "sha256": "ef6b5b32adfcffd4fce67e492bc269ed68d0680af354e41cfa00c58235418c2d"
+    },
+    {
+      "kind": "jpeg",
+      "offset": 99840,
+      "length": 5848,
+      "sha256": "21cfcbeb65df297ab140db5e696bb449b7cdf08433a82087b9259b7b0850aabd"
+    },
+    {
+      "kind": "png",
+      "offset": 144896,
+      "length": 2492,
+      "sha256": "39418422b2bd887afd1a8bd7b42e330c6ea9b81e692de20ea15ceb6713f4363f"
+    }
+  ],
+  "variants": {
+    "encase6-fast": {
+      "format": "encase6",
+      "compression": "fast",
+      "sectors_per_chunk": 64,
+      "segment_size": null,
+      "files": [
+        "encase6-fast.E01"
+      ]
+    },
+    "encase5-fast": {
+      "format": "encase5",
+      "compression": "fast",
+      "sectors_per_chunk": 64,
+      "segment_size": null,
+      "files": [
+        "encase5-fast.E01"
+      ]
+    },
+    "encase6-split": {
+      "format": "encase6",
+      "compression": "none",
+      "sectors_per_chunk": 64,
+      "segment_size": "1M",
+      "files": [
+        "encase6-split.E01",
+        "encase6-split.E02",
+        "encase6-split.E03",
+        "encase6-split.E04"
+      ]
+    }
+  }
+}
