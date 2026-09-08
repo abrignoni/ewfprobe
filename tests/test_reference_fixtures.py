@@ -124,6 +124,19 @@ def test_a_missing_segment_of_a_real_set_is_refused(tmp_path):
         ewfprobe.open_ewf(str(tmp_path / split["files"][0]))
 
 
+def test_the_image_answers_size_the_way_a_joined_raw_set_does():
+    """A consumer that opens either a single file, a joined set of raw segments
+    or an E01 asks the object for its size. Answering it here is what lets such
+    a consumer take an E01 with no special case."""
+    man = _manifest()
+    variants = dict(_variants())
+    for name in ("encase6-fast", "encase6-split"):
+        with ewfprobe.open_ewf(_first(variants[name])) as img:
+            assert img.size == img.media_size == man["size"], name
+            assert len(img.sizes) == len(variants[name]["files"]), name
+            assert all(s > 0 for s in img.sizes), name
+
+
 def test_metadata_written_by_ewfacquire_is_read_back():
     variants = dict(_variants())
     with ewfprobe.open_ewf(_first(variants["encase6-fast"])) as img:
