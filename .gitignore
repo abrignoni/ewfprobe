@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Evidence and working images never belong in this repository. The committed
+# test fixtures under tests/fixtures are the deliberate exception: they are
+# small, generated, and carry no evidence content.
+*.E0[0-9]
+*.E[1-9][0-9]
+*.raw
+!tests/fixtures/*.E*
