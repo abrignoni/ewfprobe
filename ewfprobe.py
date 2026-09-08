@@ -346,6 +346,15 @@ class EwfImage:
 
         self.chunk_size = self.sectors_per_chunk * self.sector_size
         self.media_size = self.sector_count * self.sector_size
+        # ``size`` is the byte length of the acquired disk, which is what seek
+        # and read address. A consumer that already handles a joined set of raw
+        # segments asks an image object for exactly this, so answering it here
+        # lets such a consumer take an E01 without a special case.
+        self.size = self.media_size
+        # The size each segment FILE occupies on disk. These sum to the size of
+        # the acquisition on disk, not to media_size, because the chunks in them
+        # are usually compressed.
+        self.sizes = [os.path.getsize(p) for p in self.paths]
         self._indexed_chunks = chunks
         if chunks < self._needed_chunks():
             raise EwfIncompleteSetError(
