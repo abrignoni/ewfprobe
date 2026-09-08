@@ -84,7 +84,7 @@ def sector_padded(data, sector_size=512):
 
 def write_ewf(folder, stem, data, *, chunk_size=1024, sector_size=512,
               compress=True, chunks_per_segment=None, stored_md5=True,
-              md5_override=None):
+              md5_override=None, tables_per_segment=1):
     """Write ``data`` as an EWF-E01 set and return the segment paths in order.
 
     The content is padded to a sector boundary first, because that is what an
@@ -112,10 +112,14 @@ def write_ewf(folder, stem, data, *, chunk_size=1024, sector_size=512,
                 _section(out, "volume",
                          _volume(len(chunks), sectors_per_chunk, sector_size,
                                  sector_count))
-            blob, entries = _pack_chunks(group, compress)
-            base = out.tell() + ewfprobe.SECTION_SIZE
-            _section(out, "sectors", blob)
-            _section(out, "table", _table_payload(entries, base))
+            # A real acquisition writes many sectors/table pairs per segment, so
+            # most tables are followed by a great deal more of the file.
+            per_table = -(-len(group) // tables_per_segment)
+            for j in range(0, len(group), per_table):
+                blob, entries = _pack_chunks(group[j:j + per_table], compress)
+                base = out.tell() + ewfprobe.SECTION_SIZE
+                _section(out, "sectors", blob)
+                _section(out, "table", _table_payload(entries, base))
             if last_segment:
                 if stored_md5:
                     digest = md5_override or hashlib.md5(data).digest()
@@ -310,3 +314,39 @@ def test_cli_export_round_trips(tmp_path):
     assert ewfprobe.main(
         ["export", str(tmp_path / "img.E01"), "-o", str(out), "-q"]) == 0
     assert out.read_bytes()[:len(data)] == data
+
+
+def test_a_chunk_read_is_bounded_by_what_a_chunk_can_hold(tmp_path):
+    """The last entry of a table has no next entry to bound it, and the section
+    boundary that stands in for one is the end of the segment file. Measured on a
+    238 GiB FTK Imager set, that made 471 reads averaging 773 MB, the worst 1.47 GB,
+    each to produce one 32 KiB chunk."""
+    data = sample_bytes(n_chunks=64, chunk_size=1024, tail=0)
+    path = write_ewf(tmp_path, "many", data, chunk_size=1024,
+                     tables_per_segment=8)[0]
+    with ewfprobe.open_ewf(path) as img:
+        assert len(img._tables) == 8, "the fixture is not multi-table"
+        bound = ewfprobe._compressed_bound(img.chunk_size)
+        spans = []
+        for table in img._tables:
+            last = table.first_chunk + len(table.entries) // 4 - 1
+            _seg, start, end, _c = img._chunk_location(last)
+            spans.append(end - start)
+        assert max(spans) <= bound, spans
+
+    # and the data still comes back whole, which is what the bound must not cost
+    with ewfprobe.open_ewf(path) as img:
+        assert img.read(img.media_size) == sector_padded(data)
+
+
+def test_the_bound_covers_a_chunk_that_does_not_compress(tmp_path):
+    """Incompressible content is stored rather than deflated, which is the case the
+    bound has to be generous enough for; a few bytes short would truncate a chunk."""
+    rnd = random.Random(11)
+    data = bytes(rnd.randrange(256) for _ in range(8192))
+    packed = zlib.compress(data, 9)
+    assert len(packed) >= len(data), "the fixture is meant to be incompressible"
+    assert len(packed) <= ewfprobe._compressed_bound(len(data))
+    path = write_ewf(tmp_path, "rand", data, chunk_size=8192, tables_per_segment=1)[0]
+    with ewfprobe.open_ewf(path) as img:
+        assert img.read(img.media_size) == sector_padded(data)
