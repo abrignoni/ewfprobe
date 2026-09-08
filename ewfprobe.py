@@ -30,7 +30,6 @@ reader is working, there is simply nothing plain in there to find.
 from __future__ import annotations
 
 import argparse
-import array
 import bisect
 import hashlib
 import os
@@ -237,7 +236,14 @@ def _parse_header_text(text):
 # ---------------------------------------------------------------- the reader
 
 class _Table:
-    """One table section: a run of chunk offsets sharing a base offset."""
+    """One table section: a run of chunk offsets sharing a base offset.
+
+    ``entries`` stays as the raw little-endian bytes the file holds and each
+    offset is unpacked on demand. Reading them through ``array("I")`` instead
+    would take the item size from the host's C unsigned int and need a byteswap
+    on a big-endian host, so it would depend on the machine rather than on the
+    format, and a wrong item size would misparse the table silently.
+    """
 
     __slots__ = ("segment", "base", "entries", "first_chunk", "limit")
 
@@ -375,11 +381,7 @@ class EwfImage:
         if count == 0:
             return 0
         raw = _read_exactly(fh, count * 4)
-        entries = array.array("I")
-        entries.frombytes(raw)
-        if sys.byteorder == "big":
-            entries.byteswap()
-        table = _Table(segment_index, base, entries, first_chunk, size_on_disk)
+        table = _Table(segment_index, base, raw, first_chunk, size_on_disk)
         self._table_starts.append(first_chunk)
         self._tables.append(table)
         return count
@@ -402,13 +404,14 @@ class EwfImage:
             raise EwfFormatError(f"chunk {n} is before the first table")
         table = self._tables[i]
         k = n - table.first_chunk
-        if k >= len(table.entries):
+        if (k + 1) * 4 > len(table.entries):
             raise EwfFormatError(f"chunk {n} is past the end of the chunk tables")
-        entry = table.entries[k]
+        entry = struct.unpack_from("<I", table.entries, k * 4)[0]
         start = table.base + (entry & _OFFSET_MASK)
         compressed = bool(entry & _COMPRESSED_BIT)
-        if k + 1 < len(table.entries):
-            end = table.base + (table.entries[k + 1] & _OFFSET_MASK)
+        if (k + 2) * 4 <= len(table.entries):
+            nxt = struct.unpack_from("<I", table.entries, (k + 1) * 4)[0]
+            end = table.base + (nxt & _OFFSET_MASK)
         else:
             end = table.limit
         if end <= start:
