@@ -438,7 +438,7 @@ class EwfImage:
             end = table.limit
         # The last entry of a table has no next entry to bound it, so the fallback is
         # the end of the segment file. On a real acquisition that is most of a gigabyte
-        # read and allocated to produce one 32 KiB chunk: measured on a 238 GiB FTK
+        # read and allocated to produce one 32 KiB chunk: measured on a 232.9 GiB FTK
         # Imager set of 15 segments, 471 tables whose last-chunk spans summed to 364 GB,
         # the worst single one 1.47 GB. A chunk holds chunk_size bytes, so its stored
         # form cannot be longer than deflate can make of that, whatever the section
