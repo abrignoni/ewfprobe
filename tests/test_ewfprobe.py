@@ -319,7 +319,7 @@ def test_cli_export_round_trips(tmp_path):
 def test_a_chunk_read_is_bounded_by_what_a_chunk_can_hold(tmp_path):
     """The last entry of a table has no next entry to bound it, and the section
     boundary that stands in for one is the end of the segment file. Measured on a
-    238 GiB FTK Imager set, that made 471 reads averaging 773 MB, the worst 1.47 GB,
+    232.9 GiB FTK Imager set, that made 471 reads averaging 773 MB, the worst 1.47 GB,
     each to produce one 32 KiB chunk."""
     data = sample_bytes(n_chunks=64, chunk_size=1024, tail=0)
     path = write_ewf(tmp_path, "many", data, chunk_size=1024,
