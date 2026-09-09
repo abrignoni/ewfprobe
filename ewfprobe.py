@@ -202,6 +202,17 @@ def _sections(fh, segment_path):
         offset = next_offset
 
 
+def _compressed_bound(size):
+    """The most bytes a zlib stream of ``size`` bytes can occupy.
+
+    Deflate falls back to stored blocks when nothing compresses, which costs five
+    bytes per 65,535-byte block, on top of the zlib header and the Adler-32. The
+    margin is deliberately generous: a few bytes short would truncate a chunk, and a
+    few kilobytes long costs one short read.
+    """
+    return size + 5 * (size // 65535 + 1) + 1024
+
+
 def _inflate(data):
     """Inflate a zlib stream, tolerating trailing bytes after its end."""
     obj = zlib.decompressobj()
@@ -425,6 +436,14 @@ class EwfImage:
             end = table.limit
         if end <= start:
             end = table.limit
+        # The last entry of a table has no next entry to bound it, so the fallback is
+        # the end of the segment file. On a real acquisition that is most of a gigabyte
+        # read and allocated to produce one 32 KiB chunk: measured on a 238 GiB FTK
+        # Imager set of 15 segments, 471 tables whose last-chunk spans summed to 364 GB,
+        # the worst single one 1.47 GB. A chunk holds chunk_size bytes, so its stored
+        # form cannot be longer than deflate can make of that, whatever the section
+        # boundary says.
+        end = min(end, start + _compressed_bound(self.chunk_size))
         return table.segment, start, end, compressed
 
     def _chunk(self, n):
