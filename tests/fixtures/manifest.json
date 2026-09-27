@@ -507,5 +507,102 @@
         ]
       }
     }
+  },
+  "encrypted_aff": {
+    "writer": "AFFLIB 3.7.22",
+    "password": "ewfprobe-aff-password",
+    "key": "aff-enc-test-key.pem",
+    "certificate": "aff-enc-test-cert.pem",
+    "variants": {
+      "aff-enc-pass": {
+        "encryption": "passphrase",
+        "opens_with": [
+          "password"
+        ],
+        "options": [
+          "-s64k"
+        ],
+        "files": [
+          "aff-enc-pass.aff"
+        ],
+        "afflib_reads": true
+      },
+      "aff-enc-lzma": {
+        "encryption": "passphrase",
+        "opens_with": [
+          "password"
+        ],
+        "options": [
+          "-L",
+          "-s64k"
+        ],
+        "files": [
+          "aff-enc-lzma.aff"
+        ],
+        "afflib_reads": true
+      },
+      "aff-enc-afd": {
+        "encryption": "passphrase",
+        "opens_with": [
+          "password"
+        ],
+        "options": [
+          "-s64k",
+          "-M32k"
+        ],
+        "files": [
+          "aff-enc-afd.afd/file_000.aff",
+          "aff-enc-afd.afd/file_001.aff",
+          "aff-enc-afd.afd/file_002.aff",
+          "aff-enc-afd.afd/file_003.aff",
+          "aff-enc-afd.afd/file_004.aff"
+        ],
+        "afflib_reads": true,
+        "image": "aff-enc-afd.afd"
+      },
+      "aff-enc-both": {
+        "encryption": "passphrase and certificate",
+        "opens_with": [
+          "password",
+          "private key"
+        ],
+        "options": [
+          "-s64k"
+        ],
+        "files": [
+          "aff-enc-both.aff"
+        ],
+        "afflib_reads": true,
+        "afflib_reads_with_key": true
+      },
+      "aff-enc-inplace-pass": {
+        "encryption": "passphrase, in place",
+        "opens_with": [
+          "password"
+        ],
+        "options": [
+          "-s64k"
+        ],
+        "files": [
+          "aff-enc-inplace-pass.aff"
+        ],
+        "afflib_reads": false,
+        "header_lost": true
+      },
+      "aff-enc-inplace-cert": {
+        "encryption": "certificate, in place",
+        "opens_with": [
+          "private key"
+        ],
+        "options": [
+          "-s64k"
+        ],
+        "files": [
+          "aff-enc-inplace-cert.aff"
+        ],
+        "afflib_reads": false,
+        "header_lost": true
+      }
+    }
   }
 }

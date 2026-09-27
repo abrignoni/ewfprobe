@@ -49,16 +49,19 @@ ewfprobe files   evidence.ad1     # an AD1's entries, with their item types
 ewfprobe verify  evidence.ad1     # FTK Imager's image hash, and every entry's
 ewfprobe info    --password-file pw.txt encrypted.dmg
 ewfprobe verify  --password-env CASE_PW evidence.E01   # FTK Imager AD encryption
+ewfprobe verify  --private-key examiner.pem sealed.aff  # AFF sealed to a certificate
 ```
 
 `verify` exits non-zero when the recomputed hash does not match the one the
 acquisition recorded.
 
-An encrypted image (an Apple disk image, or an acquisition FTK Imager wrote with AD
-encryption) needs its password. `--password-file FILE` reads it
+An encrypted image (an Apple disk image, an acquisition FTK Imager wrote with AD
+encryption, or an encrypted AFF) needs its password. `--password-file FILE` reads it
 from the first line of a file and `--password-env NAME` from an environment
 variable; without either, ewfprobe asks for it at a terminal. It is never taken as
 an argument's value, which would put it in the process list and the shell history.
+An AFF sealed to a certificate opens instead with that certificate's RSA private key,
+given unencrypted, as PEM or DER, with `--private-key FILE`.
 
 ## What it reads
 
@@ -86,6 +89,19 @@ missing from the file is read the way AFFLIB reads it, filled with the file's ow
 bad-sector marker, and `info` and `verify` count it. FTK Imager's AFF stores no
 hash of the disk (FTK Imager keeps its hashes in its text log), so `verify` has
 nothing to compare against on one.
+
+Reads encrypted AFF, as AFFLIB encrypts it (`lib/crypto.cpp`): every segment stored
+AES-256-CBC but a few (on the files AFFLIB 3.7.22 wrote, the bad-sector marker and
+count, the AFFLIB version, the creator, the file type and the key segments), opened
+with the passphrase (which AFFLIB
+hashes with SHA-256 to unwrap the file's key) or with the private key of a
+certificate the image is sealed to (an RSA envelope). Both need the optional
+pycryptodome package, which the release executables carry. `info` says which one
+opened it. AFFLIB 3.7.22's `affcrypto -e`, which encrypts an existing AFF in place,
+wrote its first re-encrypted segment over the file's header, with Homebrew's build on
+macOS and with Ubuntu 26.04's package alike; AFFLIB could not open those files
+afterwards, and every segment in them was intact.
+ewfprobe reads such a file from its segments and `info` says the header was lost.
 
 Reads AFD, the form of AFF split across files: a directory named `.afd` holding
 ordinary AFF files, which AFFLIB names `file_000.aff`, `file_001.aff` and on.
@@ -482,8 +498,9 @@ Refused with a message naming the reason rather than read wrongly:
 - **An encrypted QCOW** (AES or LUKS) and a QCOW setting an incompatible feature this
   reader does not know.
 - **A difference disk whose parent is missing, or is not the parent it records.**
-- **Encrypted AFF**, and **AFF pages compressed with bzip2**, which AFFLIB itself
-  never implemented.
+- **AFF pages compressed with bzip2**, which AFFLIB itself never implemented, and
+  **an encrypted AFF** without its passphrase or key, or with an RSA private key that
+  is itself encrypted (give it unencrypted).
 - **An AFF file with no image size.** AFF records the size when the acquisition
   finishes, so its absence means the file may be incomplete.
 - **An AFD with a gap in its file numbering**, or whose files disagree on a page,
@@ -572,8 +589,22 @@ occur, and one written by FTK Imager 4.7.3.61. FTK Imager's AFF names AFFLIB
 3.7.18 as its writer, so it is a second AFFLIB version rather than an independent
 implementation. Every one reproduces the source, and the three from `affconvert`
 match the MD5 and SHA-1 they recorded. A writer in the test suite covers the
-cases the fixtures cannot: a missing page, encrypted segments, a truncated file,
-the older `seg` page names, and an image size above 4 GiB.
+cases the fixtures cannot: a missing page, encrypted segments with no key, a
+truncated file, the older `seg` page names, and an image size above 4 GiB.
+
+Encrypted AFF is covered by six fixtures AFFLIB 3.7.22 wrote from the same source:
+written encrypted by `affconvert` with a passphrase (deflate, LZMA, and an AFD over
+five files), one sealed to a test certificate as well (`affcrypto -A`), and two
+encrypted in place by `affcrypto -e`, one with a passphrase and one with a
+certificate only. Every one reproduces the source with each key that opens it and
+matches the MD5 and SHA-1 it recorded, which are encrypted segments themselves.
+AFFLIB's `affconvert -r` read the first four back to the source before they were
+kept and refused the two encrypted in place; the same `affcrypto -e` from Ubuntu
+26.04's AFFLIB 3.7.22 package left a file of the same shape. A wrong passphrase, a
+key that opens none of the sealed keys, a sealed key whose inner layer is damaged, a
+key segment padded to 56 bytes and a clear copy of an encrypted segment are tested
+by editing those files. Sixteen deliberate breaks of the encrypted AFF code are
+each caught by the tests.
 
 AFD is covered by two fixtures. One is written by `affconvert -s64k -M32k`, which
 spreads the 48 pages over five files, with none in the first and the image size
@@ -844,6 +875,14 @@ flag values in its public header, `include/afflib/afflib.h`, in the
 [sshock/AFFLIBv3](https://github.com/sshock/AFFLIBv3) repository, and for AFD how
 AFFLIB finds, names and joins the files of one, in `lib/vnode_afd.cpp` at commit
 [`f35df6c`](https://github.com/sshock/AFFLIBv3/blob/f35df6c1d2610e3233c30d50054c00e29d7d5a23/lib/vnode_afd.cpp).
+For encrypted AFF, at tag v3.7.22
+([`f6e51a8`](https://github.com/sshock/AFFLIBv3/tree/f6e51a8367cff73ea24c0adf09e533483c80ecd4)):
+the key segments and their unwrapping in
+[`lib/crypto.cpp`](https://github.com/sshock/AFFLIBv3/blob/f6e51a8367cff73ea24c0adf09e533483c80ecd4/lib/crypto.cpp#L154-L279)
+(the passphrase) and
+[lines 793 to 981](https://github.com/sshock/AFFLIBv3/blob/f6e51a8367cff73ea24c0adf09e533483c80ecd4/lib/crypto.cpp#L793-L981)
+(a certificate), and the segment cipher in `af_aes_decrypt` and `af_update_segf`,
+[`lib/afflib.cpp`](https://github.com/sshock/AFFLIBv3/blob/f6e51a8367cff73ea24c0adf09e533483c80ecd4/lib/afflib.cpp#L643-L834).
 No AFFLIB code is copied.
 
 For AFF4: the AFF4 Standard v1.0a (Bradley Schatz and Michael Cohen),
