@@ -1,6 +1,6 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`), AFF (`.aff`, `.afd`) and AFF4 (`.aff4`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.sparsebundle`), and EnCase logical evidence (`.L01`). One file, pure
+A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`), AFF (`.aff`, `.afd`) and AFF4 (`.aff4`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.sparsebundle`), and logical evidence, EnCase's (`.L01`) and FTK Imager's (`.ad1`). One file, pure
 Python, standard library only. No compiler, no network, nothing to install (an
 LZFSE-compressed `.dmg` needs the optional `pyliblzfse` package, and an encrypted Apple
 disk image or an acquisition FTK Imager encrypted with AD encryption the optional
@@ -45,6 +45,8 @@ ewfprobe verify  acquisition.dmg  # also checks the checksums a .dmg records
 ewfprobe verify  image.aff4       # and the hashes an AFF4 records about its streams
 ewfprobe files   evidence.L01     # an L01's entries: kind, size, stored MD5, path
 ewfprobe export  evidence.L01 --entry "Folder/photo.jpg" -o photo.jpg
+ewfprobe files   evidence.ad1     # an AD1's entries, with their item types
+ewfprobe verify  evidence.ad1     # FTK Imager's image hash, and every entry's
 ewfprobe info    --password-file pw.txt encrypted.dmg
 ewfprobe verify  --password-env CASE_PW evidence.E01   # FTK Imager AD encryption
 ```
@@ -191,6 +193,79 @@ Times (`cr`, `ac`, `wr`, `mo`, `dl`, `aq`) are read as the POSIX values the
 specification describes. None of the tested files sets them, so that part rests on
 the specification alone.
 
+Reads AD1, FTK Imager's logical image, in files named `.ad1`, `.ad2` and on, from any
+of them, and an AD-encrypted set with its password. Entries come through the same
+interface as an L01's: `logical_entries` in the order the items lie in the image (each
+folder's children before its next sibling), `find_entry()`, `open_entry()`,
+`read_entry()`, and `ewfprobe files` and `export --entry`. The image's stream is its
+logical space, every file's data with its 512-byte margin left out, back to back,
+which is what the image's addresses point into.
+
+```python
+with ewfprobe.open_ewf("evidence.ad1") as img:
+    for entry in img.logical_entries:
+        print(entry.path, entry.size, entry.md5, entry.times.get("modified"))
+```
+
+Each entry carries its names, its size, its item type (`item_type`), and from its
+metadata records its stored MD5 and SHA-1, `type_code` (the text of record 2/0x2),
+`is_folder`, `is_deleted` and `times`. `metadata` reads every record as stored, keyed
+by category and key; an entry imaged from NTFS carries dozens (owner, security
+descriptor, NTFS times and flags), so they are read from the image when asked for
+rather than kept. In an image of several sources the top entries are named
+for their sources, such as `U:\:AD1LEAN [NTFS]`. Paths can repeat.
+
+Measured on images FTK Imager 4.7.3.61 wrote from folders of known content in a
+Windows VM set to UTC-4, and checked against FTK Imager's own directory listing of
+each image (the `.csv` it writes beside it):
+
+- **The three time records hold UTC, to the microsecond.** Record 5/0x08 is the time
+  created and 5/0x09 the time last modified, as Windows reported them for every file
+  before imaging and as FTK's listing names them on all 55 rows of four images; 5/0x07
+  is the time accessed. pyad1's notes call 0x08 the modification time and 0x09 the
+  creation time, and AD1-tools calls them modified and change.
+  `times` holds them as POSIX seconds under "created", "modified" and "accessed".
+  Imaging a folder through Windows set the files' access times, so "accessed" is the
+  time FTK read the file, not what the file carried before.
+- **Item type 5 is a folder and 2 an entry FTK's listing marks deleted.** Imaged from an
+  NTFS volume, a file deleted before imaging came back as an item of type 2 holding the
+  file's 37 bytes, and on one of the two images also as a second, empty item of type 2
+  whose `type_code` is `61`, listed as deleted with no size; a file with an alternate
+  data stream as type 1, with the stream as a child item whose `type_code` is `D`; and
+  folders with data of their own (160 bytes for one) beside their children. Imaged from
+  a folder, every file was type 0 and folders held no data. A public AD1 of an NTFS
+  volume (below) also carries `type_code` `6` on 27,206 items, each named after a file
+  beside it with `.FileSlack` appended, and `F` on 5,732 items, each named `$I30`. Only
+  types 5 and 2 are given a meaning here; the rest are reported as stored.
+- **Records 4/0x1002, 4/0x1004 and 4/0x1005** were `true` on exactly the hidden, the
+  read-only and the archive files, as AD1-tools names them.
+- **The footer is two blocks**, `ATTRGUID` at the footer address the logical header
+  gives and `LOCSGUID` at its second footer address, each an 8-byte tag, a zero and a
+  count of 20-byte entries (a 4-byte number and a 16-byte GUID). Its length follows
+  from the counts (372 bytes on one committed image, 1,492 on another, 2,012 on the
+  public image below), and on all eight AD1s at hand (six from FTK Imager 4.7.3.61,
+  pyad1's from 3.4.3.3, and the public image) the second block ends where the data
+  ends. A last file whose footer runs past its end is refused as cut short, and one
+  with bytes after its footer is refused too.
+- **The recorded segment size is a whole number of MiB**, and every file but the last
+  is exactly that long, its 512-byte margin included: 1,048,576 bytes on the set
+  written in 1 MB fragments, 1,572,864,000 (1,500 MiB) on an image written as one file
+  of 35,556 bytes, and 10,485,758,951,424 (9,999,999 MiB) on the public image (below),
+  also one file. So a file shorter than that is refused as cut short unless it is the
+  last of its set, whose end the footer gives instead.
+- **Compression 0 still writes zlib streams**, of stored blocks.
+
+`verify` computes FTK Imager's own image hash, the MD5 and SHA-1 its log records, and
+checks every entry's stored MD5 and SHA-1 against its content. That hash is taken over
+the logical header up to the first item, then the footer, then each item's header and
+metadata records in the order they lie in the image, and last the digest of all the
+items' content; chunk tables and compressed data are not in it. The order is pyad1's
+reader, followed here through the image's own addresses. The image does not record the
+hash itself, so it is compared with FTK Imager's log beside the image,
+`<first file>.txt`, when that is there, and `info` names the log. An AD1 set encrypted
+with AD encryption decrypts as the E01 and raw sets above do, only its first file
+carrying the header, and FTK's log hash matches what it decrypts to.
+
 Reads Apple disk images: UDIF (`.dmg`), the format `hdiutil` writes and macOS
 acquisition tools deliver, including one `hdiutil segment` split into `.dmgpart`
 files, sparse images (`.sparseimage`) and sparse bundles (`.sparsebundle`). Fuji, the open-source
@@ -305,8 +380,8 @@ seen) of the password's UTF-8 bytes, over the header's salt and iteration count
 (4,000); the header's HMAC of the encrypted file key, under that hash, checks the
 password; and the file key is decrypted from the header with AES-CTR from counter 0.
 `is_adcrypt()` tells whether a file begins with the header and `adcrypt_set()` lists
-the files of the set a path belongs to. An AD1 (FTK's logical image) is recognised
-inside and refused, as is an image protected by a certificate rather than a password.
+the files of the set a path belongs to. An AD1 inside reads as described below, and
+an image protected by a certificate rather than a password is refused.
 
 A sparse image longer than about a gigabyte of written bands carries more than one
 header. Measured on images `hdiutil` wrote, beyond what the format documentation
@@ -318,7 +393,8 @@ slots from offset 56 and names the next one at offset 12. The disk's sector coun
 
 `open_image()` is the same function as `open_ewf()`. `is_image()` is true for the
 disk images ewfprobe reads (EWF, EWF2, AFF, an AFD directory, AFF4, UDIF, sparse images
-and sparse bundle folders), `is_logical_evidence()` for an L01, `is_ewf()` for EWF alone,
+and sparse bundle folders), `is_logical_evidence()` for an L01 or an AD1 (`is_ad1()` for
+AD1 alone, `ad1_segments()` for the files of its set), `is_ewf()` for EWF alone,
 and `apple_image_kind()` names an Apple disk image as `UDIF`, `SPARSEIMAGE`,
 `SPARSEBUNDLE` or `ENCRYPTED` (any encrypted one, which `is_image()` leaves out
 because it opens only with its password). `is_image()` leaves out an AD-encrypted
@@ -336,6 +412,14 @@ Refused with a message naming the reason rather than read wrongly:
   size or the entry list, and **an L01 entry** whose extents are shorter than its
   size, reach past the media data, carry an extent type, or give a duplicate
   offset without the sparse flag. None of those occur in the tested files.
+- **AD1 other than version 4**, the version FTK Imager 3.4.3.3 and 4.7.3.61 write.
+  pyad1's notes describe a version 3 with a different header; no sample has been
+  available. Also **an AD1 set with a file missing, cut short or out of place**, whose
+  files disagree about the set, whose margin is not 512 bytes, whose footer does not
+  end where its data ends, whose item tree loops or places an item under a parent
+  other than the one it names, or whose entry's chunk table does not fit its size. An
+  entry whose chunk does not inflate fails when read, and `verify` reports it as a
+  mismatch.
 - **Encrypted AFF**, and **AFF pages compressed with bzip2**, which AFFLIB itself
   never implemented.
 - **An AFF file with no image size.** AFF records the size when the acquisition
@@ -472,6 +556,33 @@ publishes its scenario data under CC0, excluding any material inside an image th
 claims its own copyright. No L01 from another writer has been available; a writer
 in the suite built from the specification and from the layout of these files
 covers the behaviours that file does not exercise.
+
+AD1 was checked against images FTK Imager wrote, with FTK Imager as the oracle. Three
+were made with FTK Imager 4.7.3.61 from a folder of known content, recorded file by file
+(size, MD5, SHA-1, times) before imaging: compression 0 in four 1 MB files, compression
+6 with AD encryption, and two sources in one image, the folder on an NTFS volume with an
+alternate data stream and a deleted file, and a second folder. On each, every file's
+content, stored MD5 and SHA-1, and created and modified times match what Windows
+recorded before imaging, the stream and the deleted file hold the bytes written to them,
+every row of FTK's own listing matches its entry's times and deleted flag, and the image
+hash matches the MD5 and SHA-1 in FTK's log; they are committed under
+`tests/fixtures/ad1` with their logs and listings. Three larger ones made the same way
+(the same kinds, with a 3 MiB file of incompressible bytes) also match their logs; they
+are not committed. The four files FTK Imager 3.4.3.3 wrote for pyad1's tests
+(Apache-2.0, fetched by CI from
+[pcbje/pyad1](https://github.com/pcbje/pyad1/tree/74b21889410fb40b96e3f1f1f6ab369019d6984d/test_data)
+at `74b2188`) match their log too, with all 8 files' stored hashes. A public AD1 of an
+NTFS volume, `userbss.ad1` from Hexordia's 2025 Magnet Virtual Summit CTF dataset
+([listed on NIST CFReDS](https://cfreds.nist.gov/all/Hexordia/2025MVSCTF);
+51,678,663,221 bytes, SHA-256
+`743e1e89e1d4fa9d6f75d91e820f6dd02d2d906e1bab70eb4731a2fdb4458e7c`), opens in about 23
+seconds on an Apple M2 Max, using under 400 MB of memory, and lists 316,682 entries.
+`verify` read all 132.4 GB of their content in 12 minutes, and the stored MD5 and SHA-1
+of every one of the 299,729 entries that carry them match. Both counts are the ones
+[ad1-forensic reports for the same
+image](https://github.com/SecurityRonin/ad1-forensic/blob/afc3963659a13acf10082e7d76194d3ab789583e/docs/validation.md#L48-L53).
+Its log is not published, so its image hash is computed with nothing to compare it with.
+Twenty-one deliberate breaks of the AD1 code are each caught by the tests.
 
 **Apple disk images, against Apple's own tools.** `hdiutil` wrote every format in
 the table above from the 3 MiB source the other fixtures use, and those images are
@@ -612,6 +723,14 @@ python tools/make_aff4_fixtures.py tests/fixtures --pyaff4
 EWFPROBE_AFF4_REFERENCE=/path/to/ReferenceImages python -m pytest tests/test_aff4.py -q
 ```
 
+The AD1 fixtures in `tests/fixtures/ad1` were written by FTK Imager, as described under
+validation, and are not regenerated. pyad1's test data is read from a folder holding it;
+with `EWFPROBE_REQUIRE_AD1_REFERENCE=1` a missing one fails rather than skips:
+
+```
+EWFPROBE_AD1_REFERENCE=/path/to/pyad1/test_data python -m pytest tests/test_ad1.py -q
+```
+
 That tool shells out to `ewfacquire`, `affconvert` and `hdiutil` and is for development only.
 libewf and AFFLIB are used there solely to produce test data. Nothing from them
 ships and `ewfprobe` imports nothing.
@@ -691,6 +810,20 @@ also give the version 1 signature), and kev365/xways-imageio-dmg, `encrypted_sou
 ([lines 30 to 98](https://github.com/kev365/xways-imageio-dmg/blob/406e738d1a43dfcb9d8f421d33a31d43078fb4b5/encrypted_source.cpp#L30-L98)
 at `406e738`), both MIT. No code from either is copied. What current macOS writes
 differently was measured, as described above.
+
+For AD1: Petter Chr. Bjelland's *AccessData Format (AD1)* notes, in
+[pcbje/pyad1](https://github.com/pcbje/pyad1/blob/74b21889410fb40b96e3f1f1f6ab369019d6984d/documentation/AccessData%20Format%20(AD1).asciidoc)
+at `74b2188` (Apache-2.0), for the margin, the logical header, items, chunk tables and
+metadata records, and the structures in al3ks1s/AD1-tools,
+[`libad1/libad1_definitions.h`, lines 11 to 83](https://github.com/al3ks1s/AD1-tools/blob/2b4eec5d56cacd71717cf239d40de9a8d70fc6f4/AD1Tools/libad1/libad1_definitions.h#L11-L83)
+at `2b4eec5`, for the addresses in the version 4 header and the metadata categories and
+keys ([lines 133 to 160](https://github.com/al3ks1s/AD1-tools/blob/2b4eec5d56cacd71717cf239d40de9a8d70fc6f4/AD1Tools/libad1/libad1_definitions.h#L133-L160)).
+The image hash follows pyad1's reader,
+[`pyad1/reader.py`, lines 100 to 183](https://github.com/pcbje/pyad1/blob/74b21889410fb40b96e3f1f1f6ab369019d6984d/pyad1/reader.py#L100-L183):
+the content hash's raw digest, not its hex form as the notes say, goes last
+([line 183](https://github.com/pcbje/pyad1/blob/74b21889410fb40b96e3f1f1f6ab369019d6984d/pyad1/reader.py#L183)).
+No code from either is copied. What the time records and item types mean was measured,
+as described above.
 
 For FTK Imager's AD encryption: the "AD encryption" section of the EWF documentation
 above ([lines 3376 to 3465 at `d76fd0b`](https://github.com/libyal/libewf/blob/d76fd0bb21601e2969bc88ffdaeb861023f6a5b2/documentation/Expert%20Witness%20Compression%20Format%20(EWF).asciidoc?plain=1#L3376-L3465)),

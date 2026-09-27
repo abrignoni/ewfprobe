@@ -245,12 +245,25 @@ def test_a_header_cut_short_is_refused(tmp_path):
         ewfprobe.open_ewf(str(lone), password=PASSWORD)
 
 
-def test_an_encrypted_ad1_is_refused_as_logical(tmp_path):
-    plain = tmp_path / "plain.ad1"
-    plain.write_bytes(b"ADSEGMENTEDFILE\x00" + bytes(1000))
+def test_an_encrypted_ad1_set_reads_as_the_plain_one(tmp_path):
+    plain = [os.path.join(FIXTURES, "ad1", f"lean-src-c0-1mb.ad{n}") for n in range(1, 5)]
+    out = [str(tmp_path / f"evidence.ad{n}") for n in range(1, 5)]
+    write_adcrypt(plain, out)
+    with ewfprobe.open_ewf(plain[0]) as want, \
+            ewfprobe.open_ewf(out[2], password=PASSWORD) as img:
+        assert img.format == ewfprobe.FORMAT_AD1 and len(img.paths) == 4
+        entries = [(e.path, e.size, e.md5) for e in img.logical_entries]
+        assert entries == [(e.path, e.size, e.md5) for e in want.logical_entries]
+        result = img.verify()
+    assert result["entry_md5_checked"] == 8 and not result["entry_md5_mismatched"]
+
+
+def test_an_ad1_name_that_decrypts_to_something_else_is_refused(tmp_path):
+    plain = tmp_path / "plain"
+    plain.write_bytes(bytes(4096))
     out = str(tmp_path / "evidence.ad1")
     write_adcrypt([str(plain)], [out])
-    with pytest.raises(ewfprobe.EwfFormatError, match="AD1 logical image"):
+    with pytest.raises(ewfprobe.EwfFormatError, match="not AD1"):
         ewfprobe.open_ewf(out, password=PASSWORD)
 
 

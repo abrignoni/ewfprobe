@@ -8,20 +8,22 @@ ewfprobe, built as a standalone executable
                           ewfprobe export image.E01 -o image.raw
                           ewfprobe files  evidence.L01
                           ewfprobe export evidence.L01 --entry "Folder/a.jpg" -o a.jpg
+                          ewfprobe files  evidence.ad1
                           ewfprobe --help
                       On Windows write ewfprobe.exe; on macOS and Linux write
                       ./ewfprobe from this folder. It reads .E01, .s01, .Ex01,
                       .aff, .afd and .aff4 disk images, Apple .dmg,
                       .sparseimage and .sparsebundle disk images, and the
-                      files in an .L01. For a split set, keep every segment
-                      (.E01, .E02, ..., a .dmg and its .dmgpart files, or
-                      the files of a striped .aff4) in one folder and name
-                      the first. Name a .sparsebundle folder itself. An
+                      files in an .L01 or an FTK Imager .ad1. For a split
+                      set, keep every segment (.E01, .E02, ..., .ad1, .ad2,
+                      ..., a .dmg and its .dmgpart files, or the files of a
+                      striped .aff4) in one folder and name the first. Name a .sparsebundle folder itself. An
                       LZFSE-compressed .dmg needs the Python package
                       pyliblzfse, which this executable does not include;
                       run python3 ewfprobe.py with it installed.
-                      An encrypted .dmg, .sparseimage or .sparsebundle opens
-                      with its password: ewfprobe asks for it, or give it
+                      An encrypted .dmg, .sparseimage or .sparsebundle, and
+                      an E01, SMART, raw or .ad1 set FTK Imager encrypted
+                      with AD encryption, opens with its password: ewfprobe asks for it, or give it
                       with --password-file FILE (the first line of FILE)
                       or --password-env NAME (an environment variable).
 

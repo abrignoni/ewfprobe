@@ -13,8 +13,9 @@ sparse images (.sparseimage) and sparse bundles (.sparsebundle). An LZFSE .dmg
 (ULFO) needs the optional pyliblzfse package. An Apple disk image encrypted with a
 password (hdiutil -encryption, AES-128 or AES-256) opens with that password and
 needs the optional pycryptodome package, and so does an E01, SMART or raw (dd) set
-FTK Imager encrypted with AD encryption. From an L01, EnCase's logical evidence, it
-lists the files collected and reads each one's content.
+FTK Imager encrypted with AD encryption. From an L01, EnCase's logical evidence, and
+an AD1, FTK Imager's (AD-encrypted or not), it lists the files collected and reads
+each one's content.
 
     with ewfprobe.open_ewf("evidence.E01") as img:
         img.seek(0)
@@ -45,21 +46,24 @@ read from the layout two MIT-licensed readers publish, nlitsme/encrypteddmg and
 kev365/xways-imageio-dmg, with what differs on current macOS measured on images
 hdiutil wrote; no code from either is copied. AD encryption follows the "AD
 encryption" section of the EWF documentation, with what it leaves open measured on
-sets FTK Imager wrote.
+sets FTK Imager wrote. The AD1 reader follows Petter Chr. Bjelland's notes and reader
+(pcbje/pyad1, Apache-2.0) and the structures of al3ks1s/AD1-tools, with what the time
+records and item types mean measured on images FTK Imager wrote; no code from either
+is copied.
 
 Scope. This reads EWF-E01, the format EnCase 6 and 7 and FTK Imager write and
 by far the most common one in the field, EWF-S01, the variant ASR Data's SMART
 writes, EWF2-Ex01, which EnCase 7 and later write, AFF, including AFD, and
-EWF-L01 logical evidence, and UDIF, sparse image and sparse bundle Apple disk
-images, encrypted with a password or not, AD-encrypted E01, SMART and raw sets, and
-AFF4 containers, standard and pre-standard, striped or not.
-It does not read Lx01 logical evidence, encrypted AFF4 or AFF4-L, an AD1 or an
-AD-encrypted image protected by a certificate, an Apple disk image unlocked by a
-certificate or a keybag rather than a password, or one in the older version 1
-encrypted format (cdsaencr), encrypted Ex01 images (the encryption is not publicly
-documented), Ex01 images compressed with bzip2 (no sample exists to validate
-against), encrypted AFF, or AFM (AFF metadata beside split raw files), and it never
-writes.
+EWF-L01 logical evidence, FTK Imager's AD1 (version 4), and UDIF, sparse image and
+sparse bundle Apple disk images, encrypted with a password or not, AD-encrypted E01,
+SMART, raw and AD1 sets, and AFF4 containers, standard and pre-standard, striped or
+not. It does not read Lx01 logical evidence, encrypted AFF4 or AFF4-L, an AD1 other
+than version 4, an AD-encrypted image protected by a certificate, an Apple disk
+image unlocked by a certificate or a keybag rather than a password, or one in the
+older version 1 encrypted format (cdsaencr), encrypted Ex01 images (the encryption
+is not publicly documented), Ex01 images compressed with bzip2 (no sample exists to
+validate against), encrypted AFF, or AFM (AFF metadata beside split raw files), and
+it never writes.
 
 An image whose content is encrypted at rest, by BitLocker or FileVault or an
 encrypted APFS volume, reads back as the ciphertext that was acquired: the
@@ -70,6 +74,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import datetime
 import errno
 import getpass
 import hashlib
@@ -94,7 +99,7 @@ try:
 except ImportError:
     lzma = None
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # ---------------------------------------------------------------- constants
 
@@ -127,6 +132,7 @@ FORMAT_E01 = "EWF-E01"
 FORMAT_S01 = "EWF-S01"
 FORMAT_EX01 = "EWF2-Ex01"
 FORMAT_L01 = "EWF-L01"
+FORMAT_AD1 = "AD1"
 
 # EWF2 (Ex01). A 32-byte file header, then sections whose 64-byte descriptor sits
 # AFTER the section's data and points back at the previous descriptor, so a
@@ -811,11 +817,18 @@ def adcrypt_set(path):
     """The files of the AD-encrypted set ``path`` belongs to, first file first, or
     None when it is not one. Only the first file carries the header, so a later
     numbered segment of a raw set is recognised by its first sibling; an EWF set
-    (E01, SMART, Ex01) is joined by its extension sequence from its first file."""
+    (E01, SMART, Ex01) is joined by its extension sequence from its first file, and
+    an AD1 set by its .ad1, .ad2, ... names, from any of them."""
     if os.path.isdir(path):
         return None
+    name = os.path.basename(path)
+    if _ad1_named(name):
+        try:
+            files = ad1_segments(path)
+        except EwfFormatError:
+            files = []
+        return files if files and is_adcrypt(files[0]) else None
     if is_adcrypt(path):
-        name = os.path.basename(path)
         ext = name.rpartition(".")[2] if "." in name else ""
         if ext.isascii() and ext.isdigit():
             return _numbered_set(path) or [os.path.abspath(path)]
@@ -1075,13 +1088,15 @@ def udif_segments(path, password=None, _keys=None) -> list[str]:
 
 
 def is_logical_evidence(path) -> bool:
-    """True when the file begins with the L01 signature, logical evidence ewfprobe
-    reads as a tree of files."""
+    """True when the file begins with the L01 or AD1 signature, logical evidence
+    ewfprobe reads as a tree of files. An AD-encrypted AD1 is not counted, because it
+    opens only with its password; is_adcrypt reports it."""
     try:
         with open(path, "rb") as fh:
-            return fh.read(8) == LVF_SIGNATURE
+            head = fh.read(len(AD1_SIGNATURE))
     except OSError:
         return False
+    return head[:8] == LVF_SIGNATURE or head == AD1_SIGNATURE
 
 
 def _is_aff(path):
@@ -2507,6 +2522,245 @@ class _Aff4Map:
         return totals
 
 
+# ---------------------------------------------------------------- AD1
+
+# AD1 is FTK Imager's logical image. The layout follows Petter Chr. Bjelland's
+# "AccessData Format (AD1)" notes (pcbje/pyad1, documentation/) and the structures
+# of al3ks1s/AD1-tools (libad1/libad1_definitions.h); no code from either is
+# copied. What they leave open or label with a question mark was measured on images
+# FTK Imager 3.4.3.3 and 4.7.3.61 wrote, as the README records.
+#
+# Every file of a set (.ad1, .ad2, ...) begins with a 512-byte margin: a
+# signature, two fields that held 1 and 2 on every image here, the file's number
+# from 1, the number of files, the size of every file but the last, and the
+# margin's own size. The data
+# of the files with their margins left out, back to back, is the logical space the
+# image's addresses point into.
+_AD1_SEGMENT = struct.Struct("<16sIIIIQI")
+_AD1_MARGIN = 512
+AD1_LOGICAL_SIGNATURE = b"ADLOGICALIMAGE\x00\x00"
+# The logical header, version 4: signature, version, a field that held 1, the chunk size,
+# the address of the image's own metadata records, of the first item, the length
+# and address of the source's name (after "AD\0\0"), and the address where the
+# footer begins, a zero, and a second footer address.
+_AD1_HEADER = struct.Struct("<16sIIIQQI4sQQQQ")
+# An item: its next sibling, first child, first metadata record, chunk table,
+# decompressed size, type and name length; then the name and its parent's address.
+_AD1_ITEM = struct.Struct("<QQQQQII")
+# A metadata record: the next record, a category, a key and the value's length,
+# then the value as text.
+_AD1_RECORD = struct.Struct("<QIII")
+# A footer block: its tag (ATTRGUID or LOCSGUID), a zero and a count of entries, each
+# a 4-byte number and a 16-byte GUID.
+_AD1_FOOTER_BLOCK = struct.Struct("<8sII")
+_AD1_FOOTER_ENTRY = 20
+_AD1_FOLDER = 5                                # item types: a folder, and an entry
+_AD1_DELETED = 2                                # FTK Imager's listing marks deleted
+# The records an entry keeps: its hashes, its type record and its times.
+_AD1_KEPT = {(1, 0x5001), (1, 0x5002), (2, 0x2), (5, 0x07), (5, 0x08), (5, 0x09)}
+# The time records' keys, named as FTK Imager 4.7.3.61's own directory listing
+# names the same values (Created, Modified, Accessed). They hold UTC.
+_AD1_TIMES = {0x08: "created", 0x09: "modified", 0x07: "accessed"}
+_AD1_TIME = re.compile(r"(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)(?:\.(\d{1,6}))?")
+_AD1_MAX_NAME = 1 << 16
+_AD1_WINDOW = 1 << 18                           # logical bytes read at a time for items
+_AD1_MAX_VALUE = 1 << 24
+_AD1_EXT = re.compile(r"ad([1-9][0-9]*)", re.IGNORECASE)
+
+
+def is_ad1(path) -> bool:
+    """True when the file begins with the AD1 segment signature."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(len(AD1_SIGNATURE)) == AD1_SIGNATURE
+    except OSError:
+        return False
+
+
+def _ad1_named(name):
+    ext = name.rpartition(".")[2] if "." in name else ""
+    return bool(_AD1_EXT.fullmatch(ext))
+
+
+def ad1_segments(path) -> list[str]:
+    """The files of the AD1 set ``path`` belongs to, from its .ad1 through every
+    consecutive .ad2, .ad3 ... beside it, matched without regard to case."""
+    folder, name = os.path.split(os.path.abspath(path))
+    stem, dot, ext = name.rpartition(".")
+    if not dot or not _AD1_EXT.fullmatch(ext):
+        raise EwfFormatError(f"{name} is not named as a file of an AD1 set (.ad1, "
+                             f".ad2, ...)")
+    try:
+        present = {entry.lower(): entry for entry in os.listdir(folder)}
+    except OSError as exc:
+        raise EwfFormatError(f"cannot list the folder holding the image: {exc}") from exc
+    out = []
+    while f"{stem}.ad{len(out) + 1}".lower() in present:
+        out.append(os.path.join(folder, present[f"{stem}.ad{len(out) + 1}".lower()]))
+    if not out:
+        raise EwfFormatError(f"{name} belongs to an AD1 set whose first file, "
+                             f"{stem}.ad1, is not beside it")
+    return out
+
+
+def _ad1_time(text):
+    """A time record's POSIX time (UTC), or None when it is not one."""
+    m = _AD1_TIME.fullmatch(text.strip())
+    if not m:
+        return None
+    *parts, frac = m.groups()
+    try:
+        when = datetime.datetime(*map(int, parts), tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    return when.timestamp() + (int(frac.ljust(6, "0")) / 1e6 if frac else 0)
+
+
+class Ad1Entry:
+    """One item of an AD1's file tree.
+
+    ``names`` is the path from the top as a tuple, and ``path`` the names joined by
+    "/", for display: a name can itself hold "\\" or ":", and in an image of several
+    sources the top items are named for their sources. ``item_type`` is the type the
+    item stores (5 is a folder, 2 an entry FTK Imager lists as deleted), ``type_code``
+    the text of its metadata record 2/0x2 (None when absent), ``size`` the
+    decompressed size, ``md5`` and ``sha1`` the digests its records store (None when
+    absent), and ``times`` the "created", "modified" and "accessed" records as POSIX
+    times. ``metadata`` reads every metadata record from the image, as
+    {(category, key): text}; an entry imaged from NTFS carries dozens, so they are
+    read when asked for rather than kept. Paths can repeat: a deleted file can appear
+    as more than one entry.
+    """
+
+    __slots__ = ("names", "parent", "children", "address", "header_length",
+                 "item_type", "size", "chunk_table", "metadata_address", "md5", "sha1",
+                 "type_code", "times", "_image")
+
+    def __init__(self, names, parent, address=0, header_length=0, item_type=None,
+                 size=0, chunk_table=0, kept=None, metadata_address=0, image=None):
+        self.names = names
+        self.parent = parent
+        self.children = []
+        self.address = address
+        self.header_length = header_length
+        self.item_type = item_type
+        self.size = size
+        self.chunk_table = chunk_table
+        self.metadata_address = metadata_address
+        self._image = image
+        kept = kept or {}
+        self.md5 = _l01_digest(kept.get((1, 0x5001)), 32)
+        self.sha1 = _l01_digest(kept.get((1, 0x5002)), 40)
+        self.type_code = kept.get((2, 0x2))
+        self.times = {}
+        for key, label in _AD1_TIMES.items():
+            value = _ad1_time(kept.get((5, key), ""))
+            if value is not None:
+                self.times[label] = value
+
+    @property
+    def metadata(self):
+        if self._image is None:
+            return {}
+        if self._image._closed:
+            raise ValueError("the image this entry belongs to is closed")
+        out = {}
+        for _addr, _length, category, key, value in self._image._ad1_records(
+                self.metadata_address, f"AD1 entry {self.path}"):
+            out.setdefault((category, key), value)
+        return out
+
+    @property
+    def values(self):
+        return self.metadata
+
+    @property
+    def name(self):
+        return self.names[-1] if self.names else ""
+
+    @property
+    def path(self):
+        return "/".join(self.names)
+
+    @property
+    def is_folder(self):
+        return self.item_type == _AD1_FOLDER
+
+    @property
+    def is_deleted(self):
+        return self.item_type == _AD1_DELETED
+
+    def __repr__(self):
+        return f"<Ad1Entry {self.path!r} size={self.size}>"
+
+
+class _Ad1File(io.RawIOBase):
+    """An AD1 entry's content as a seekable file object, inflated chunk by chunk
+    through its chunk table."""
+
+    def __init__(self, image, entry, addresses):
+        super().__init__()
+        self._image = image
+        self._entry = entry
+        self._addresses = addresses
+        self._chunk_size = image.ad1["chunk_size"]
+        self._size = entry.size
+        self._pos = 0
+        self._k = None
+        self._data = b""
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if whence == os.SEEK_SET:
+            pos = offset
+        elif whence == os.SEEK_CUR:
+            pos = self._pos + offset
+        elif whence == os.SEEK_END:
+            pos = self._size + offset
+        else:
+            raise ValueError(f"invalid whence {whence}")
+        if pos < 0:
+            raise ValueError("negative seek position")
+        self._pos = pos
+        return pos
+
+    def _piece(self, k):
+        if k != self._k:
+            a, b = self._addresses[k], self._addresses[k + 1]
+            want = min(self._chunk_size, self._size - k * self._chunk_size)
+            try:
+                data = zlib.decompress(self._image._ad1_read(a, b - a))
+            except zlib.error as exc:
+                raise EwfFormatError(f"AD1 entry {self._entry.path}: chunk {k} does not "
+                                     f"inflate ({exc})") from None
+            if len(data) != want:
+                raise EwfFormatError(f"AD1 entry {self._entry.path}: chunk {k} inflates "
+                                     f"to {len(data):,} bytes where {want:,} were "
+                                     f"expected")
+            self._k, self._data = k, data
+        return self._data
+
+    def readinto(self, buffer):
+        view = memoryview(buffer).cast("B")
+        done = 0
+        while done < len(view) and self._pos < self._size:
+            k, within = divmod(self._pos, self._chunk_size)
+            data = self._piece(k)
+            take = min(len(view) - done, len(data) - within)
+            view[done:done + take] = data[within:within + take]
+            done += take
+            self._pos += take
+        return done
+
+
 class EwfImage:
     """An EWF-E01, EWF-S01, EWF2-Ex01, AFF or AFD acquisition, read as one seekable stream,
     or an EWF-L01, read as its media data with its entries in ``logical_entries``.
@@ -2534,6 +2788,10 @@ class EwfImage:
             self.paths = [os.path.abspath(path)]
         elif adcrypt_set(path):
             self.paths = adcrypt_set(path)
+        elif _ad1_named(os.path.basename(path)):
+            self.paths = ad1_segments(path)
+        elif is_ad1(path):                      # an AD1 file named otherwise
+            self.paths = [os.path.abspath(path)]
         else:
             self.paths = ewf_segments(path)
         self._handles: OrderedDict[int, object] = OrderedDict()
@@ -2580,6 +2838,13 @@ class EwfImage:
         self.aff4 = None
         self._aff4 = None
         self._aff4_reader = None
+        # AD1: what the image records about itself, and how its logical space maps
+        # onto its files.
+        self.ad1 = None
+        self._ad1_usable = 0
+        self._ad1_total = 0
+        self._ad1_sizes: list[int] = []
+        self._ad1_window = (0, b"")
 
         self._tables: list[_Table] = []
         self._table_starts: list[int] = []
@@ -2637,6 +2902,9 @@ class EwfImage:
             if magic is None:
                 self._index_adcrypt_raw()
                 return
+        if magic == AD1_SIGNATURE[:8]:
+            self._index_ad1()
+            return
         if magic == LEF2_SIGNATURE:
             raise EwfFormatError(
                 f"{os.path.basename(self.paths[0])} is Lx01 logical evidence, which "
@@ -2883,24 +3151,29 @@ class EwfImage:
         return runs
 
     def open_entry(self, entry):
-        """An L01 entry's content as a seekable, read-only file object."""
+        """An L01 or AD1 entry's content as a seekable, read-only file object."""
+        if self.format == FORMAT_AD1:
+            return io.BufferedReader(_Ad1File(self, entry, self._ad1_chunks(entry)),
+                                     buffer_size=1 << 16)
         if self.format != FORMAT_L01:
-            raise EwfFormatError("only an L01 holds entries")
+            raise EwfFormatError("only an L01 or AD1 holds entries")
         return io.BufferedReader(_LogicalFile(self, self._entry_runs(entry), entry.size),
                                  buffer_size=1 << 16)
 
     def read_entry(self, entry):
-        """An L01 entry's content, whole."""
+        """An L01 or AD1 entry's content, whole."""
         with self.open_entry(entry) as fh:
             return fh.read()
 
     def find_entry(self, path):
-        """The L01 entry whose path (its names joined by "/") is ``path``."""
+        """The first L01 or AD1 entry, in tree order, whose path (its names joined by
+        "/") is ``path``."""
         path = path.strip("/")
         for entry in self.logical_entries:
             if entry.path == path:
                 return entry
-        raise EwfFormatError(f"no L01 entry has the path {path!r}")
+        kind = "AD1" if self.format == FORMAT_AD1 else "L01"
+        raise EwfFormatError(f"no {kind} entry has the path {path!r}")
 
     def _walk_aff(self, i):
         """One AFF file's segments, walked once: where each page is, and the content
@@ -3403,10 +3676,12 @@ class EwfImage:
         with fh:
             inner = fh.read(len(AD1_SIGNATURE))
         if inner == AD1_SIGNATURE:
-            raise EwfFormatError(f"{name} is an AD1 logical image, encrypted; ewfprobe "
-                                 f"reads disk images and does not read AD1")
+            return inner[:8]
         if inner[:8] in (SIGNATURE, SIGNATURE_V2, LVF_SIGNATURE, LEF2_SIGNATURE):
             return inner[:8]
+        if _ad1_named(name):                    # before EWF: .ad1 fits its pattern too
+            raise EwfFormatError(f"{name} is named as a file of an AD1 set and decrypts "
+                                 f"to something that is not AD1")
         if _ewf_named(name):
             raise EwfFormatError(f"{name} is named as an EWF segment and decrypts to "
                                  f"something that is not EWF")
@@ -3446,6 +3721,357 @@ class EwfImage:
             if pos + len(out) >= self._raw_starts[i] + self._raw_sizes[i]:
                 i += 1
         return bytes(out)
+
+    # -- AD1 ---------------------------------------------------------------
+
+    def _index_ad1(self):
+        """An AD1: check its files' margins, read its logical header and walk its
+        item tree. The image's stream is its logical space."""
+        self.format = FORMAT_AD1
+        first = os.path.basename(self.paths[0])
+        sizes = [self._content_size(p) if self.encryption else os.path.getsize(p)
+                 for p in self.paths]
+        count = segment_size = None
+        for i, path in enumerate(self.paths):
+            name = os.path.basename(path)
+            fh = self._handle(i)
+            fh.seek(0)
+            head = fh.read(_AD1_SEGMENT.size)
+            if len(head) != _AD1_SEGMENT.size or not head.startswith(AD1_SIGNATURE):
+                raise EwfFormatError(f"{name} does not begin with the AD1 signature")
+            _sig, _one, _two, number, files, size, margin = _AD1_SEGMENT.unpack(head)
+            if margin != _AD1_MARGIN:
+                raise EwfFormatError(f"{name} records a {margin:,}-byte margin; only "
+                                     f"{_AD1_MARGIN} is read")
+            if count is None:
+                count, segment_size = files, size
+            elif (files, size) != (count, segment_size):
+                raise EwfFormatError(f"{name} records a set of {files:,} files of "
+                                     f"{size:,} bytes where {first} records {count:,} "
+                                     f"of {segment_size:,}")
+            if number != i + 1:
+                raise EwfFormatError(f"{name} says it is file {number} of the AD1 set, "
+                                     f"but it sits at position {i + 1}")
+        if len(self.paths) < count:
+            raise EwfIncompleteSetError(
+                f"{first} records {count:,} files in its set and {len(self.paths):,} "
+                f"{'is' if len(self.paths) == 1 else 'are'} beside it. Put every file "
+                f"of the set in one folder before opening it.")
+        if len(self.paths) > count:
+            raise EwfFormatError(f"{first} records {count:,} files in its set and "
+                                 f"{len(self.paths):,} are numbered as its files")
+        if segment_size <= _AD1_MARGIN:
+            raise EwfFormatError(f"{first} records a segment size of {segment_size:,} "
+                                 f"bytes, which holds no data")
+        for i, (path, size) in enumerate(zip(self.paths, sizes)):
+            last = i == len(sizes) - 1
+            if (size < segment_size and not last) or size <= _AD1_MARGIN:
+                raise EwfIncompleteSetError(
+                    f"{os.path.basename(path)} is {size:,} bytes where every file of "
+                    f"the set but the last is {segment_size:,}; the file is cut short")
+            if size > segment_size:
+                raise EwfFormatError(f"{os.path.basename(path)} is {size:,} bytes, "
+                                     f"longer than the set's {segment_size:,}")
+        self._ad1_usable = segment_size - _AD1_MARGIN
+        self._ad1_sizes = [size - _AD1_MARGIN for size in sizes]
+        total = self._ad1_total = sum(self._ad1_sizes)
+        head = self._ad1_read(0, min(_AD1_HEADER.size, total))
+        if not head.startswith(AD1_LOGICAL_SIGNATURE):
+            raise EwfFormatError(f"{first} has no AD1 logical header after its margin")
+        version = struct.unpack_from("<I", head, 16)[0] if len(head) >= 20 else None
+        if version != 4:
+            raise EwfFormatError(f"{first} is AD1 version {version}; only version 4, "
+                                 f"which FTK Imager 3.4 and 4.7 write, is read")
+        if len(head) < _AD1_HEADER.size:
+            raise EwfFormatError(f"{first} ends inside its AD1 logical header")
+        (_sig, _version, _one, chunk_size, meta_addr, first_item, name_length, tag,
+         name_addr, footer, _zero, footer2) = _AD1_HEADER.unpack(head)
+        if tag != b"AD\x00\x00":
+            raise EwfFormatError(f"{first}'s AD1 logical header lacks its AD tag")
+        if not 0 < chunk_size <= _AD1_MAX_VALUE:
+            raise EwfFormatError(f"{first} records a chunk size of {chunk_size:,} bytes")
+        for what, addr in (("first item", first_item), ("footer", footer),
+                           ("source name", name_addr), ("metadata", meta_addr)):
+            if addr >= total:
+                raise EwfFormatError(f"{first} places its {what} at logical offset "
+                                     f"{addr:,}, past the end of its data")
+        if footer:
+            self._ad1_check_footer(first, footer, footer2, total)
+        if name_length > _AD1_MAX_NAME:
+            raise EwfFormatError(f"{first} records a {name_length:,}-byte source name")
+        source = self._ad1_read(name_addr, name_length).decode("utf-8", "surrogateescape")
+        image_metadata = {}
+        for _addr, _length, category, key, value in self._ad1_records(meta_addr,
+                                                                      "the image"):
+            image_metadata.setdefault((category, key), value)
+        self.ad1 = {"version": version, "chunk_size": chunk_size,
+                    "segment_size": segment_size, "segment_count": count,
+                    "data_source": source, "first_item": first_item,
+                    "footer": footer, "logical_size": total,
+                    "image_metadata": image_metadata, "log": None}
+        self.metadata = {"data_source": source}
+
+        root = Ad1Entry((), None)
+        order = []
+        seen = set()
+        work = [(first_item, root)]
+        while work:
+            addr, parent = work.pop()
+            if not addr:
+                continue
+            if addr in seen:
+                raise EwfFormatError(f"the AD1 item at logical offset {addr:,} is reached "
+                                     f"twice; its tree loops")
+            seen.add(addr)
+            entry, next_item, child = self._ad1_item(addr, parent, total)
+            parent.children.append(entry)
+            order.append(entry)
+            work.append((next_item, parent))
+            work.append((child, entry))         # children before the next sibling
+        self.logical_root = root
+        self.logical_entries = order
+        self._ad1_log()
+
+        # The stream is the logical space, read through virtual chunks.
+        self.sector_size = 0
+        self.sector_count = 0
+        self.media_size = self.size = total
+        self.chunk_size = _APPLE_VIRTUAL_CHUNK
+        self.sizes = [os.path.getsize(p) for p in self.paths]
+        self.chunk_count = self._needed_chunks()
+        self._indexed_chunks = self.chunk_count
+
+    def _ad1_check_footer(self, first, footer, footer2, total):
+        """The footer is two blocks, ATTRGUID at the address the logical header gives
+        and LOCSGUID at its second footer address, each a tag, a zero and a count of
+        20-byte entries, and the second ends where the image's data ends, on every
+        AD1 in the README's validation. So its computed end shows a last file cut
+        short, which no other address would reach, or bytes after it."""
+        last = os.path.basename(self.paths[-1])
+        end = footer
+        for label in (b"ATTRGUID", b"LOCSGUID"):
+            if label == b"LOCSGUID" and end != footer2:
+                raise EwfFormatError(f"{first}'s AD1 footer places its second block at "
+                                     f"logical offset {footer2:,}, where its first ends "
+                                     f"at {end:,}")
+            if end + _AD1_FOOTER_BLOCK.size > total:
+                raise EwfIncompleteSetError(f"{last} ends inside its AD1 footer; the "
+                                            f"file is cut short")
+            tag, _zero, count = _AD1_FOOTER_BLOCK.unpack(
+                self._ad1_read(end, _AD1_FOOTER_BLOCK.size))
+            if tag != label:
+                raise EwfFormatError(f"{first}'s AD1 footer has no {label.decode()} "
+                                     f"block at logical offset {end:,}")
+            end += _AD1_FOOTER_BLOCK.size + _AD1_FOOTER_ENTRY * count
+        if end > total:
+            missing = end - total
+            raise EwfIncompleteSetError(f"{last} ends {missing:,} byte"
+                                        f"{'' if missing == 1 else 's'} before the end "
+                                        f"of its AD1 footer; the file is cut short")
+        if end < total:
+            extra = total - end
+            raise EwfFormatError(f"{last} holds {extra:,} byte{'' if extra == 1 else 's'} "
+                                 f"after its AD1 footer")
+
+    def _ad1_read(self, offset, n):
+        """``n`` bytes at ``offset`` of an AD1's logical space: its files with their
+        margins left out, back to back. Small reads are served from a window of the
+        space, since an item's header and records lie together."""
+        start, window = self._ad1_window
+        if start <= offset and offset + n <= start + len(window):
+            return window[offset - start:offset + n - start]
+        if n < _AD1_WINDOW:
+            i, within = divmod(offset, self._ad1_usable)
+            if i < len(self.paths) and within < self._ad1_sizes[i]:
+                span = min(_AD1_WINDOW, self._ad1_sizes[i] - within)
+                if span >= n:
+                    self._ad1_window = (offset, self._ad1_span(offset, span))
+                    return self._ad1_window[1][:n]
+        return self._ad1_span(offset, n)
+
+    def _ad1_span(self, offset, n):
+        out = bytearray()
+        while n > 0:
+            i, within = divmod(offset, self._ad1_usable)
+            if i >= len(self.paths) or within >= self._ad1_sizes[i]:
+                raise EwfFormatError(f"the AD1 refers to logical offset {offset:,}, past "
+                                     f"the end of its data")
+            take = min(n, self._ad1_sizes[i] - within)
+            fh = self._handle(i)
+            fh.seek(_AD1_MARGIN + within)
+            piece = fh.read(take)
+            if len(piece) != take:
+                raise EwfIncompleteSetError(f"{os.path.basename(self.paths[i])} ends "
+                                            f"early; the file is cut short")
+            out += piece
+            offset += take
+            n -= take
+        return bytes(out)
+
+    def _ad1_records(self, addr, where, keep=None):
+        """The metadata records chained from ``addr``: (address, length, category,
+        key, text) each, the text only for the (category, key) pairs in ``keep`` when
+        that is given."""
+        out = []
+        seen = set()
+        total = self._ad1_total
+        while addr:
+            if addr in seen:
+                raise EwfFormatError(f"the metadata records of {where} loop")
+            if addr >= total:
+                raise EwfFormatError(f"a metadata record of {where} lies past the end "
+                                     f"of the data")
+            seen.add(addr)
+            nxt, category, key, length = _AD1_RECORD.unpack(
+                self._ad1_read(addr, _AD1_RECORD.size))
+            if length > _AD1_MAX_VALUE:
+                raise EwfFormatError(f"{where} has a {length:,}-byte metadata value")
+            value = None
+            if keep is None or (category, key) in keep:
+                value = self._ad1_read(addr + _AD1_RECORD.size, length).decode(
+                    "utf-8", "surrogateescape")
+            elif addr + _AD1_RECORD.size + length > total:
+                raise EwfFormatError(f"a metadata record of {where} lies past the end "
+                                     f"of the data")
+            out.append((addr, _AD1_RECORD.size + length, category, key, value))
+            addr = nxt
+        return out
+
+    def _ad1_item(self, addr, parent, total):
+        """The item at ``addr``: its entry, and the addresses of its next sibling and
+        its first child."""
+        next_item, child, meta, table, size, item_type, name_length = _AD1_ITEM.unpack(
+            self._ad1_read(addr, _AD1_ITEM.size))
+        if name_length > _AD1_MAX_NAME:
+            raise EwfFormatError(f"the AD1 item at logical offset {addr:,} has a "
+                                 f"{name_length:,}-byte name")
+        tail = self._ad1_read(addr + _AD1_ITEM.size, name_length + 8)
+        name = tail[:name_length].decode("utf-8", "surrogateescape")
+        parent_addr = struct.unpack_from("<Q", tail, name_length)[0]
+        names = parent.names + (name,)
+        where = f"AD1 entry {'/'.join(names)}"
+        if parent_addr != parent.address:
+            raise EwfFormatError(f"{where} names its parent at logical offset "
+                                 f"{parent_addr:,} but sits under the one at "
+                                 f"{parent.address:,}")
+        if size and not table:
+            raise EwfFormatError(f"{where} holds {size:,} bytes and no chunk table")
+        if table >= total:
+            raise EwfFormatError(f"{where} places its chunk table past the end of the data")
+        kept = {}
+        for _raddr, _length, category, key, value in self._ad1_records(meta, where,
+                                                                       _AD1_KEPT):
+            if value is not None:
+                kept.setdefault((category, key), value)
+        entry = Ad1Entry(names, parent, addr, _AD1_ITEM.size + name_length + 8,
+                         item_type, size, table, kept, meta, self)
+        return entry, next_item, child
+
+    def _ad1_chunks(self, entry):
+        """The addresses bounding an AD1 entry's compressed chunks, in order."""
+        if not entry.chunk_table:
+            return [0]
+        where = f"AD1 entry {entry.path}"
+        count = struct.unpack("<Q", self._ad1_read(entry.chunk_table, 8))[0]
+        need = -(-entry.size // self.ad1["chunk_size"])
+        if count != need:
+            raise EwfFormatError(f"{where}: its chunk table lists {count:,} chunks where "
+                                 f"its {entry.size:,} bytes take {need:,}")
+        addresses = struct.unpack(f"<{count + 1}Q",
+                                  self._ad1_read(entry.chunk_table + 8, 8 * (count + 1)))
+        if any(b < a for a, b in zip(addresses, addresses[1:])) or \
+                addresses[-1] > self.ad1["logical_size"]:
+            raise EwfFormatError(f"{where}: its chunk table's addresses are out of order "
+                                 f"or past the end of the data")
+        return list(addresses)
+
+    def _ad1_log(self):
+        """The image MD5 and SHA-1 FTK Imager records in its log beside the image
+        (<first file>.txt), under Computed Hashes, when that log is there."""
+        log = self.paths[0] + ".txt"
+        try:
+            with open(log, "rb") as fh:
+                text = fh.read(1 << 20).decode("utf-8-sig", "replace")
+        except OSError:
+            return
+        found, inside = {}, False
+        for line in text.splitlines():
+            if line.strip() == "[Computed Hashes]":
+                inside = True
+                continue
+            if inside:
+                m = re.match(r"\s*(MD5|SHA1) checksum:\s*([0-9a-fA-F]+)\s*$", line)
+                if not m:
+                    break
+                found[m.group(1)] = m.group(2).lower()
+        found = {k: v for k, v in found.items() if len(v) == (32 if k == "MD5" else 40)}
+        if found:
+            self.stored_hashes = found
+            self.ad1["log"] = os.path.basename(log)
+
+    def _chunk_data_ad1(self, n):
+        pos = n * self.chunk_size
+        return self._ad1_read(pos, min(self.chunk_size, self.media_size - pos))
+
+    def _verify_ad1(self, block, progress):
+        """FTK Imager's image hash of an AD1, and every entry's stored MD5 and SHA-1
+        checked against its content.
+
+        The image hash is taken over the logical header up to the first item, then
+        the footer (from the address the header gives to the end of the data), then
+        each item's header and metadata records in the order they lie in the image,
+        and last the digest of all the items' content in that order; chunk tables and
+        compressed chunks are not in it. The scheme is pyad1's reader, followed through
+        the image's own addresses; it reproduces the hashes in FTK Imager's log on
+        every image in the README's validation."""
+        algos = ("MD5", "SHA1")
+        image = {a: hashlib.new(a.lower()) for a in algos}
+        content = {a: hashlib.new(a.lower()) for a in algos}
+        total = self.ad1["logical_size"]
+        head = self._ad1_read(0, self.ad1["first_item"])
+        footer = self._ad1_read(self.ad1["footer"], total - self.ad1["footer"]) \
+            if self.ad1["footer"] else b""
+        for h in image.values():
+            h.update(head)
+            h.update(footer)
+        wanted = sum(e.size for e in self.logical_entries)
+        done = 0
+        checked = {"md5": 0, "sha1": 0}
+        mismatched = {"md5": [], "sha1": []}
+        for entry in sorted(self.logical_entries, key=lambda e: e.address):
+            item = self._ad1_read(entry.address, entry.header_length)
+            for h in image.values():
+                h.update(item)
+            own = {"md5": hashlib.md5(), "sha1": hashlib.sha1()}
+            if entry.size:
+                try:
+                    with self.open_entry(entry) as fh:
+                        while True:
+                            piece = fh.read(block)
+                            if not piece:
+                                break
+                            for h in (*content.values(), *own.values()):
+                                h.update(piece)
+                            done += len(piece)
+                            if progress:
+                                progress(done, wanted)
+                except EwfFormatError:
+                    # A chunk that does not inflate: what was read of the entry fails
+                    # its stored hashes, and the image hash fails with it.
+                    pass
+            for addr, length, *_rest in self._ad1_records(entry.metadata_address,
+                                                          entry.path, keep=()):
+                data = self._ad1_read(addr, length)
+                for h in image.values():
+                    h.update(data)
+            for algo, stored in (("md5", entry.md5), ("sha1", entry.sha1)):
+                if stored is not None:
+                    checked[algo] += 1
+                    if own[algo].hexdigest() != stored:
+                        mismatched[algo].append(entry.path)
+        for algo in algos:
+            image[algo].update(content[algo].digest())
+        return ({a: h.hexdigest() for a, h in image.items()}, done, checked, mismatched)
 
     def _note_encryption(self, key):
         self.encryption = {"container": "encrcdsa version 2",
@@ -4132,6 +4758,8 @@ class EwfImage:
             return self._keep(n, self._chunk_data_aff4(n), want)
         if self.format == FORMAT_RAW:
             return self._keep(n, self._chunk_data_raw(n), want)
+        if self.format == FORMAT_AD1:
+            return self._keep(n, self._chunk_data_ad1(n), want)
 
         segment, start, end, compressed = self._chunk_location(n)
         fh = self._handle(segment)
@@ -4259,6 +4887,12 @@ class EwfImage:
         # space would take long and compare with nothing.
         if self.format == FORMAT_AFF4 and not self.stored_hashes:
             hashers = {}
+        # An AD1's hash is FTK Imager's, taken over its structure and its entries'
+        # content rather than over its data as stored; its entries are checked in the
+        # same pass.
+        ad1 = self._verify_ad1(block, progress) if self.format == FORMAT_AD1 else None
+        if ad1:
+            hashers = {}
         self.seek(0)
         while hashers:
             data = self.read(block)
@@ -4270,12 +4904,18 @@ class EwfImage:
             if progress:
                 progress(done, self.media_size)
         computed = {n: h.hexdigest() for n, h in hashers.items()}
+        if ad1:
+            computed, done = ad1[0], ad1[1]
         match = None
         for name, value in self.stored_hashes.items():
             if name in computed:
                 match = (computed[name] == value) if match in (None, True) else False
         checked, mismatched = 0, []
-        for entry in self.logical_entries:
+        sha1_checked, sha1_mismatched = 0, []
+        if ad1:
+            checked, mismatched = ad1[2]["md5"], ad1[3]["md5"]
+            sha1_checked, sha1_mismatched = ad1[2]["sha1"], ad1[3]["sha1"]
+        for entry in [] if ad1 else self.logical_entries:
             if entry.md5 is None:
                 continue
             digest = hashlib.md5()
@@ -4300,6 +4940,8 @@ class EwfImage:
             "missing_page_ranges": list(self.missing_page_ranges),
             "entry_md5_checked": checked,
             "entry_md5_mismatched": mismatched,
+            "entry_sha1_checked": sha1_checked,
+            "entry_sha1_mismatched": sha1_mismatched,
             "container_checks": container,
         }
 
@@ -4334,6 +4976,9 @@ class EwfImage:
             "sparsebundle": None if self.sparsebundle is None else dict(self.sparsebundle),
             "encryption": None if self.encryption is None else dict(self.encryption),
             "aff4": None if self.aff4 is None else dict(self.aff4),
+            "ad1": None if self.ad1 is None else {
+                key: value for key, value in self.ad1.items()
+                if key not in ("first_item", "footer")},
         }
 
 
@@ -4342,8 +4987,8 @@ def open_ewf(path, segments=None, password=None) -> EwfImage:
     it, an AFF file, an AFD directory from the directory or any file in it, an AFF4
     container (a striped one from any of its files), an Apple
     .dmg (a segmented one from its .dmg) or .sparseimage, or a sparse bundle from its
-    folder, or an AD-encrypted E01, SMART or raw set from its first file (a raw set
-    from any of its files). An encrypted Apple disk image or AD-encrypted set opens
+    folder, an AD1 set from any of its files, or an AD-encrypted E01, SMART or raw set
+    from its first file (a raw or AD1 set from any of its files). An encrypted Apple disk image or AD-encrypted set opens
     with ``password`` (a str, used as UTF-8, or bytes); without one it raises
     EwfPasswordRequiredError, and with one that does not open it
     EwfWrongPasswordError."""
@@ -4414,7 +5059,21 @@ def _cmd_info(args):
               f"{' .. ' + d['segments'][-1] if d['segment_count'] > 1 else ''})")
         print(f"format          {d['format']}")
         print(f"media type      {d['media_type'] or 'not recorded'}")
-        if d["format"] == FORMAT_L01:
+        if d["format"] == FORMAT_AD1:
+            a = d["ad1"]
+            print(f"data source     {_shown(a['data_source'])}")
+            print(f"AD1 version     {a['version']}")
+            print(f"logical data    {d['media_size']:,} bytes ({_size(d['media_size'])}), "
+                  f"the files' data with their margins left out")
+            print(f"segment size    {a['segment_size']:,} bytes as recorded, the size of "
+                  f"every file of the set but the last")
+            print(f"chunk size      {a['chunk_size']:,} bytes")
+            print(f"entries         {d['entry_count']:,}, {d['entry_md5_count']:,} with a "
+                  f"stored MD5")
+            if a["log"]:
+                print(f"log             {_shown(a['log'])}, FTK Imager's, which holds the "
+                      f"stored hashes below")
+        elif d["format"] == FORMAT_L01:
             print(f"media data      {d['media_size']:,} bytes ({_size(d['media_size'])}), "
                   f"the content of its entries")
             print(f"entries         {d['entry_count']:,}, {d['entry_md5_count']:,} with a "
@@ -4425,6 +5084,8 @@ def _cmd_info(args):
         if d["format"] == FORMAT_L01:
             # An L01's volume section declares no chunks; its tables list them.
             print(f"chunks          {d['indexed_chunks']:,}")
+        elif d["format"] == FORMAT_AD1:
+            pass                                # no sectors: its entries are the content
         else:
             if d["sector_size"]:
                 print(f"sector size     {d['sector_size']:,} bytes")
@@ -4525,6 +5186,11 @@ def _cmd_verify(args):
         result = img.verify(progress=None if args.quiet else _progress)
         if not args.quiet:
             sys.stderr.write("\r" + " " * 48 + "\r")
+        if img.format == FORMAT_AD1:
+            where = (f"stored: {_shown(img.ad1['log'])}" if img.ad1["log"] else
+                     "no log beside it holds a stored one")
+            print(f"FTK Imager's image hash, over the AD1's structure and its entries' "
+                  f"content ({where})")
         for name, value in result["computed"].items():
             stored = result["stored"].get(name)
             if stored is None:
@@ -4545,15 +5211,19 @@ def _cmd_verify(args):
             print(f"{algo:<6}{c['computed']}   {verdict}  ({_shown(c['what'])})")
         if failed:
             return 1
-        if result["entry_md5_checked"]:
-            bad = result["entry_md5_mismatched"]
-            print(f"entry MD5s      {result['entry_md5_checked']:,} checked, "
-                  f"{len(bad):,} DO NOT MATCH" if bad else
-                  f"entry MD5s      {result['entry_md5_checked']:,} checked, all match")
+        any_bad = False
+        for label, key in (("entry MD5s", "md5"), ("entry SHA-1s", "sha1")):
+            if not result[f"entry_{key}_checked"]:
+                continue
+            bad = result[f"entry_{key}_mismatched"]
+            count = result[f"entry_{key}_checked"]
+            print(f"{label:<16}{count:,} checked, {len(bad):,} DO NOT MATCH" if bad
+                  else f"{label:<16}{count:,} checked, all match")
             for path in bad:
                 print(f"  mismatch      {_shown(path)}")
-            if bad:
-                return 1
+            any_bad = any_bad or bool(bad)
+        if any_bad:
+            return 1
         if result["match"] is None:
             if result["container_checks"]:
                 print("the image recorded no hash of the disk; the checksums it records "
@@ -4571,13 +5241,23 @@ def _shown(text):
 
 def _cmd_files(args):
     with _open_cli(args) as img:
-        if img.format != FORMAT_L01:
+        if img.format not in (FORMAT_L01, FORMAT_AD1):
             raise EwfFormatError(f"{os.path.basename(args.image)} is a disk image, not "
                                  f"logical evidence; it holds no entry list")
         # The listing is data, so it is UTF-8 wherever it goes; on Windows a pipe or
         # file would otherwise get the ANSI code page, which cannot hold every name.
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+        if img.format == FORMAT_AD1:
+            # An AD1 entry also carries its item type and its type record, as stored,
+            # so a deleted entry or an alternate data stream can be told apart.
+            print("kind\tsize\tmd5\titem_type\ttype_code\tpath")
+            for entry in img.logical_entries:
+                kind = "folder" if entry.is_folder else "file"
+                print(f"{kind}\t{entry.size}\t{entry.md5 or '-'}\t{entry.item_type}\t"
+                      f"{_shown(entry.type_code) if entry.type_code else '-'}\t"
+                      f"{_shown(entry.path)}")
+            return 0
         print("kind\tsize\tmd5\tpath")
         for entry in img.logical_entries:
             kind = "folder" if entry.is_folder else "file"
@@ -4634,7 +5314,8 @@ def main(argv=None):
         description="Read an EnCase/EWF (.E01, .Ex01), SMART (.s01), AFF (.aff, "
                     ".afd) or AFF4 (.aff4) forensic image, an Apple disk image (.dmg, .sparseimage, "
                     ".sparsebundle), an E01, SMART or raw set FTK Imager encrypted "
-                    "with AD encryption, or EnCase logical evidence (.L01). Read only.")
+                    "with AD encryption, or logical evidence: EnCase's (.L01) or "
+                    "FTK Imager's (.ad1). Read only.")
     ap.add_argument("--version", action="version", version=f"ewfprobe {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -4643,20 +5324,22 @@ def main(argv=None):
     s.set_defaults(func=_cmd_info)
 
     s = sub.add_parser("verify", help="recompute the media hash and compare it "
-                                      "with the one the acquisition stored")
+                                      "with the one the acquisition stored (for an "
+                                      "AD1, the one in FTK Imager's log beside it)")
     s.add_argument("image")
     s.add_argument("-q", "--quiet", action="store_true", help="no progress output")
     s.set_defaults(func=_cmd_verify)
 
-    s = sub.add_parser("files", help="list the entries of an L01, tab separated")
+    s = sub.add_parser("files", help="list the entries of an L01 or AD1, tab separated")
     s.add_argument("image")
     s.set_defaults(func=_cmd_files)
 
     s = sub.add_parser("export", help="write the acquired disk out as a raw image, or "
-                                      "one L01 entry's content with --entry")
+                                      "one L01 or AD1 entry's content with --entry")
     s.add_argument("image")
     s.add_argument("--entry", default=None,
-                   help="the path of an L01 entry, as the files command lists it")
+                   help="the path of an L01 or AD1 entry, as the files command "
+                        "lists it")
     s.add_argument("-o", "--output", default="-", help="output file, or - for stdout")
     s.add_argument("--offset", type=int, default=0, help="start at this byte offset")
     s.add_argument("--length", type=int, default=None, help="write this many bytes")
