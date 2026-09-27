@@ -368,6 +368,20 @@ records, 512 sampled windows across the disk matched its raw device the same way
 a walk of its APFS container through qnxprobe listed the same paths and file sizes as
 macOS's own read-only mount of the image.
 
+**Segmented images and sparse bundles, against `hdiutil attach`.** 36 images `hdiutil`
+wrote from HFS+ and APFS test disks read byte for byte the same as the same image
+attached read-only and read from its raw device: each of UDZO, UDBZ, ULMO, ULFO, UDCO
+and UDRO split by `hdiutil segment` at 700k and 3m (9 to 58 files) and left in one file
+with the base offsets `segment` writes, the plain conversions, and nine sparse bundles,
+among them bands of 1,536,000 bytes, a bundle grown after it was written, an APFS one
+shrunk, and one given both a band file longer than a band and a band file numbered past
+the disk's end. Every checksum the `.dmg` images record verified. The
+committed fixtures cover a segmented UDZO image and a sparse bundle of the shared
+source, and segmented images of a small GPT disk whose block tables carry base
+offsets. The private sample above, converted by `hdiutil` into a sparse bundle and
+split by `hdiutil segment` into 2 GB parts, read to the same SHA-256 across the whole
+disk in both forms as the original `.dmg` does.
+
 ## Standalone executables
 
 Each release carries `ewfprobe` built as a single executable with PyInstaller on
