@@ -720,3 +720,106 @@ def test_the_key_segment_padded_to_56_bytes_opens_and_another_version_does_not(t
         name, struct.pack(">I", 2) + stored[4:], arg) + data[end:])
     with pytest.raises(ewfprobe.EwfFormatError, match="version 2, not 1"):
         ewfprobe.open_ewf(str(other), password=section["password"])
+
+
+# -- AFM -----------------------------------------------------------------------------
+
+def _afm_copy(tmp_path, name):
+    """The AFM variant's files, copied into tmp_path; the path of its .afm."""
+    variant = _manifest()["variants"][name]
+    for f in variant["files"]:
+        shutil.copy(os.path.join(FIXTURES, f), tmp_path / f)
+    return tmp_path / variant["files"][0], variant
+
+
+def test_afm_fixtures_read_from_their_raw_files():
+    """affconvert wrote each AFM as its metadata file and the disk as raw files: one
+    .000, or split at 1 MiB into .000, .001 and .002. AFFLIB 3.7.22's own affcat read
+    them short (one 64 KiB page from each raw file) and its affconvert -r wrote an
+    empty file, so the known answer is the source, which the raw files joined equal,
+    and the MD5 and SHA-1 the metadata records."""
+    man = _manifest()
+    for name, raw_count in (("aff-afm", 1), ("aff-afm-split", 3)):
+        variant = man["variants"][name]
+        assert variant["format"] == "afm" and len(variant["files"]) == raw_count + 1, name
+        with ewfprobe.open_ewf(_first(variant)) as img:
+            assert img.format == ewfprobe.FORMAT_AFM, name
+            assert [os.path.basename(p) for p in img.paths] == variant["files"], name
+            assert img.missing_page_count == 0 and img.chunk_count == 48, name
+            joined = b"".join(open(os.path.join(FIXTURES, f), "rb").read()
+                              for f in variant["files"][1:])
+            # reads that cross from one raw file into the next
+            for at in (1048576 - 100, 2097152 - 65536 - 7):
+                img.seek(at)
+                assert img.read(70000) == joined[at:at + 70000], (name, at)
+
+
+def test_an_afm_missing_a_raw_file_is_refused(tmp_path):
+    afm, variant = _afm_copy(tmp_path, "aff-afm-split")
+    os.remove(tmp_path / variant["files"][-1])
+    with pytest.raises(ewfprobe.EwfIncompleteSetError, match="hold 2,097,152"):
+        ewfprobe.open_ewf(str(afm))
+    for f in variant["files"][1:]:
+        if os.path.exists(tmp_path / f):
+            os.remove(tmp_path / f)
+    with pytest.raises(ewfprobe.EwfIncompleteSetError, match="not beside it"):
+        ewfprobe.open_ewf(str(afm))
+
+
+def test_afm_raw_files_that_do_not_fit_the_metadata_are_refused(tmp_path):
+    afm, variant = _afm_copy(tmp_path, "aff-afm-split")
+    middle = tmp_path / variant["files"][2]
+    data = middle.read_bytes()
+    middle.write_bytes(data[:-512])                 # a middle file short
+    with pytest.raises(ewfprobe.EwfFormatError, match="not all the size of the first"):
+        ewfprobe.open_ewf(str(afm))
+    middle.write_bytes(data)
+    extra = tmp_path / variant["files"][-1].replace(".002", ".003")
+    extra.write_bytes(b"\x00" * 512)                # one file more than the image holds
+    with pytest.raises(ewfprobe.EwfFormatError, match="hold 3,146,240"):
+        ewfprobe.open_ewf(str(afm))
+    os.remove(extra)
+    # the metadata says 8 pages of 64 KiB per file, and the files are 1 MiB each
+    raw = bytearray(afm.read_bytes())
+    at = raw.index(b"pages_per_raw_image_file") + len(b"pages_per_raw_image_file")
+    assert raw[at:at + 8] == struct.pack(">II", 16, 0)
+    raw[at:at + 8] = struct.pack(">II", 8, 0)
+    afm.write_bytes(bytes(raw))
+    with pytest.raises(ewfprobe.EwfFormatError, match="records 8 pages"):
+        ewfprobe.open_ewf(str(afm))
+
+
+def test_an_afm_is_read_under_any_three_letter_extension_and_no_other(tmp_path):
+    """AFFLIB swaps the metadata file's extension for the raw one, and requires the
+    two to be the same length (afm_open in lib/vnode_afm.cpp)."""
+    afm, _variant = _afm_copy(tmp_path, "aff-afm")
+    renamed = tmp_path / "aff-afm.xyz"
+    shutil.copy(afm, renamed)
+    with ewfprobe.open_ewf(str(renamed)) as img:
+        assert _media_sha(img) == _manifest()["sha256"]
+    longer = tmp_path / "aff-afm.meta"
+    shutil.copy(afm, longer)
+    with pytest.raises(ewfprobe.EwfFormatError, match="three-letter extension"):
+        ewfprobe.open_ewf(str(longer))
+
+
+def test_afm_raw_files_are_counted_up_as_afflib_counts_them():
+    """split_raw_increment_fname in lib/vnode_split_raw.cpp: 000 to 999, then A00 to
+    ZZZ with the last two places in base 36, keeping lower case."""
+    step = ewfprobe._afm_next_extension     # pylint: disable=protected-access
+    assert [step(e) for e in ("000", "009", "998", "999", "A00", "A09", "A0Z",
+                              "AZZ", "a0z", "ZZZ", "00", "0000")] == [
+        "001", "010", "999", "A00", "A01", "A0A", "A10", "B00", "a10", None, None, None]
+
+
+def test_a_page_that_runs_across_two_raw_files_is_joined(tmp_path):
+    """An AFM that records no pages per file is still joined with the raw files
+    after its .000, which AFFLIB requires only to be the size of the first; so a
+    page can start in one file and end in the next."""
+    afm, variant = _afm_copy(tmp_path, "aff-afm")
+    whole = (tmp_path / variant["files"][1]).read_bytes()
+    for k, at in enumerate(range(0, len(whole), 1000000)):
+        (tmp_path / f"aff-afm.{k:03d}").write_bytes(whole[at:at + 1000000])
+    with ewfprobe.open_ewf(str(afm)) as img:
+        assert len(img.paths) == 5
+        assert _media_sha(img) == _manifest()["sha256"]

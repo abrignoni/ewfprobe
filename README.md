@@ -127,6 +127,16 @@ from the numbering: when it held the image size, as it does in an AFD from
 `affconvert`, the image is refused; otherwise its pages are counted as missing
 pages by `info` and `verify`.
 
+Reads AFM, the form of AFF that keeps the disk as plain raw files: an `.afm` file
+holding the metadata (its file type is `AFM`) and, beside it, the disk in files named
+after it with the extension it records, `.000` and, when `affconvert -M` split it,
+`.001` and on (then `A00`, as AFFLIB counts past `999`). Open the `.afm`. The raw
+files are found and checked the way AFFLIB's `lib/vnode_afm.cpp` does it: joined while
+the next one exists, every one but the last the size of the first, and together the
+image size the metadata records, so a missing, short or extra file is refused. Before
+0.10.0 an `.afm` was read as an AFF whose pages were all missing, so the whole disk
+read as the bad-sector marker.
+
 Reads AFF4, the Advanced Forensic Format 4, as the AFF4 Standard v1.0 defines it and
 as the pre-standard images Evimetry 2.0 and 2.1 wrote (`.aff4`, `.af4`): a ZIP file
 whose `information.turtle` describes the image, the map that places its bytes, and the
@@ -505,8 +515,6 @@ Refused with a message naming the reason rather than read wrongly:
   finishes, so its absence means the file may be incomplete.
 - **An AFD with a gap in its file numbering**, or whose files disagree on a page,
   a hash, the page size, the sector size or the bad-sector marker.
-- **AFM**, AFF metadata kept beside the image as split raw files (`.000`, `.001`
-  and on).
 - **Encrypted AFF4** (`aff4:EncryptedStream`), **AFF4-L**, the logical form that holds
   files rather than a disk, **an AFF4 kept as a folder** rather than a ZIP, and **an
   AFF4 map whose ranges overlap**, which none of the eleven maps measured has. AFF4 written by
@@ -605,6 +613,17 @@ key that opens none of the sealed keys, a sealed key whose inner layer is damage
 key segment padded to 56 bytes and a clear copy of an encrypted segment are tested
 by editing those files. Sixteen deliberate breaks of the encrypted AFF code are
 each caught by the tests.
+
+AFM is covered by two fixtures `affconvert` wrote as `.afm` files: one with the disk
+in a single `.000`, and one split at 1 MiB into `.000`, `.001` and `.002`. Both read
+as the source and match the MD5 and SHA-1 their metadata records. AFFLIB 3.7.22's own
+tools read them short: `affcat` wrote one page from each raw file (65,536 of the
+3,145,728 bytes from the first, 196,608 from the split one, and the same one page per
+file on two 16 MiB AFMs with 1 MiB pages), each a correct prefix, and
+`affconvert -r` wrote an empty file. The known answer is therefore the source, which
+the raw files joined equal byte for byte. A missing, short or extra raw file, a page
+count per file that does not match, a page that runs across two raw files, and
+AFFLIB's extension counting are tested by editing copies.
 
 AFD is covered by two fixtures. One is written by `affconvert -s64k -M32k`, which
 spreads the 48 pages over five files, with none in the first and the image size
