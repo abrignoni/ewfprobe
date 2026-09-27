@@ -38,9 +38,30 @@ def _manifest():
         return json.load(fh)
 
 
+# A job that installs pyliblzfse sets this, so the LZFSE fixture has to run there
+# rather than skip unseen.
+_LZFSE_REQUIRED = bool(os.environ.get("EWFPROBE_REQUIRE_LZFSE"))
+
+
 def _variants():
     man = _manifest()
-    return [(name, v) for name, v in sorted(man["variants"].items())]
+    out = []
+    for name, v in sorted(man["variants"].items()):
+        missing = v.get("needs") == "liblzfse" and ewfprobe.liblzfse is None
+        marks = ([pytest.mark.skip(reason="LZFSE needs the optional pyliblzfse package")]
+                 if missing and not _LZFSE_REQUIRED else [])
+        out.append(pytest.param(name, v, marks=marks, id=name))
+    return out
+
+
+def _readable():
+    """The variants this Python can read, as (name, variant) pairs."""
+    return [p.values for p in _variants() if not p.marks]
+
+
+def test_the_lzfse_fixture_runs_where_it_is_required():
+    if _LZFSE_REQUIRED:
+        assert ewfprobe.liblzfse is not None, "EWFPROBE_REQUIRE_LZFSE is set and pyliblzfse is not installed"
 
 
 def _first(variant):
@@ -95,7 +116,7 @@ def test_the_known_media_is_where_the_manifest_says(name, variant):
 
 def test_the_older_encase5_table_layout_reads():
     """encase5 predates the 64-bit table base offset, so it exercises base 0."""
-    variants = dict(_variants())
+    variants = dict(_readable())
     assert "encase5-fast" in variants, "the encase5 fixture is missing"
     with ewfprobe.open_ewf(_first(variants["encase5-fast"])) as img:
         assert _media_sha(img) == _manifest()["sha256"]
@@ -104,7 +125,7 @@ def test_the_older_encase5_table_layout_reads():
 
 
 def test_the_split_fixture_is_genuinely_multi_segment():
-    variants = dict(_variants())
+    variants = dict(_readable())
     split = variants["encase6-split"]
     assert len(split["files"]) >= 3, "the split fixture did not actually split"
     with ewfprobe.open_ewf(_first(split)) as img:
@@ -120,7 +141,7 @@ def test_the_split_fixture_is_genuinely_multi_segment():
 
 
 def test_a_missing_segment_of_a_real_set_is_refused(tmp_path):
-    variants = dict(_variants())
+    variants = dict(_readable())
     split = variants["encase6-split"]
     for name in split["files"]:
         shutil.copy(os.path.join(FIXTURES, name), tmp_path / name)
@@ -134,7 +155,7 @@ def test_the_image_answers_size_the_way_a_joined_raw_set_does():
     or an E01 asks the object for its size. Answering it here is what lets such
     a consumer take an E01 with no special case."""
     man = _manifest()
-    variants = dict(_variants())
+    variants = dict(_readable())
     for name in ("encase6-fast", "encase6-split"):
         with ewfprobe.open_ewf(_first(variants[name])) as img:
             assert img.size == img.media_size == man["size"], name
@@ -143,7 +164,7 @@ def test_the_image_answers_size_the_way_a_joined_raw_set_does():
 
 
 def test_metadata_written_by_ewfacquire_is_read_back():
-    variants = dict(_variants())
+    variants = dict(_readable())
     with ewfprobe.open_ewf(_first(variants["encase6-fast"])) as img:
         meta = img.metadata
     assert meta.get("case_number") == "FIXTURE"
@@ -153,7 +174,7 @@ def test_metadata_written_by_ewfacquire_is_read_back():
 def test_libewf_smart_fixtures_read_as_smart():
     """Written by ewfacquire -f smart: lowercase segment names, the 94-byte volume
     section and a table header with no base offset."""
-    variants = dict(_variants())
+    variants = dict(_readable())
     for name in ("smart-fast", "smart-split"):
         assert name in variants, f"the {name} fixture is missing"
         with ewfprobe.open_ewf(_first(variants[name])) as img:
@@ -165,7 +186,7 @@ def test_libewf_smart_fixtures_read_as_smart():
 
 
 def test_the_smart_split_fixture_opens_from_any_member():
-    variants = dict(_variants())
+    variants = dict(_readable())
     files = variants["smart-split"]["files"]
     assert len(files) >= 3, "the SMART split fixture did not actually split"
     assert all(f.rsplit(".", 1)[1].startswith("s") for f in files)
@@ -178,7 +199,7 @@ def test_ftk_imager_fixtures_are_read_like_the_libewf_ones():
     """Written by FTK Imager 4.7.3.61 from the same source image, so a writer that
     is neither this reader nor libewf. Its SMART files carry a digest section with a
     SHA-1 beside the MD5, and its split set opens from any member."""
-    variants = dict(_variants())
+    variants = dict(_readable())
     for name in ("ftk-smart", "ftk-smart-split", "ftk-e01"):
         assert name in variants, f"the {name} fixture is missing"
         assert variants[name]["writer"].startswith("FTK Imager"), name
@@ -194,7 +215,7 @@ def test_ftk_imager_fixtures_are_read_like_the_libewf_ones():
 def test_libewf_ex01_fixtures_read_as_ex01():
     """Written by ewfacquire -f encase7-v2 from libewf 20260924. Between them the
     two carry deflated, checksummed-stored and pattern-filled chunks."""
-    variants = dict(_variants())
+    variants = dict(_readable())
     seen = set()
     for name in ("ex01-fast", "ex01-none"):
         assert name in variants, f"the {name} fixture is missing"
@@ -213,7 +234,7 @@ def test_libewf_ex01_fixtures_read_as_ex01():
 def test_aff_fixtures_cover_every_page_form_and_read_as_aff():
     """affconvert (AFFLIB 3.7.22) with 64 KiB pages writes zero pages, deflated
     pages, LZMA pages and stored pages; FTK Imager's AFF is one 16 MiB page."""
-    variants = dict(_variants())
+    variants = dict(_readable())
     forms = set()
     for name in ("aff-zlib", "aff-lzma", "aff-none", "ftk-aff"):
         assert name in variants, f"the {name} fixture is missing"
@@ -236,7 +257,7 @@ def test_afd_fixtures_read_as_one_image_from_the_directory_or_any_file():
     the middle file and the image size in every file, and writes the sector size as
     text in the first file and as a segment argument in the others."""
     man = _manifest()
-    variants = dict(_variants())
+    variants = dict(_readable())
     for name, members in (("aff-afd", 5), ("ftk-aff-split", 3)):
         assert name in variants, f"the {name} fixture is missing"
         files = variants[name]["files"]
@@ -262,7 +283,7 @@ def test_afd_fixtures_read_as_one_image_from_the_directory_or_any_file():
 def test_a_missing_file_of_a_real_afd_is_refused(tmp_path):
     """The middle file of FTK Imager's AFD holds the only page, and the last file of
     affconvert's holds the image size."""
-    variants = dict(_variants())
+    variants = dict(_readable())
     for name, gone, words in (("ftk-aff-split", "file_001.aff", "file_001.aff"),
                               ("aff-afd", "file_004.aff", "image size")):
         folder = tmp_path / os.path.basename(variants[name]["image"])
@@ -317,3 +338,35 @@ def test_the_real_l01_fixture_is_the_file_digital_corpora_publishes():
             assert hashlib.sha256(fh.read()).hexdigest() == known["file_sha256"], name
     assert _logical(), "the L01 fixture is missing from the manifest"
 
+
+def test_apple_disk_images_read_as_hdiutil_wrote_them():
+    """hdiutil wrote these from the same source. Each must decode to that source
+    (the generic tests above) and must verify every checksum it records about its
+    own data: the data fork, each block table over the chunks it stores, and the
+    master over the tables' checksums."""
+    codecs = {"UDZO": "zlib", "UDBZ": "bzip2", "ULMO": "LZMA", "ULFO": "LZFSE",
+              "UDCO": "ADC", "UDRO": "none", "UFBI": "none"}
+    seen = set()
+    for name, variant in _readable():
+        fmt = variant.get("hdiutil_format")
+        if not fmt:
+            continue
+        seen.add(fmt)
+        with ewfprobe.open_ewf(_first(variant)) as img:
+            if fmt == "UDSP":
+                assert img.format == ewfprobe.FORMAT_SPARSEIMAGE, name
+                assert img.verify()["container_checks"] == [], name
+                continue
+            assert img.format == ewfprobe.FORMAT_UDIF, name
+            assert img.compression_level == codecs[fmt], name
+            checks = img.verify()["container_checks"]
+        kinds = [c["what"] for c in checks]
+        assert kinds[0] == "data" and kinds[-1] == "master", name
+        assert len(kinds) >= 3, name
+        assert all(c["match"] for c in checks), (name, [c for c in checks if not c["match"]])
+        expected = "MD5" if fmt == "UFBI" else "CRC32"
+        assert {c["algorithm"] for c in checks} == {expected}, name
+    expected_formats = set(codecs) | {"UDSP"}
+    if ewfprobe.liblzfse is None and not _LZFSE_REQUIRED:
+        expected_formats.discard("ULFO")
+    assert seen == expected_formats

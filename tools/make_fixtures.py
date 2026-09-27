@@ -54,6 +54,23 @@ import sys
 
 EWFACQUIRE = os.environ.get("EWFACQUIRE", "ewfacquire")
 AFFCONVERT = os.environ.get("AFFCONVERT", "affconvert")
+HDIUTIL = os.environ.get("HDIUTIL", "hdiutil")
+
+# Apple disk image variants, written by hdiutil (so macOS only) from the same
+# source. Between them they cover every chunk codec a UDIF image can use, stored
+# chunks with and without compression, and a sparse image. ULFO needs the optional
+# pyliblzfse package to read, and the tests skip it where that is absent.
+DMG_VARIANTS = [
+    # name,         hdiutil format
+    ("dmg-udzo",    "UDZO"),        # zlib
+    ("dmg-udbz",    "UDBZ"),        # bzip2
+    ("dmg-ulmo",    "ULMO"),        # LZMA
+    ("dmg-ulfo",    "ULFO"),        # LZFSE
+    ("dmg-udco",    "UDCO"),        # ADC
+    ("dmg-udro",    "UDRO"),        # stored, with unstored runs left out
+    ("dmg-ufbi",    "UFBI"),        # stored whole, MD5 checksums
+    ("dmg-sparse",  "UDSP"),        # a .sparseimage
+]
 
 # AFF variants, written by affconvert from AFFLIB. A 64 KiB page (the default is
 # 16 MiB) gives the 3 MiB source 48 pages, so zero pages, deflated pages, LZMA
@@ -230,6 +247,34 @@ def acquire_aff(raw_path, out_dir, name, options):
     return target, files
 
 
+def acquire_dmg(raw_path, out_dir, name, fmt):
+    """One Apple disk image variant, as the list of files written. hdiutil takes a
+    raw disk image only under a name it recognises, so the source is copied to a
+    .img beside it first and removed afterwards."""
+    target = name + (".sparseimage" if fmt == "UDSP" else ".dmg")
+    stale = os.path.join(out_dir, target)
+    if os.path.exists(stale):
+        os.remove(stale)
+    source = os.path.join(out_dir, name + "-source.img")
+    shutil.copyfile(raw_path, source)
+    try:
+        result = subprocess.run(
+            [HDIUTIL, "convert", "-quiet", os.path.basename(source), "-format", fmt,
+             "-o", target], cwd=out_dir, capture_output=True, text=True, check=False)
+    finally:
+        os.remove(source)
+    if result.returncode != 0 or not os.path.exists(stale):
+        raise SystemExit(f"hdiutil failed for {name}:\n{result.stdout}\n{result.stderr}")
+    os.chmod(stale, 0o644)
+    return [target]
+
+
+def hdiutil_version():
+    out = subprocess.run(["sw_vers", "-productVersion"], capture_output=True, text=True,
+                         check=False).stdout.strip()
+    return f"hdiutil, macOS {out}" if out else "hdiutil"
+
+
 def writer_version(tool=None):
     out = subprocess.run([tool or EWFACQUIRE, "-V"], capture_output=True, text=True,
                          check=False).stdout
@@ -280,8 +325,13 @@ def main(argv):
     out = os.path.abspath(args[0])
     os.makedirs(out, exist_ok=True)
     aff_known = dict(AFF_VARIANTS)
-    ewf_wanted = not add or any(a not in aff_known for a in args[1:])
+    dmg_known = dict(DMG_VARIANTS)
+    ewf_wanted = not add or any(a not in aff_known and a not in dmg_known for a in args[1:])
     aff_wanted = not add or any(a in aff_known for a in args[1:])
+    dmg_wanted = not add or any(a in dmg_known for a in args[1:])
+    if dmg_wanted and not shutil.which(HDIUTIL):
+        raise SystemExit(f"{HDIUTIL} not found; the Apple disk image variants are written "
+                         f"on macOS (test tool only)")
     if ewf_wanted and not shutil.which(EWFACQUIRE):
         raise SystemExit(f"{EWFACQUIRE} not found; install libewf (test tool only)")
     if aff_wanted and not shutil.which(AFFCONVERT):
@@ -292,11 +342,13 @@ def main(argv):
         with open(os.path.join(out, "manifest.json"), encoding="utf-8") as fh:
             manifest = json.load(fh)
         known = {v[0]: v for v in VARIANTS + SMALL_VARIANTS}
-        unknown = [a for a in args[1:] if a not in known and a not in aff_known]
+        unknown = [a for a in args[1:]
+                   if a not in known and a not in aff_known and a not in dmg_known]
         if unknown:
             raise SystemExit(f"unknown variant(s): {', '.join(unknown)}")
         chosen = [known[a] for a in args[1:] if a in known]
         chosen_aff = [(a, aff_known[a]) for a in args[1:] if a in aff_known]
+        chosen_dmg = [(a, dmg_known[a]) for a in args[1:] if a in dmg_known]
         raw_path = rebuild_source(out, manifest)
         print(f"raw source rebuilt and matches the manifest: {manifest['sha256'][:16]}")
     else:
@@ -313,6 +365,7 @@ def main(argv):
         manifest["variants"] = {}
         chosen = SMALL_VARIANTS if small else VARIANTS
         chosen_aff = list(AFF_VARIANTS)
+        chosen_dmg = list(DMG_VARIANTS)
 
     for name, fmt, comp, spc, seg in chosen:
         made = acquire(raw_path, out, name, fmt, comp, spc, seg)
@@ -335,6 +388,20 @@ def main(argv):
             manifest["variants"][name]["image"] = image
         size = sum(os.path.getsize(os.path.join(out, f)) for f in made)
         print(f"  {name:<20} aff       {' '.join(options):<14} {size:>10,} bytes")
+
+    dmg_writer = hdiutil_version() if chosen_dmg else None
+    for name, fmt in chosen_dmg:
+        made = acquire_dmg(raw_path, out, name, fmt)
+        manifest["variants"][name] = {
+            "format": "sparseimage" if fmt == "UDSP" else "udif", "hdiutil_format": fmt,
+            "files": made, "writer": dmg_writer,
+            # UDIF records checksums of its own data, not a hash of the disk
+            "stores_no_hash": True,
+        }
+        if fmt == "ULFO":
+            manifest["variants"][name]["needs"] = "liblzfse"
+        size = sum(os.path.getsize(os.path.join(out, f)) for f in made)
+        print(f"  {name:<20} {fmt:<9} {size:>10,} bytes")
 
     if add:
         os.remove(raw_path)

@@ -217,6 +217,79 @@
       "image": "ftk-aff-split.afd",
       "writer": "FTK Imager 4.7.3.61 (AFFLIB 3.7.18, per the image's afflib_version segment)",
       "stores_no_hash": true
+    },
+    "dmg-udzo": {
+      "format": "udif",
+      "hdiutil_format": "UDZO",
+      "files": [
+        "dmg-udzo.dmg"
+      ],
+      "writer": "hdiutil, macOS 26.6.2",
+      "stores_no_hash": true
+    },
+    "dmg-udbz": {
+      "format": "udif",
+      "hdiutil_format": "UDBZ",
+      "files": [
+        "dmg-udbz.dmg"
+      ],
+      "writer": "hdiutil, macOS 26.6.2",
+      "stores_no_hash": true
+    },
+    "dmg-ulmo": {
+      "format": "udif",
+      "hdiutil_format": "ULMO",
+      "files": [
+        "dmg-ulmo.dmg"
+      ],
+      "writer": "hdiutil, macOS 26.6.2",
+      "stores_no_hash": true
+    },
+    "dmg-ulfo": {
+      "format": "udif",
+      "hdiutil_format": "ULFO",
+      "files": [
+        "dmg-ulfo.dmg"
+      ],
+      "writer": "hdiutil, macOS 26.6.2",
+      "stores_no_hash": true,
+      "needs": "liblzfse"
+    },
+    "dmg-udco": {
+      "format": "udif",
+      "hdiutil_format": "UDCO",
+      "files": [
+        "dmg-udco.dmg"
+      ],
+      "writer": "hdiutil, macOS 26.6.2",
+      "stores_no_hash": true
+    },
+    "dmg-udro": {
+      "format": "udif",
+      "hdiutil_format": "UDRO",
+      "files": [
+        "dmg-udro.dmg"
+      ],
+      "writer": "hdiutil, macOS 26.6.2",
+      "stores_no_hash": true
+    },
+    "dmg-ufbi": {
+      "format": "udif",
+      "hdiutil_format": "UFBI",
+      "files": [
+        "dmg-ufbi.dmg"
+      ],
+      "writer": "hdiutil, macOS 26.6.2",
+      "stores_no_hash": true
+    },
+    "dmg-sparse": {
+      "format": "sparseimage",
+      "hdiutil_format": "UDSP",
+      "files": [
+        "dmg-sparse.sparseimage"
+      ],
+      "writer": "hdiutil, macOS 26.6.2",
+      "stores_no_hash": true
     }
   },
   "logical": {
