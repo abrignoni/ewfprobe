@@ -4,9 +4,10 @@ One file, pure Python, standard library only. No compiler, no network, and
 nothing to install. It opens an EWF-E01 or SMART (.s01) acquisition, joins its
 segments, and presents the original disk as an ordinary seekable file object,
 so anything that can read a raw image can read an E01 without changing how it
-reads. It also reads Ex01 (EWF2), the format EnCase 7 introduced, and AFF, the
+reads. It also reads Ex01 (EWF2), the format EnCase 7 introduced, AFF, the
 Advanced Forensic Format that AFFLIB and FTK Imager write, as a single .aff file or
-as an AFD directory of them, and Apple disk images: UDIF (.dmg), compressed with
+as an AFD directory of them, AFF4 (.aff4), including one striped across several
+files, and Apple disk images: UDIF (.dmg), compressed with
 zlib, bzip2, LZMA or ADC or stored, including one split into .dmgpart segments,
 sparse images (.sparseimage) and sparse bundles (.sparsebundle). An LZFSE .dmg
 (ULFO) needs the optional pyliblzfse package. An Apple disk image encrypted with a
@@ -31,7 +32,11 @@ and reimplementing a documented format is what keeps it that way. The AFF
 reader is written from AFFLIB's own documentation, the segment names and flag
 values in its public header, include/afflib/afflib.h, and, for AFD, how
 lib/vnode_afd.cpp finds and joins the files of one (sshock/AFFLIBv3); no AFFLIB
-code is copied. The Apple disk image readers follow Joachim Metz, "Mac OS disk
+code is copied. The AFF4 reader follows the AFF4 Standard v1.0a (aff4/Standard,
+inprogress/AFF4StandardSpecification-v1.0a.md), with what the standard leaves open
+taken from pyaff4 and c-aff4 (both Apache-2.0) and the Snappy and LZ4 decoders from
+Google's format_description.txt and lz4's doc/lz4_Block_format.md; no code from
+any of them is copied. The Apple disk image readers follow Joachim Metz, "Mac OS disk
 image types" (libyal/libmodi documentation) and "ADC compressed data format"
 (libyal/libfmos documentation), with the checksum rules, the sparse image's
 continuation headers and the layout of a segmented .dmg measured on images
@@ -46,14 +51,15 @@ Scope. This reads EWF-E01, the format EnCase 6 and 7 and FTK Imager write and
 by far the most common one in the field, EWF-S01, the variant ASR Data's SMART
 writes, EWF2-Ex01, which EnCase 7 and later write, AFF, including AFD, and
 EWF-L01 logical evidence, and UDIF, sparse image and sparse bundle Apple disk
-images, encrypted with a password or not, and AD-encrypted E01, SMART and raw sets.
-It does not read Lx01 logical evidence, an AD1 or an AD-encrypted image protected by
-a certificate, an Apple disk image unlocked by a certificate or a keybag rather than
-a password,
-or one in the older version 1 encrypted format (cdsaencr),
-encrypted Ex01 images (the encryption is not publicly documented), Ex01 images
-compressed with bzip2 (no sample exists to validate against), encrypted AFF, or AFM
-(AFF metadata beside split raw files), and it never writes.
+images, encrypted with a password or not, AD-encrypted E01, SMART and raw sets, and
+AFF4 containers, standard and pre-standard, striped or not.
+It does not read Lx01 logical evidence, encrypted AFF4 or AFF4-L, an AD1 or an
+AD-encrypted image protected by a certificate, an Apple disk image unlocked by a
+certificate or a keybag rather than a password, or one in the older version 1
+encrypted format (cdsaencr), encrypted Ex01 images (the encryption is not publicly
+documented), Ex01 images compressed with bzip2 (no sample exists to validate
+against), encrypted AFF, or AFM (AFF metadata beside split raw files), and it never
+writes.
 
 An image whose content is encrypted at rest, by BitLocker or FileVault or an
 encrypted APFS volume, reads back as the ciphertext that was acquired: the
@@ -74,6 +80,8 @@ import plistlib
 import re
 import struct
 import sys
+import urllib.parse
+import zipfile
 import zlib
 from collections import OrderedDict
 
@@ -86,7 +94,7 @@ try:
 except ImportError:
     lzma = None
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # ---------------------------------------------------------------- constants
 
@@ -206,6 +214,8 @@ _AFF_MAX_SMALL = 1 << 16                         # non-page segments read into m
 # segment from the first file that holds it, and names the files it writes
 # file_000.aff, file_001.aff and on, numbered by how many it already has.
 FORMAT_AFD = "AFD"
+# AFF4: see the AFF4 section above EwfImage.
+FORMAT_AFF4 = "AFF4"
 _AFD_MEMBER_NAME = re.compile(r"file_(\d+)\.aff", re.IGNORECASE)
 # Segments the files of an AFD must agree on when more than one of them holds one.
 _AFD_MUST_AGREE = {"pagesize", "segsize", "sectorsize", "badflag", "md5", "sha1", "sha256"}
@@ -476,8 +486,9 @@ def _family(ext):
 
 def is_image(path) -> bool:
     """True when ``path`` is a disk image ewfprobe reads: a file beginning with the
-    EWF, EWF2 or AFF signature, an AFD directory holding AFF files, or an Apple
-    UDIF (.dmg), sparse image (.sparseimage) or sparse bundle (.sparsebundle). An
+    EWF, EWF2 or AFF signature, an AFF4 container, an AFD directory holding AFF files,
+    or an Apple UDIF (.dmg), sparse image (.sparseimage) or sparse bundle
+    (.sparsebundle). An
     L01 holds files rather than a disk; is_logical_evidence answers for it. An
     encrypted Apple disk image is not counted, because it opens only with its
     password; apple_image_kind reports it as ENCRYPTED."""
@@ -497,7 +508,7 @@ def is_image(path) -> bool:
                 return True
     except OSError:
         return False
-    return apple_image_kind(path) in (FORMAT_UDIF, FORMAT_SPARSEIMAGE)
+    return is_aff4(path) or apple_image_kind(path) in (FORMAT_UDIF, FORMAT_SPARSEIMAGE)
 
 
 def _sparsebundle_info(path):
@@ -1633,6 +1644,869 @@ class _LogicalFile(io.RawIOBase):
         return done
 
 
+# ---------------------------------------------------------------- AFF4
+
+def _snappy_decompress(data):
+    """A raw Snappy block (google/snappy, format_description.txt): the decoded length
+    as a varint, then literals and back-references. Raises on anything the format
+    rules out rather than returning a short or padded block."""
+    size = shift = i = 0
+    while True:
+        if i >= len(data) or shift > 28:
+            raise EwfFormatError("a Snappy chunk has no valid length")
+        b = data[i]
+        i += 1
+        size |= (b & 0x7F) << shift
+        if b < 0x80:
+            break
+        shift += 7
+    out = bytearray()
+    end = len(data)
+    while i < end:
+        tag = data[i]
+        i += 1
+        kind = tag & 3
+        if kind == 0:
+            length = tag >> 2
+            if length >= 60:                      # 60 to 63: 1 to 4 length bytes follow
+                extra = length - 59
+                length = int.from_bytes(data[i:i + extra], "little")
+                i += extra
+            length += 1
+            if i + length > end:
+                raise EwfFormatError("a Snappy literal runs past its chunk")
+            out += data[i:i + length]
+            i += length
+            continue
+        if kind == 1:
+            length = 4 + ((tag >> 2) & 7)
+            offset = ((tag >> 5) << 8) | data[i]
+            i += 1
+        elif kind == 2:
+            length = 1 + (tag >> 2)
+            offset = int.from_bytes(data[i:i + 2], "little")
+            i += 2
+        else:
+            length = 1 + (tag >> 2)
+            offset = int.from_bytes(data[i:i + 4], "little")
+            i += 4
+        _copy_back(out, offset, length, "Snappy")
+    if len(out) != size:
+        raise EwfFormatError(f"a Snappy chunk decoded to {len(out):,} bytes, not the "
+                             f"{size:,} it declares")
+    return bytes(out)
+
+
+def _copy_back(out, offset, length, codec):
+    """Append ``length`` bytes copied from ``offset`` bytes back; a copy longer than
+    its offset repeats the last ``offset`` bytes, as both LZ77 formats define."""
+    if offset == 0 or offset > len(out):
+        raise EwfFormatError(f"an {codec} back-reference points outside its chunk")
+    start = len(out) - offset
+    if length <= offset:
+        out += out[start:start + length]
+    else:
+        piece = bytes(out[start:])
+        whole, rest = divmod(length, offset)
+        out += piece * whole + piece[:rest]
+
+
+def _lz4_block_decompress(data):
+    """An LZ4 block (lz4/lz4, doc/lz4_Block_format.md): sequences of a token, literals,
+    a two-byte offset and a match, the last sequence holding literals only."""
+    out = bytearray()
+    i, end = 0, len(data)
+    while i < end:
+        token = data[i]
+        i += 1
+        lit = token >> 4
+        if lit == 15:
+            while True:
+                if i >= end:
+                    raise EwfFormatError("an LZ4 literal length runs past its chunk")
+                b = data[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        if i + lit > end:
+            raise EwfFormatError("an LZ4 literal runs past its chunk")
+        out += data[i:i + lit]
+        i += lit
+        if i >= end:
+            break                                 # the last sequence: literals only
+        if i + 2 > end:
+            raise EwfFormatError("an LZ4 sequence stops inside its offset")
+        offset = data[i] | data[i + 1] << 8
+        i += 2
+        match = token & 15
+        if match == 15:
+            while True:
+                if i >= end:
+                    raise EwfFormatError("an LZ4 match length runs past its chunk")
+                b = data[i]
+                i += 1
+                match += b
+                if b != 255:
+                    break
+        _copy_back(out, offset, match + 4, "LZ4")
+    return bytes(out)
+
+
+def _aff4_lz4(data, chunk_size):
+    """An AFF4 LZ4 chunk. c-aff4 writes a raw block (LZ4_compress_default in
+    aff4/aff4_image.cc); pyaff4 writes python-lz4's default, the same block after a
+    4-byte little-endian length, which pyaff4 itself then fails to read. The raw form
+    is tried first, the prefixed one when the first four bytes are the chunk size."""
+    try:
+        return _lz4_block_decompress(data)
+    except (IndexError, EwfFormatError):
+        if len(data) > 4 and int.from_bytes(data[:4], "little") == chunk_size:
+            out = _lz4_block_decompress(data[4:])
+            if len(out) == chunk_size:
+                return out
+        raise
+
+
+def _aff4_inflate(data):
+    """An AFF4 zlib or deflate chunk. c-aff4 writes a zlib stream, header and all,
+    for both (deflateInit and compress2 in aff4/aff4_image.cc) and leaves spare bytes
+    after a deflate one; the header decides which is tried first, and bytes after the
+    end of the stream are ignored."""
+    zlib_header = len(data) >= 2 and data[0] & 0x0F == 8 and (data[0] << 8 | data[1]) % 31 == 0
+    for wbits in ((15, -15) if zlib_header else (-15, 15)):
+        d = zlib.decompressobj(wbits)
+        try:
+            out = d.decompress(data)
+        except zlib.error:
+            continue
+        if d.eof:
+            return out
+    raise EwfFormatError("the chunk is neither a zlib nor a raw deflate stream")
+
+
+def _aff4_unescape(text):
+    return re.sub(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})|\\(.)",
+                  lambda m: (chr(int(m.group(1) or m.group(2), 16)) if m.group(3) is None
+                             else {"t": "\t", "n": "\n", "r": "\r", "b": "\b",
+                                   "f": "\f"}.get(m.group(3), m.group(3))), text)
+
+
+_TURTLE_TOKEN = re.compile(r'''
+    (?P<skip>\s+|\#[^\n]*)
+  | (?P<iri><[^<>"{}|^`\\\x00-\x20]*>)
+  | (?P<long>"""(?:[^"\\]|\\.|"(?!""))*"""|\'\'\'(?:[^'\\]|\\.|'(?!''))*\'\'\')
+  | (?P<str>"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*')
+  | (?P<dt>\^\^)
+  | (?P<at>@[A-Za-z]+(?:-[A-Za-z0-9]+)*)
+  | (?P<num>[+-]?(?:\d+\.\d+|\.\d+|\d+)(?:[eE][+-]?\d+)?)
+  | (?P<bnode>_:[A-Za-z0-9_](?:[\w.-]*[\w-])?)
+  | (?P<pname>(?:[A-Za-z][\w.-]*)?:(?:[\w:%-](?:[\w.:%-]*[\w:%-])?)?)
+  | (?P<word>[A-Za-z]+)
+  | (?P<punct>[;,.\[\]()])
+''', re.X | re.S)
+
+
+def _turtle(text, prefixes_out=None):
+    """Parse RDF written in Turtle into {subject: {predicate: [object, ...]}}, in the
+    order the text states them. An IRI object is ("iri", iri); a literal is ("lit",
+    text, datatype IRI or "@language" or None); a collection is ("list", [...]).
+    Enough of the W3C Turtle grammar for what AFF4 writers produce: prefixes and base
+    in both spellings, typed and language-tagged literals, numbers and booleans,
+    blank nodes and collections."""
+    tokens = []
+    pos = 0
+    while pos < len(text):
+        m = _TURTLE_TOKEN.match(text, pos)
+        if not m:
+            raise EwfFormatError(f"information.turtle cannot be read at character "
+                                 f"{pos:,}: {text[pos:pos + 40]!r}")
+        pos = m.end()
+        if m.lastgroup != "skip":
+            tokens.append((m.lastgroup, m.group()))
+    prefixes, base = {}, ""
+    graph: dict = {}
+    blank = [0]
+    at = [0]
+
+    def peek():
+        return tokens[at[0]] if at[0] < len(tokens) else (None, None)
+
+    def take(kind=None, value=None):
+        tok = peek()
+        if tok[0] is None or (kind and tok[0] != kind) or (value and tok[1] != value):
+            raise EwfFormatError(f"information.turtle: expected {value or kind}, found "
+                                 f"{tok[1]!r}")
+        at[0] += 1
+        return tok
+
+    def iri(tok):
+        kind, value = tok
+        if kind == "iri":
+            ref = _aff4_unescape(value[1:-1])
+            if re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", ref):
+                return ref
+            if not ref:
+                return base
+            return base + ref if ref.startswith("#") else base.rstrip("/") + "/" + ref
+        prefix, _, local = value.partition(":")
+        if prefix not in prefixes:
+            raise EwfFormatError(f"information.turtle uses the undeclared prefix "
+                                 f"{prefix or '(empty)'}:")
+        return prefixes[prefix] + re.sub(r"\\(.)", r"\1", local)
+
+    def add(subject, predicate, obj):
+        graph.setdefault(subject, {}).setdefault(predicate, []).append(obj)
+
+    def term():
+        tok = peek()
+        kind, value = tok
+        if kind in ("iri", "pname"):
+            take()
+            return ("iri", iri(tok))
+        if kind == "bnode":
+            take()
+            return ("iri", value)
+        if kind in ("str", "long"):
+            take()
+            q = 3 if kind == "long" else 1
+            lit = _aff4_unescape(value[q:-q])
+            nxt = peek()
+            if nxt[0] == "dt":
+                take()
+                return ("lit", lit, iri(take()))
+            if nxt[0] == "at":
+                take()
+                return ("lit", lit, nxt[1])
+            return ("lit", lit, None)
+        if kind == "num":
+            take()
+            dtype = ("integer" if re.fullmatch(r"[+-]?\d+", value) else
+                     "decimal" if "e" not in value.lower() else "double")
+            return ("lit", value, "http://www.w3.org/2001/XMLSchema#" + dtype)
+        if kind == "word" and value in ("true", "false"):
+            take()
+            return ("lit", value, "http://www.w3.org/2001/XMLSchema#boolean")
+        if value == "[":
+            take()
+            node = f"_:b{blank[0]}"
+            blank[0] += 1
+            if peek()[1] != "]":
+                pairs(node)
+            take("punct", "]")
+            return ("iri", node)
+        if value == "(":
+            take()
+            items = []
+            while peek()[1] != ")":
+                items.append(term())
+            take("punct", ")")
+            return ("list", items)
+        raise EwfFormatError(f"information.turtle: unexpected {value!r}")
+
+    def pairs(subject):
+        while True:
+            tok = peek()
+            if tok[0] == "word" and tok[1] == "a":
+                take()
+                predicate = _RDF_TYPE
+            else:
+                predicate = iri(take())
+            while True:
+                add(subject, predicate, term())
+                if peek()[1] != ",":
+                    break
+                take()
+            if peek()[1] != ";":
+                return
+            while peek()[1] == ";":
+                take()
+            if peek()[1] in (".", "]", None):
+                return
+
+    while at[0] < len(tokens):
+        kind, value = peek()
+        if value in ("@prefix", "@base") or (kind == "word" and value.upper() in
+                                             ("PREFIX", "BASE")):
+            take()
+            if value.lower().endswith("prefix"):
+                name = take("pname")[1]
+                prefixes[name[:-1]] = iri(take("iri"))
+            else:
+                base = iri(take("iri"))
+            if value.startswith("@"):
+                take("punct", ".")
+            continue
+        subj = term()
+        if subj[0] != "iri":
+            raise EwfFormatError("information.turtle: a statement has no subject")
+        if peek()[1] != ".":
+            pairs(subj[1])
+        take("punct", ".")
+    if prefixes_out is not None:
+        prefixes_out.update(prefixes)
+    return graph
+
+
+_RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+_XSD = "http://www.w3.org/2001/XMLSchema#"
+# AFF4 Standard v1.0 names; the pre-standard images Evimetry 2.0 and 2.1 wrote use the
+# older namespace and some older names, listed after the standard one.
+_AFF4_NS = "http://aff4.org/Schema#"
+_AFF4_LEGACY_NS = "http://afflib.org/2009/aff4#"
+_AFF4_LEGACY_SYMBOLIC = "http://afflib.org/2012/SymbolicStream#"
+_AFF4_NAMES = {
+    "chunkSize": ("chunkSize", "chunk_size"),
+    "chunksInSegment": ("chunksInSegment", "chunks_in_segment"),
+    "compressionMethod": ("compressionMethod", "CompressionMethod"),
+    "ImageStream": ("ImageStream", "stream"),
+    "Map": ("Map", "map"),
+}
+_AFF4_HASHES = {"MD5": "md5", "SHA1": "sha1", "SHA256": "sha256", "SHA512": "sha512",
+                "blake2b": "blake2b"}
+_AFF4_MAP_ENTRY = struct.Struct("<QQQI")        # mapped offset, length, target offset,
+                                                # target id
+_AFF4_INDEX_ENTRY = struct.Struct("<QI")        # chunk offset in the bevy, stored length
+_AFF4_TILE = 1 << 20                            # UnknownData, UnreadableData repeat per MiB
+_AFF4_VIRTUAL_CHUNK = 1 << 16                   # served to EwfImage in chunks of this size
+_AFF4_STREAM_CACHE = 64                         # decompressed stream chunks kept
+_AFF4_INDEX_CACHE = 16                          # bevy indexes kept
+_AFF4_SIBLINGS = (".aff4", ".af4")
+_AFF4_BLOCK_ORDER = ("md5", "sha1", "sha256", "sha512", "blake2b")   # AFF4 Standard 6.2
+# What an acquisition records about itself, by the local names Evimetry, pyaff4 and
+# the pre-standard images use, under the names ewfprobe gives an E01's header.
+_AFF4_METADATA = {
+    "caseName": "case_name", "caseNumber": "case_number",
+    "caseDescription": "description", "evidenceNumber": "evidence_number",
+    "examiner": "examiner", "notes": "notes",
+    "diskMake": "drive_make", "make": "drive_make",
+    "diskModel": "drive_model", "model": "drive_model",
+    "diskSerial": "drive_serial_number", "serial": "drive_serial_number",
+    "diskFirmware": "drive_firmware", "firmwareString": "drive_firmware",
+    "diskDeviceName": "device_name", "deviceName": "device_name",
+    "diskInterfaceType": "drive_interface",
+    "acquisitionCompletionState": "acquisition_state",
+    "startTime": "acquisition_start", "StartTime": "acquisition_start",
+    "endTime": "acquisition_end", "EndTime": "acquisition_end",
+}
+
+
+def _aff4_hash_kind(datatype):
+    """(label, hashlib name) for a linear hash datatype, ("block map", name) for an
+    aff4:blockMapHashSHA512 or SHA256 one, else None."""
+    local = (datatype or "").rsplit("#", 1)[-1].lower()
+    if local in _AFF4_BLOCK_ORDER:
+        return local.upper(), local
+    m = re.fullmatch(r"blockmaphash(sha256|sha512)", local)
+    if m:
+        return "block map", m.group(1)
+    return None
+
+
+def _aff4_codec(uri):
+    """The compression an ImageStream's aff4:compressionMethod names, as stored,
+    snappy, lz4, zlib or deflate. None means stored (AFF4 Standard 3.3)."""
+    low = "" if uri is None else uri.lower()
+    if uri is None or low.endswith(("nullcompressor", "compression/stored")):
+        return "stored"                           # c-aff4 spells the legacy one nullCompressor
+    if "snappy" in low:
+        # pyaff4 (lexicon.py) names Scudette's early writer github.com/google/snappy,
+        # which compressed every chunk, stored-length ones included.
+        return "snappy-always" if "github.com/google/snappy" in low else "snappy"
+    if "lz4" in low:
+        return "lz4"
+    if "rfc1950" in low:
+        return "zlib"
+    if "rfc1951" in low:
+        return "deflate"
+    raise EwfFormatError(f"the image stream uses compression {uri}, which ewfprobe "
+                         f"does not read")
+
+
+def _aff4_zip_comment(fh):
+    """The ZIP comment, from the end-of-central-directory record in the last 64 KiB."""
+    fh.seek(0, os.SEEK_END)
+    size = fh.tell()
+    fh.seek(max(0, size - 65536 - 22))
+    tail = fh.read()
+    at = tail.rfind(b"PK\x05\x06")
+    if at < 0 or at + 22 > len(tail):
+        return None
+    length = struct.unpack_from("<H", tail, at + 20)[0]
+    return tail[at + 22:at + 22 + length]
+
+
+def is_aff4(path) -> bool:
+    """True when the file is an AFF4 ZIP container: a ZIP whose comment starts with
+    the volume's aff4:// URI or whose first member is container.description, the two
+    places the AFF4 Standard (5.4) says a producer stores it. Neither check reads the
+    central directory, so a large ordinary ZIP is turned away cheaply."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(30)
+            if head[:4] != b"PK\x03\x04":
+                return False
+            name_len = struct.unpack_from("<H", head, 26)[0]
+            if fh.read(name_len) == b"container.description":
+                return True
+            comment = _aff4_zip_comment(fh)
+            return bool(comment) and comment.startswith(b"aff4://")
+    except (OSError, struct.error):
+        return False
+
+
+class _Aff4Volume:
+    """One AFF4 ZIP file: its members by name (percent-escapes decoded), its volume
+    URI and its information.turtle."""
+
+    def __init__(self, path, index):
+        self.path = path
+        self.index = index
+        try:
+            with zipfile.ZipFile(path) as z:
+                infos = z.infolist()
+                comment = z.comment
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise EwfFormatError(f"{os.path.basename(path)} is not a readable ZIP: "
+                                 f"{exc}") from exc
+        self.members = {}
+        for info in infos:
+            self.members.setdefault(urllib.parse.unquote(info.filename), info)
+        self._starts: dict = {}
+        urn = comment.split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
+        if "container.description" in self.members:
+            urn = self.read_whole("container.description").decode("utf-8",
+                                                                   "replace").strip()
+        self.urn = urn
+        if "information.turtle" not in self.members:
+            raise EwfFormatError(f"{os.path.basename(path)} has no information.turtle, "
+                                 f"so it is not an AFF4 container ewfprobe reads")
+        self.prefixes: dict = {}
+        self.graph = _turtle(self.read_whole("information.turtle").decode("utf-8"),
+                             self.prefixes)
+        version = self.members.get("version.txt")
+        self.version = {}
+        if version is not None:
+            for line in re.split(r"\r\n|\r|\n", self.read_whole("version.txt").decode(
+                    "utf-8", "replace")):
+                key, sep, value = line.partition("=")
+                if sep:
+                    self.version[key.strip()] = value.strip()
+
+    def name_of(self, urn):
+        """The member name an object's URI maps to (AFF4 Standard 5.1): relative to
+        the volume when it starts with the volume URI, else the whole URI."""
+        if self.urn and urn.startswith(self.urn + "/"):
+            return urn[len(self.urn) + 1:]
+        return urn
+
+    def find(self, urn):
+        return self.members.get(self.name_of(urn))
+
+    def read_whole(self, name):
+        with zipfile.ZipFile(self.path) as z:
+            return z.read(self.members[name])
+
+    def data_start(self, info, fh):
+        """Where a stored member's bytes begin: after its local header, whose name and
+        extra field lengths can differ from the central directory's."""
+        start = self._starts.get(info.filename)
+        if start is None:
+            fh.seek(info.header_offset)
+            head = _read_exactly(fh, 30)
+            if head[:4] != b"PK\x03\x04":
+                raise EwfFormatError(f"the ZIP entry for {info.filename} has no local "
+                                     f"header where the directory says")
+            name_len, extra_len = struct.unpack_from("<HH", head, 26)
+            start = info.header_offset + 30 + name_len + extra_len
+            self._starts[info.filename] = start
+        return start
+
+
+class _Aff4Symbolic:
+    """A symbolic stream (AFF4 Standard 4.4): one byte repeated, or a string repeated
+    in 1 MiB tiles (UnknownData, UnreadableData), read at the offset asked."""
+
+    def __init__(self, name, byte=None, text=None):
+        self.name = name
+        self.byte = byte
+        if text is not None:
+            tile = text * (_AFF4_TILE // len(text))
+            self.tile = tile + text[:_AFF4_TILE - len(tile)]
+        else:
+            self.tile = None
+
+    def read_at(self, offset, n):
+        if self.tile is None:
+            return self.byte * n
+        out = bytearray()
+        while len(out) < n:
+            at = (offset + len(out)) % _AFF4_TILE
+            out += self.tile[at:at + n - len(out)]
+        return bytes(out)
+
+
+def _aff4_symbolic(uri):
+    """The symbolic stream a URI names, in the standard or the pre-standard spelling
+    (the latter as pyaff4's stream_factory.py lists them), else None."""
+    for ns in (_AFF4_NS, _AFF4_LEGACY_NS):
+        if not uri.startswith(ns):
+            continue
+        local = uri[len(ns):]
+        if local == "Zero":
+            return _Aff4Symbolic("Zero", byte=b"\x00")
+        if local == "UnknownData":
+            return _Aff4Symbolic("UnknownData", text=b"UNKNOWN")
+        if local == "UnreadableData":
+            return _Aff4Symbolic("UnreadableData", text=b"UNREADABLEDATA")
+        m = re.fullmatch(r"(?:SymbolicStream)?([0-9A-Fa-f]{2})", local)
+        if m:
+            return _Aff4Symbolic(f"SymbolicStream{m.group(1).upper()}",
+                                 byte=bytes.fromhex(m.group(1)))
+    if uri.startswith(_AFF4_LEGACY_SYMBOLIC):
+        local = uri[len(_AFF4_LEGACY_SYMBOLIC):]
+        if re.fullmatch(r"[0-9A-Fa-f]{2}", local):
+            return _Aff4Symbolic(f"SymbolicStream{local.upper()}",
+                                 byte=bytes.fromhex(local))
+    return None
+
+
+class _Aff4Container:
+    """Resolve AFF4 objects by URI across the ZIP files of one acquisition, and build
+    a reader for any stream: an ImageStream, a Map, or a symbolic stream."""
+
+    def __init__(self, image, path):
+        self.image = image                         # the EwfImage, for its file handles
+        self.volumes = [_Aff4Volume(path, 0)]
+        self._candidates = None                    # sibling files, opened on demand
+        self.graph: dict = {}
+        self.prefixes: dict = {}
+        self._merge(self.volumes[0])
+        self.readers: dict = {}
+
+    def _merge(self, volume):
+        for name, iri in volume.prefixes.items():
+            self.prefixes.setdefault(name, iri)
+        for subject, props in volume.graph.items():
+            mine = self.graph.setdefault(subject, {})
+            for predicate, objs in props.items():
+                have = mine.setdefault(predicate, [])
+                have.extend(o for o in objs if o not in have)
+
+    def _siblings(self):
+        """The other AFF4 files beside the first, where a striped acquisition (AFF4
+        Standard 7.1) keeps the rest of its image streams. They are opened once, and
+        one joins the image only when it holds a segment the image needs, so an
+        unrelated container in the same folder is never read as part of it."""
+        if self._candidates is None:
+            self._candidates = []
+            first = os.path.abspath(self.volumes[0].path)
+            folder = os.path.dirname(first)
+            for name in sorted(os.listdir(folder)):
+                full = os.path.join(folder, name)
+                if (full != first and name.lower().endswith(_AFF4_SIBLINGS)
+                        and os.path.isfile(full) and is_aff4(full)):
+                    try:
+                        self._candidates.append(_Aff4Volume(full, -1))
+                    except EwfFormatError:
+                        continue
+        return self._candidates
+
+    def member(self, urn, needed=True):
+        """(volume, ZipInfo) for the segment a URI names, from the first file or,
+        failing that, from a sibling file, which then joins the image."""
+        for volume in self.volumes:
+            info = volume.find(urn)
+            if info is not None:
+                return volume, info
+        for volume in self._siblings():
+            info = volume.find(urn)
+            if info is not None:
+                self._candidates.remove(volume)
+                volume.index = len(self.volumes)
+                self.volumes.append(volume)
+                self.image.paths.append(volume.path)
+                self._merge(volume)
+                return volume, info
+        if needed:
+            raise EwfIncompleteSetError(
+                f"the segment {urn} is in none of the AFF4 files beside "
+                f"{os.path.basename(self.volumes[0].path)}; a striped acquisition "
+                f"keeps its image streams in several files, and every one has to be "
+                f"in the same folder")
+        return None
+
+    def read_member(self, urn, offset=0, n=None):
+        volume, info = self.member(urn)
+        if n is None:
+            n = info.file_size - offset
+        if offset + n > info.file_size:
+            raise EwfFormatError(f"a read of {urn} runs past its end")
+        if info.compress_type != zipfile.ZIP_STORED:
+            return volume.read_whole(volume.name_of(urn))[offset:offset + n]
+        fh = self.image._handle(volume.index)
+        fh.seek(volume.data_start(info, fh) + offset)
+        return _read_exactly(fh, n)
+
+    def props(self, subject):
+        return self.graph.get(subject, {})
+
+    def values(self, subject, name):
+        """The objects of a subject's AFF4 property, in either namespace and under any
+        of its known spellings."""
+        found = []
+        for local in _AFF4_NAMES.get(name, (name,)):
+            for ns in (_AFF4_NS, _AFF4_LEGACY_NS):
+                found.extend(self.props(subject).get(ns + local, ()))
+        return found
+
+    def one(self, subject, name):
+        found = self.values(subject, name)
+        return found[0] if found else None
+
+    def number(self, subject, name):
+        obj = self.one(subject, name)
+        if obj is None or obj[0] != "lit":
+            return None
+        try:
+            return int(obj[1])
+        except ValueError:
+            raise EwfFormatError(f"{name} of {subject} is {obj[1]!r}, not a number") from None
+
+    def is_a(self, subject, name):
+        kinds = {o[1] for o in self.props(subject).get(_RDF_TYPE, ()) if o[0] == "iri"}
+        return any(ns + local in kinds for local in _AFF4_NAMES.get(name, (name,))
+                   for ns in (_AFF4_NS, _AFF4_LEGACY_NS))
+
+    def reader(self, urn):
+        if urn in self.readers:
+            found = self.readers[urn]
+            if found is None:                      # still being built: a map loop
+                raise EwfFormatError(f"the map {urn} refers back to itself")
+            return found
+        symbolic = _aff4_symbolic(urn)
+        if symbolic is not None:
+            found = symbolic
+        elif self.is_a(urn, "EncryptedStream"):
+            raise EwfFormatError("the image is an encrypted AFF4 stream, which ewfprobe "
+                                 "does not read")
+        elif self.is_a(urn, "Map"):
+            self.readers[urn] = None
+            try:
+                found = _Aff4Map(self, urn)
+            finally:
+                del self.readers[urn]
+        elif self.is_a(urn, "ImageStream") or self.values(urn, "chunkSize"):
+            found = _Aff4ImageStream(self, urn)
+        elif self.member(f"{urn}/00000000", needed=False) is not None and (
+                self.is_a(urn, "ImageStream") or self.values(urn, "chunkSize")):
+            # a striped file can name another file's stream only in its map; finding
+            # the stream's first segment brought that file, and its description, in
+            found = _Aff4ImageStream(self, urn)
+        elif any(o == ("iri", urn) for subject in self.graph
+                 for o in self.values(subject, "dependentStream")):
+            raise EwfIncompleteSetError(
+                f"the image stream {urn} is in none of the AFF4 files beside "
+                f"{os.path.basename(self.volumes[0].path)}; a striped acquisition keeps "
+                f"its image streams in several files, and every one has to be in the "
+                f"same folder")
+        else:
+            raise EwfFormatError(f"the image refers to {urn}, which the container does "
+                                 f"not describe as a map or an image stream")
+        self.readers[urn] = found
+        return found
+
+
+class _Aff4ImageStream:
+    """An aff4:ImageStream: chunks of chunkSize bytes, chunksInSegment of them to a
+    bevy segment, each bevy with an index of where its chunks lie (AFF4 Standard 3).
+    A chunk whose stored length is chunkSize is stored, anything shorter compressed."""
+
+    def __init__(self, container, urn):
+        self.c = container
+        self.urn = urn
+        self.name = urn
+        # In a striped set each file describes the other files' streams only in part,
+        # so the file holding this stream's first bevy is found, and its description
+        # merged, before the stream's properties are read.
+        container.member(self.bevy(0))
+        self.size = container.number(urn, "size")
+        self.chunk_size = container.number(urn, "chunkSize")
+        self.per_bevy = container.number(urn, "chunksInSegment")
+        method = container.one(urn, "compressionMethod")
+        self.method = None if method is None else method[1]
+        self.codec = _aff4_codec(self.method)
+        if self.size is None or not self.chunk_size:
+            raise EwfFormatError(f"the image stream {urn} records no size or chunk size")
+        if not self.per_bevy:
+            raise EwfFormatError(f"the image stream {urn} records no chunks in segment")
+        self.chunk_count = -(-self.size // self.chunk_size)
+        self.bevy_count = -(-self.chunk_count // self.per_bevy)
+        self._index: OrderedDict = OrderedDict()
+        self._cache: OrderedDict = OrderedDict()
+        for b in range(self.bevy_count):          # a missing bevy is a missing file
+            container.member(self.bevy(b))
+
+    def bevy(self, b):
+        return f"{self.urn}/{b:08d}"
+
+    def index_segment(self, b):
+        """The URI of bevy b's index, in the file that holds the bevy: <bevy>.index in
+        AFF4 Standard v1.0, <bevy>/index in the pre-standard images."""
+        volume, _info = self.c.member(self.bevy(b))
+        std = self.bevy(b) + ".index"
+        return std if volume.find(std) is not None else self.bevy(b) + "/index"
+
+    def bevy_index(self, b):
+        found = self._index.get(b)
+        if found is not None:
+            self._index.move_to_end(b)
+            return found
+        name = self.index_segment(b)
+        raw = self.c.read_member(name)
+        if name.endswith(".index"):
+            if len(raw) % _AFF4_INDEX_ENTRY.size:
+                raise EwfFormatError(f"the index {name} is not whole 12-byte entries")
+            entries = list(_AFF4_INDEX_ENTRY.iter_unpack(raw))
+        else:
+            # Pre-standard: 32-bit offsets. As pyaff4 (aff4_image.py, _parse_bevy_index)
+            # reads them, Evimetry lists where each chunk ends, so the first chunk
+            # starts at 0; a list that starts at 0 lists where each chunk begins, and
+            # the last chunk runs to the end of the bevy.
+            offsets = [o for (o,) in struct.iter_unpack("<I", raw[:len(raw) // 4 * 4])]
+            bevy_size = self.c.member(self.bevy(b))[1].file_size
+            if offsets and offsets[0] != 0:
+                starts = [0] + offsets[:-1]
+                entries = [(s, e - s) for s, e in zip(starts, offsets)]
+            else:
+                ends = offsets[1:] + [bevy_size]
+                entries = [(s, e - s) for s, e in zip(offsets, ends)]
+        if len(self._index) >= _AFF4_INDEX_CACHE:
+            self._index.popitem(last=False)
+        self._index[b] = entries
+        return entries
+
+    def chunk(self, k):
+        found = self._cache.get(k)
+        if found is not None:
+            self._cache.move_to_end(k)
+            return found
+        b, i = divmod(k, self.per_bevy)
+        entries = self.bevy_index(b)
+        if i >= len(entries):
+            raise EwfFormatError(f"chunk {k:,} of {self.urn} is past the end of its "
+                                 f"bevy's index")
+        offset, length = entries[i]
+        stored = self.c.read_member(self.bevy(b), offset, length)
+        data = self._decode(stored, k)
+        want = min(self.chunk_size, self.size - k * self.chunk_size)
+        data = data[:want]
+        if len(data) < want:
+            raise EwfFormatError(f"chunk {k:,} of {self.urn} decodes to {len(data):,} "
+                                 f"bytes, not {want:,}")
+        if len(self._cache) >= _AFF4_STREAM_CACHE:
+            self._cache.popitem(last=False)
+        self._cache[k] = data
+        return data
+
+    def _decode(self, stored, k):
+        if self.codec == "stored" or (len(stored) == self.chunk_size
+                                      and self.codec != "snappy-always"):
+            return stored                         # AFF4 Standard 3.2: a stored chunk
+        try:
+            if self.codec in ("snappy", "snappy-always"):
+                return _snappy_decompress(stored)
+            if self.codec == "lz4":
+                return _aff4_lz4(stored, self.chunk_size)
+            return _aff4_inflate(stored)
+        except (IndexError, EwfFormatError) as exc:
+            if self.codec == "snappy-always" and len(stored) == self.chunk_size:
+                return stored                     # not Snappy after all: stored
+            raise EwfFormatError(f"chunk {k:,} of {self.urn} does not decompress as "
+                                 f"{self.codec}: {exc}") from exc
+
+    def read_at(self, offset, n):
+        out = bytearray()
+        end = min(offset + n, self.size)
+        while offset < end:
+            k, within = divmod(offset, self.chunk_size)
+            piece = self.chunk(k)[within:within + end - offset]
+            out += piece
+            offset += len(piece)
+        if len(out) < n:
+            raise EwfFormatError(f"a map entry reads past the end of {self.urn}")
+        return bytes(out)
+
+
+class _Aff4Map:
+    """An aff4:Map: ranges of the image, each pointing at a stream and an offset in it,
+    the streams named line by line in idx. What no range covers reads from
+    aff4:mapGapDefaultStream, else aff4:Zero (AFF4 Standard 4)."""
+
+    def __init__(self, container, urn):
+        self.c = container
+        self.urn = urn
+        self.name = urn
+        self.size = container.number(urn, "size")
+        raw = container.read_member(urn + "/map")
+        if len(raw) % _AFF4_MAP_ENTRY.size:
+            raise EwfFormatError(f"the map {urn} is not whole 28-byte entries")
+        # The standard says \n separates the lines; Evimetry's pre-standard images use
+        # \r\n, and pyaff4 (aff4_map.py) splits on either.
+        names = container.read_member(urn + "/idx").decode("utf-8").splitlines()
+        self.target_names = names
+        self.targets = [container.reader(name) for name in names]
+        entries = sorted(e for e in _AFF4_MAP_ENTRY.iter_unpack(raw) if e[1])
+        for a, b in zip(entries, entries[1:]):
+            if a[0] + a[1] > b[0]:
+                raise EwfFormatError(f"the map {urn} has overlapping ranges at "
+                                     f"{b[0]:,}, which ewfprobe does not resolve")
+        for e in entries:
+            if e[3] >= len(self.targets):
+                raise EwfFormatError(f"the map {urn} names target {e[3]}, which its idx "
+                                     f"does not list")
+        if self.size is None:
+            self.size = max((e[0] + e[1] for e in entries), default=0)
+        self.entries = entries
+        self.starts = [e[0] for e in entries]
+        gap = container.one(urn, "mapGapDefaultStream")
+        self.gap = container.reader(gap[1]) if gap else _aff4_symbolic(_AFF4_NS + "Zero")
+        self.gap_uri = gap[1] if gap else None
+
+    def read_at(self, offset, n):
+        out = bytearray()
+        end = min(offset + n, self.size)
+        i = max(0, bisect.bisect_right(self.starts, offset) - 1)
+        while offset < end:
+            entry = self.entries[i] if i < len(self.entries) else None
+            if entry is None or offset < entry[0]:
+                stop = end if entry is None else min(end, entry[0])
+                out += self.gap.read_at(offset, stop - offset)
+                offset = stop
+                continue
+            start, length, target_offset, target = entry
+            if offset < start + length:
+                take = min(end, start + length) - offset
+                out += self.targets[target].read_at(target_offset + offset - start, take)
+                offset += take
+            i += 1
+        return bytes(out)
+
+    def coverage(self):
+        """Bytes of the image by where they come from: each target's name, and the
+        gaps."""
+        totals: dict = {}
+        for _start, length, _to, target in self.entries:
+            key = getattr(self.targets[target], "name", self.target_names[target])
+            totals[key] = totals.get(key, 0) + length
+        covered = sum(e[1] for e in self.entries)
+        if self.size > covered:
+            totals["(in no map range; read from " + (
+                self.gap.name if isinstance(self.gap, _Aff4Symbolic) else self.gap_uri)
+                   + ")"] = self.size - covered
+        return totals
+
+
 class EwfImage:
     """An EWF-E01, EWF-S01, EWF2-Ex01, AFF or AFD acquisition, read as one seekable stream,
     or an EWF-L01, read as its media data with its entries in ``logical_entries``.
@@ -1656,7 +2530,7 @@ class EwfImage:
             self.paths = list(segments)
         elif self._afd:
             self.paths = _afd_members(self._afd)
-        elif _is_aff(path) or apple_image_kind(path):
+        elif _is_aff(path) or is_aff4(path) or apple_image_kind(path):
             self.paths = [os.path.abspath(path)]
         elif adcrypt_set(path):
             self.paths = adcrypt_set(path)
@@ -1703,6 +2577,9 @@ class EwfImage:
         self._band_handles: OrderedDict[int, object] = OrderedDict()
         self.udif = None
         self.sparsebundle = None
+        self.aff4 = None
+        self._aff4 = None
+        self._aff4_reader = None
 
         self._tables: list[_Table] = []
         self._table_starts: list[int] = []
@@ -1770,6 +2647,9 @@ class EwfImage:
             return
         if magic == AF_HEADER:
             self._index_aff()
+            return
+        if magic[:4] == b"PK\x03\x04" and is_aff4(self.paths[0]):
+            self._index_aff4()
             return
         chunks = 0
         volume_seen = False
@@ -2213,6 +3093,245 @@ class EwfImage:
                              f"which ewfprobe does not read")
 
     # -- Apple disk images ----------------------------------------------------
+
+    def _index_aff4(self):
+        """Open an AFF4 container: find the image it describes, the map or image
+        stream that holds its bytes, and what it records about itself."""
+        c = _Aff4Container(self, self.paths[0])
+        self._aff4 = c
+        images = [s for s in c.graph if c.is_a(s, "Image")]
+        image = images[0] if images else None
+        data = None
+        if image is not None:
+            ds = c.one(image, "dataStream")
+            data = ds[1] if ds else (image if c.is_a(image, "Map") else None)
+        if data is None:
+            maps = [s for s in c.graph if c.is_a(s, "Map")]
+            streams = [s for s in c.graph if c.is_a(s, "ImageStream")]
+            data = (maps or streams or [None])[0]
+        if data is None:
+            raise EwfFormatError(
+                f"{os.path.basename(self.paths[0])} describes no image, map or image "
+                f"stream; an AFF4-L container of logical files is not read")
+        reader = c.reader(data)
+        self._aff4_reader = reader
+        self.format = FORMAT_AFF4
+        self.media_size = self.size = reader.size
+        self.chunk_size = _AFF4_VIRTUAL_CHUNK
+        self.chunk_count = self._indexed_chunks = -(-self.media_size // self.chunk_size)
+        self.sector_size = (c.number(image, "blockSize") if image else None) or 512
+        self.sector_count = self.media_size // self.sector_size
+        self.sectors_per_chunk = self.chunk_size // self.sector_size
+        maps, streams = self._aff4_parts()
+        self.compression_level = ", ".join(sorted({s.codec for s in streams})) or "none"
+        for subject in (image, data):
+            for obj in (c.values(subject, "hash") if subject else ()):
+                kind = _aff4_hash_kind(obj[2]) if obj[0] == "lit" else None
+                if kind and kind[0] != "block map":
+                    self.stored_hashes.setdefault(kind[0], obj[1].lower())
+        related = [image, data] + [s for s in c.graph if any(
+            o[1] in (image, data) for o in c.values(s, "target") if o[0] == "iri")]
+        for subject in (s for s in related if s):
+            for predicate, objs in c.props(subject).items():
+                local = predicate.rsplit("#", 1)[-1]
+                key = _AFF4_METADATA.get(local)
+                if key is None or not predicate.startswith((_AFF4_NS, _AFF4_LEGACY_NS)):
+                    continue
+                for obj in objs:
+                    if obj[0] == "lit" and obj[1].strip():
+                        have = self.metadata.get(key)
+                        if have is None:
+                            self.metadata[key] = obj[1].strip()
+                        elif obj[1].strip() not in have.split("; "):
+                            self.metadata[key] = have + "; " + obj[1].strip()
+        version = c.volumes[0].version
+        if version.get("tool"):
+            self.metadata.setdefault("acquiry_software_version", version["tool"])
+
+        def short(iri):
+            for name, base in sorted(c.prefixes.items(), key=lambda kv: -len(kv[1])):
+                if iri.startswith(base) and base:
+                    return f"{name}:{iri[len(base):]}"
+            return iri
+
+        vendor = []
+        for predicate, objs in (c.props(image).items() if image else ()):
+            if predicate.startswith((_AFF4_NS, _AFF4_LEGACY_NS, _RDF_TYPE)):
+                continue
+            for obj in objs:
+                vendor.append((short(predicate), short(obj[1]) if obj[0] == "iri"
+                               else obj[1]))
+        self.aff4 = {
+            "volume": c.volumes[0].urn,
+            "version": (f"{version['major']}.{version['minor']}"
+                        if "major" in version and "minor" in version else None),
+            "tool": version.get("tool"),
+            "image": image,
+            "images": len(images),
+            "image_types": [short(o[1]) for o in (c.props(image).get(_RDF_TYPE, ())
+                                                  if image else ()) if o[0] == "iri"],
+            "data_stream": data,
+            "streams": [{"urn": st.urn, "compression": st.codec, "method": st.method,
+                         "chunk_size": st.chunk_size, "chunks_in_segment": st.per_bevy,
+                         "size": st.size,
+                         "file": os.path.basename(c.member(st.bevy(0))[0].path)}
+                        for st in streams],
+            "coverage": (list(reader.coverage().items()) if isinstance(reader, _Aff4Map)
+                         else [(reader.name, reader.size)]),
+            "vendor_properties": vendor,
+        }
+
+    def _aff4_parts(self, readers=None):
+        """The maps and image streams an AFF4 image reads through, each once."""
+        maps, streams, seen = [], [], set()
+        todo = list(readers or [self._aff4_reader])
+        while todo:
+            r = todo.pop(0)
+            if id(r) in seen:
+                continue
+            seen.add(id(r))
+            if isinstance(r, _Aff4Map):
+                maps.append(r)
+                todo.extend(r.targets)
+            elif isinstance(r, _Aff4ImageStream):
+                streams.append(r)
+        return maps, streams
+
+    def _chunk_data_aff4(self, n):
+        start = n * self.chunk_size
+        return self._aff4_reader.read_at(start, min(self.chunk_size,
+                                                    self.media_size - start))
+
+    def _verify_aff4(self, progress):
+        """Recompute what an AFF4 container records about its own data (AFF4 Standard
+        6): each image stream's linear hashes, each chunk's block hash and the hash of
+        each stream's block hashes, each map's segment hashes, the block map hash of
+        each map with its stream, and the image's hash over those. The orderings are
+        pyaff4's (block_hasher.py), which the reference images agree with."""
+        c = self._aff4
+        image = self.aff4["image"]
+        roots = [self._aff4_reader]
+        if image is not None:                     # a striped image names a map per file
+            for obj in c.values(image, "dataStream"):
+                if obj[0] == "iri" and obj[1] != self.aff4["data_stream"]:
+                    roots.append(c.reader(obj[1]))
+        maps, streams = self._aff4_parts(roots)
+        checks = []
+        outer: dict = {}                          # stream urn -> {algo: digest of block hashes}
+        total = sum(st.size for st in streams) or 1
+        done = 0
+        for st in streams:
+            volume = c.member(st.bevy(0))[0]
+            standard = volume.find(st.bevy(0) + ".index") is not None
+
+            def segment(b, algo, st=st, standard=standard):
+                return f"{st.bevy(b)}{'.' if standard else '/'}blockHash.{algo}"
+
+            algos = [a for a in _AFF4_BLOCK_ORDER
+                     if c.member(segment(0, a), needed=False) is not None]
+            linear = []
+            for obj in c.values(st.urn, "hash"):
+                kind = _aff4_hash_kind(obj[2]) if obj[0] == "lit" else None
+                if kind and kind[0] != "block map":
+                    linear.append((kind[0], obj[1].lower(), hashlib.new(kind[1])))
+            # the hash kept of each algorithm's block hashes: the BlockHashes object's
+            # own datatype in the standard, the block algorithm itself before it
+            wraps = {}
+            for a in algos:
+                if standard:
+                    obj = c.one(f"{st.urn}/blockhash.{a}", "hash")
+                    kind = _aff4_hash_kind(obj[2]) if obj and obj[0] == "lit" else None
+                    if kind and kind[0] != "block map":
+                        wraps[a] = (kind[0], obj[1].lower(), hashlib.new(kind[1]))
+                else:
+                    for obj in c.values(st.urn, "blockHashesHash"):
+                        kind = _aff4_hash_kind(obj[2]) if obj[0] == "lit" else None
+                        if kind and kind[1] == a:
+                            wraps[a] = (kind[0], obj[1].lower(), hashlib.new(a))
+            bad = {a: 0 for a in algos}
+            stored_blocks: dict = {}
+            for k in range(st.chunk_count):
+                data = st.chunk(k)
+                for _name, _want, h in linear:
+                    h.update(data)
+                b, i = divmod(k, st.per_bevy)
+                for a in algos:
+                    raw = stored_blocks.get((a, b))
+                    if raw is None:
+                        if len(stored_blocks) > 16:
+                            stored_blocks.clear()
+                        raw = c.read_member(segment(b, a))
+                        stored_blocks[(a, b)] = raw
+                    digest = hashlib.new(a, data).digest()
+                    size = len(digest)
+                    if raw[i * size:(i + 1) * size] != digest:
+                        bad[a] += 1
+                    if a in wraps:
+                        wraps[a][2].update(digest)
+                done += len(data)
+                if progress:
+                    progress(done, total)
+            for name, want, h in linear:
+                checks.append((f"image stream {st.urn}", name, want, h.hexdigest()))
+            for a in algos:
+                n = st.chunk_count
+                checks.append((f"chunk hashes of {st.urn}", a.upper(),
+                               f"{n:,} of {n:,} agree", f"{n - bad[a]:,} of {n:,} agree"))
+            outer[st.urn] = {}
+            for a, (name, want, h) in wraps.items():
+                checks.append((f"block hashes of {st.urn}", name, want, h.hexdigest()))
+                outer[st.urn][a] = h.digest()
+        block_map: dict = {}
+        for m in maps:
+            parts = {"map": c.read_member(m.urn + "/map"), "idx": c.read_member(m.urn + "/idx")}
+            if c.member(m.urn + "/mapPath", needed=False) is not None:
+                parts["mapPath"] = c.read_member(m.urn + "/mapPath")
+            computed = {}
+            for prop, pieces in (("mapIdxHash", ["idx"]), ("mapPointHash", ["map"]),
+                                 ("mapPathHash", ["mapPath"]),
+                                 ("mapHash", ["map", "idx", "mapPath"])):
+                obj = c.one(m.urn, prop)
+                kind = _aff4_hash_kind(obj[2]) if obj and obj[0] == "lit" else None
+                if kind is None or kind[0] == "block map":
+                    continue
+                h = hashlib.new(kind[1])
+                for piece in pieces:
+                    h.update(parts.get(piece, b""))
+                checks.append((f"{prop} of map {m.urn}", kind[0], obj[1].lower(),
+                               h.hexdigest()))
+                computed[prop] = h.digest()
+            # the pre-standard images call a map's block map hash blockHashesHash
+            stored = c.one(m.urn, "blockMapHash") or c.one(m.urn, "blockHashesHash")
+            kind = _aff4_hash_kind(stored[2]) if stored and stored[0] == "lit" else None
+            home = c.member(m.urn + "/map")[0]
+            local = [st for st in streams if c.member(st.bevy(0))[0] is home]
+            if kind is None or len(local) != 1:
+                continue
+            h = hashlib.new(kind[1])
+            for a in _AFF4_BLOCK_ORDER:
+                if a in outer.get(local[0].urn, {}):
+                    h.update(outer[local[0].urn][a])
+            for prop in ("mapPointHash", "mapIdxHash", "mapPathHash"):
+                if prop in computed:
+                    h.update(computed[prop])
+            checks.append((f"block map hash of map {m.urn}", kind[1].upper(),
+                           stored[1].lower(), h.hexdigest()))
+            block_map[m.urn] = h.digest()
+        for obj in (c.values(image, "hash") if image else ()):
+            kind = _aff4_hash_kind(obj[2]) if obj[0] == "lit" else None
+            if not kind or kind[0] != "block map" or not block_map:
+                continue
+            if len(block_map) == 1:
+                got = next(iter(block_map.values())).hex()
+            else:                                 # one level up, by map URI (pyaff4)
+                h = hashlib.new(kind[1])
+                for urn in sorted(block_map):
+                    h.update(block_map[urn])
+                got = h.hexdigest()
+            checks.append((f"image {image}, over its block map hashes", kind[1].upper(),
+                           obj[1].lower(), got))
+        return [{"what": what, "algorithm": algo, "stored": want, "computed": got,
+                 "match": want == got} for what, algo, want, got in checks]
 
     def _apple_finish(self, sectors, fmt, sizes=None):
         """Fields every reader of the stream relies on, for an Apple disk image."""
@@ -3009,6 +4128,8 @@ class EwfImage:
             return self._keep(n, self._chunk_data_bundle(n), want)
         if self.format == FORMAT_UDRW:
             return self._keep(n, self._chunk_data_udrw(n), want)
+        if self.format == FORMAT_AFF4:
+            return self._keep(n, self._chunk_data_aff4(n), want)
         if self.format == FORMAT_RAW:
             return self._keep(n, self._chunk_data_raw(n), want)
 
@@ -3129,25 +4250,26 @@ class EwfImage:
         ``match`` value that is True, False, or None when the acquisition
         recorded no hash to compare against.
         """
-        md5 = hashlib.md5()
-        sha1 = hashlib.sha1()
-        sha256 = hashlib.sha256() if "SHA256" in self.stored_hashes else None
-        self.seek(0)
+        names = ["MD5", "SHA1"] + [n for n in ("SHA256", "SHA512", "BLAKE2B")
+                                   if n in self.stored_hashes]
+        hashers = {n: hashlib.new(n.lower()) for n in names}
         done = 0
-        while True:
+        # An AFF4 image that recorded no hash of the disk is checked through what it
+        # did record about its own streams; hashing a disk that is mostly unrecorded
+        # space would take long and compare with nothing.
+        if self.format == FORMAT_AFF4 and not self.stored_hashes:
+            hashers = {}
+        self.seek(0)
+        while hashers:
             data = self.read(block)
             if not data:
                 break
-            md5.update(data)
-            sha1.update(data)
-            if sha256 is not None:
-                sha256.update(data)
+            for h in hashers.values():
+                h.update(data)
             done += len(data)
             if progress:
                 progress(done, self.media_size)
-        computed = {"MD5": md5.hexdigest(), "SHA1": sha1.hexdigest()}
-        if sha256 is not None:
-            computed["SHA256"] = sha256.hexdigest()
+        computed = {n: h.hexdigest() for n, h in hashers.items()}
         match = None
         for name, value in self.stored_hashes.items():
             if name in computed:
@@ -3166,7 +4288,8 @@ class EwfImage:
             checked += 1
             if digest.hexdigest() != entry.md5:
                 mismatched.append(entry.path)
-        container = self._verify_udif(block, None) if self.format == FORMAT_UDIF else []
+        container = (self._verify_udif(block, None) if self.format == FORMAT_UDIF else
+                     self._verify_aff4(progress) if self.format == FORMAT_AFF4 else [])
         return {
             "computed": computed,
             "stored": dict(self.stored_hashes),
@@ -3210,12 +4333,14 @@ class EwfImage:
             "stored_bands": len(self._bands) if self.format == FORMAT_SPARSEIMAGE else None,
             "sparsebundle": None if self.sparsebundle is None else dict(self.sparsebundle),
             "encryption": None if self.encryption is None else dict(self.encryption),
+            "aff4": None if self.aff4 is None else dict(self.aff4),
         }
 
 
 def open_ewf(path, segments=None, password=None) -> EwfImage:
     """Open an acquisition ewfprobe reads: an EWF, EWF2 or L01 set from any path in
-    it, an AFF file, an AFD directory from the directory or any file in it, an Apple
+    it, an AFF file, an AFD directory from the directory or any file in it, an AFF4
+    container (a striped one from any of its files), an Apple
     .dmg (a segmented one from its .dmg) or .sparseimage, or a sparse bundle from its
     folder, or an AD-encrypted E01, SMART or raw set from its first file (a raw set
     from any of its files). An encrypted Apple disk image or AD-encrypted set opens
@@ -3342,6 +4467,26 @@ def _cmd_info(args):
                     print("Info.bckup      differs from Info.plist; Info.plist was used")
             elif d["format"] in (FORMAT_UDRW, FORMAT_RAW):
                 pass                            # the disk itself: no chunks or bands
+            elif d["format"] == FORMAT_AFF4:
+                a = d["aff4"]
+                print(f"AFF4 version    {a['version'] or 'not recorded (pre-standard)'}"
+                      f"{', written by ' + a['tool'] if a['tool'] else ''}")
+                if a["image"]:
+                    print(f"AFF4 image      {a['image']}"
+                          f"{' (' + ', '.join(a['image_types']) + ')' if a['image_types'] else ''}")
+                if a["images"] > 1:
+                    print(f"                the container describes {a['images']} images; "
+                          f"this is the first")
+                for st in a["streams"]:
+                    print(f"image stream    {st['urn']} in {_shown(st['file'])}")
+                    print(f"                {st['size']:,} bytes, {st['compression']}, "
+                          f"{st['chunk_size']:,}-byte chunks, {st['chunks_in_segment']:,} "
+                          f"to a segment")
+                print("where the bytes come from")
+                for name, count in a["coverage"]:
+                    print(f"  {count:>22,}  {_shown(name)}")
+                for key, value in a["vendor_properties"]:
+                    print(f"{_shown(key):<26}{_shown(value)}")
             else:
                 unit = "page size " if d["format"] in (FORMAT_AFF, FORMAT_AFD) else "chunk size"
                 print(f"{unit}      {d['chunk_size']:,} bytes "
@@ -3396,7 +4541,8 @@ def _cmd_verify(args):
         failed = [c for c in result["container_checks"] if not c["match"]]
         for c in result["container_checks"]:
             verdict = "matches" if c["match"] else f"DOES NOT MATCH stored {c['stored']}"
-            print(f"{c['algorithm']:<6}{c['computed']}   {verdict}  ({_shown(c['what'])})")
+            algo = c["algorithm"] if len(c["algorithm"]) < 6 else c["algorithm"] + " "
+            print(f"{algo:<6}{c['computed']}   {verdict}  ({_shown(c['what'])})")
         if failed:
             return 1
         if result["entry_md5_checked"]:
@@ -3485,8 +4631,8 @@ def _export_entry(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="ewfprobe",
-        description="Read an EnCase/EWF (.E01, .Ex01), SMART (.s01) or AFF (.aff, "
-                    ".afd) forensic image, an Apple disk image (.dmg, .sparseimage, "
+        description="Read an EnCase/EWF (.E01, .Ex01), SMART (.s01), AFF (.aff, "
+                    ".afd) or AFF4 (.aff4) forensic image, an Apple disk image (.dmg, .sparseimage, "
                     ".sparsebundle), an E01, SMART or raw set FTK Imager encrypted "
                     "with AD encryption, or EnCase logical evidence (.L01). Read only.")
     ap.add_argument("--version", action="version", version=f"ewfprobe {__version__}")
