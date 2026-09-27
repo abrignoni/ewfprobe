@@ -350,3 +350,117 @@ def test_the_bound_covers_a_chunk_that_does_not_compress(tmp_path):
     path = write_ewf(tmp_path, "rand", data, chunk_size=8192, tables_per_segment=1)[0]
     with ewfprobe.open_ewf(path) as img:
         assert img.read(img.media_size) == sector_padded(data)
+
+
+# ------------------------------------------------ SMART (EWF-S01), spec-written
+
+def _smart_volume(chunk_count, sectors_per_chunk, sector_size, sector_count):
+    """The original 94-byte volume section, with SMART at offset 85."""
+    data = bytearray(94)
+    data[0] = 0x01                                        # reserved, not a media type
+    struct.pack_into("<IIII", data, 4, chunk_count, sectors_per_chunk, sector_size,
+                     sector_count)
+    data[85:90] = b"SMART"
+    struct.pack_into("<I", data, 90, zlib.adler32(bytes(data[:90])) & 0xFFFFFFFF)
+    return bytes(data)
+
+
+def write_smart(folder, stem, data, *, chunk_size=1024, sector_size=512,
+                chunks_per_segment=None, table_padding=b"\x00" * 16, level="f"):
+    """Write ``data`` as an EWF-S01 set: lowercase names, a table header with no base
+    offset, and the chunks inside the table section at offsets from the file start.
+
+    ``table_padding`` fills the 16 bytes the E01 layout reads a base offset from, so a
+    reader that took a base offset out of a SMART table would read the wrong place.
+    """
+    data = sector_padded(data, sector_size)
+    chunks = [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
+    per_segment = chunks_per_segment or len(chunks)
+    groups = [chunks[i:i + per_segment] for i in range(0, len(chunks), per_segment)]
+    paths = []
+    for index, group in enumerate(groups):
+        path = os.path.join(folder, f"{stem}.s{index + 1:02d}")
+        paths.append(path)
+        with open(path, "wb") as out:
+            out.write(struct.pack("<8sBHH", ewfprobe.SIGNATURE, 1, index + 1, 0))
+            if index == 0:
+                header = ("1\nmain\nc\tn\ta\te\tt\tav\tov\tm\tu\tp\tr\n"
+                          f"S-1\tE-1\tsmart test\tExaminer\t\t1.0\tTest OS\t"
+                          f"2026 1 1 0 0 0\t2026 1 1 0 0 0\t0\t{level}\n\n")
+                _section(out, "header", zlib.compress(header.encode("ascii")))
+                _section(out, "volume", _smart_volume(
+                    len(chunks), chunk_size // sector_size, sector_size,
+                    len(data) // sector_size))
+            start = out.tell()
+            head = struct.pack("<I", len(group)) + table_padding
+            head += struct.pack("<I", zlib.adler32(head) & 0xFFFFFFFF)
+            first_chunk = start + ewfprobe.SECTION_SIZE + len(head) + 4 * len(group)
+            packed = [zlib.compress(c, 6) for c in group]
+            entries, pos = [], first_chunk
+            for p in packed:
+                entries.append(pos | ewfprobe._COMPRESSED_BIT)
+                pos += len(p)
+            body = b"".join(struct.pack("<I", e) for e in entries)
+            _section(out, "table", head + body + b"".join(packed))
+            if index == len(groups) - 1:
+                _section(out, "hash", hashlib.md5(data).digest() + b"\x00" * 16)
+                _section(out, "done", b"", last=True)
+            else:
+                _section(out, "next", b"", last=True)
+    return paths
+
+
+def test_smart_round_trip_across_segments(tmp_path):
+    data = sample_bytes(n_chunks=9)
+    paths = write_smart(str(tmp_path), "img", data, chunks_per_segment=2)
+    assert [os.path.basename(p) for p in paths][:2] == ["img.s01", "img.s02"]
+    with ewfprobe.open_ewf(paths[2]) as img:           # any member opens the set
+        assert img.format == ewfprobe.FORMAT_S01
+        assert len(img.paths) == len(paths)
+        assert img.read(len(data)) == data
+        assert img.verify()["match"] is True
+
+
+def test_smart_table_padding_is_not_read_as_a_base_offset(tmp_path):
+    """The E01 layout reads a 64-bit base offset from bytes 8 to 16 of the table
+    header; in SMART those bytes are padding. Junk there must change nothing."""
+    data = sample_bytes(n_chunks=4)
+    path = write_smart(str(tmp_path), "img", data,
+                       table_padding=b"\xa5" * 16)[0]
+    with ewfprobe.open_ewf(path) as img:
+        assert {t.base for t in img._tables} == {0}
+        assert img.read(len(data)) == data
+
+
+def test_smart_reports_what_its_volume_section_does_not_record(tmp_path):
+    """Byte 0 of a SMART volume is a reserved 1, which the E01 layout would print
+    as fixed media; the compression level comes from the header's r value."""
+    path = write_smart(str(tmp_path), "img", sample_bytes(n_chunks=2), level="b")[0]
+    with ewfprobe.open_ewf(path) as img:
+        assert img.media_type is None
+        assert img.compression_level == "best"
+        assert img.info()["format"] == "EWF-S01"
+
+
+def test_an_incomplete_smart_set_is_refused(tmp_path):
+    paths = write_smart(str(tmp_path), "img", sample_bytes(n_chunks=9),
+                        chunks_per_segment=2)
+    os.remove(paths[-1])
+    with pytest.raises(ewfprobe.EwfIncompleteSetError):
+        ewfprobe.open_ewf(paths[0])
+
+
+def test_e01_images_still_report_their_own_format(tmp_path):
+    path = write_ewf(str(tmp_path), "img", sample_bytes(n_chunks=2))[0]
+    with ewfprobe.open_ewf(path) as img:
+        assert img.format == ewfprobe.FORMAT_E01
+        assert img.media_type == "fixed"
+
+
+def test_segment_extension_sequences():
+    e = list(ewfprobe._extension_sequence("E"))
+    s = list(ewfprobe._extension_sequence("s"))
+    assert e[0] == "E01" and e[98] == "E99" and e[99] == "EAA" and e[-1] == "ZZZ"
+    assert s[0] == "s01" and s[98] == "s99" and s[99] == "saa"
+    # after szz the first letter advances, as the E sequence does after EZZ
+    assert s[99 + 675] == "szz" and s[99 + 676] == "taa" and s[-1] == "zzz"

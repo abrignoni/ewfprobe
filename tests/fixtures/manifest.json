@@ -71,6 +71,62 @@
         "encase6-split.E03",
         "encase6-split.E04"
       ]
+    },
+    "smart-fast": {
+      "format": "smart",
+      "compression": "fast",
+      "sectors_per_chunk": 64,
+      "segment_size": null,
+      "files": [
+        "smart-fast.s01"
+      ],
+      "writer": "ewfacquire 20260924"
+    },
+    "smart-split": {
+      "format": "smart",
+      "compression": "none",
+      "sectors_per_chunk": 64,
+      "segment_size": "1M",
+      "files": [
+        "smart-split.s01",
+        "smart-split.s02",
+        "smart-split.s03",
+        "smart-split.s04"
+      ],
+      "writer": "ewfacquire 20260924"
+    },
+    "ftk-smart": {
+      "format": "smart",
+      "compression": "6",
+      "sectors_per_chunk": 64,
+      "segment_size": "1500M",
+      "files": [
+        "ftk-smart.s01"
+      ],
+      "writer": "FTK Imager 4.7.3.61"
+    },
+    "ftk-smart-split": {
+      "format": "smart",
+      "compression": "0",
+      "sectors_per_chunk": 64,
+      "segment_size": "1M",
+      "files": [
+        "ftk-smart-split.s01",
+        "ftk-smart-split.s02",
+        "ftk-smart-split.s03",
+        "ftk-smart-split.s04"
+      ],
+      "writer": "FTK Imager 4.7.3.61"
+    },
+    "ftk-e01": {
+      "format": "e01",
+      "compression": "6",
+      "sectors_per_chunk": 64,
+      "segment_size": null,
+      "files": [
+        "ftk-e01.E01"
+      ],
+      "writer": "FTK Imager 4.7.3.61"
     }
   }
 }

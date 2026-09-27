@@ -143,3 +143,44 @@ def test_metadata_written_by_ewfacquire_is_read_back():
         meta = img.metadata
     assert meta.get("case_number") == "FIXTURE"
     assert "ewfprobe fixture" in meta.get("description", "")
+
+
+def test_libewf_smart_fixtures_read_as_smart():
+    """Written by ewfacquire -f smart: lowercase segment names, the 94-byte volume
+    section and a table header with no base offset."""
+    variants = dict(_variants())
+    for name in ("smart-fast", "smart-split"):
+        assert name in variants, f"the {name} fixture is missing"
+        with ewfprobe.open_ewf(_first(variants[name])) as img:
+            assert img.format == ewfprobe.FORMAT_S01, name
+            assert img.media_type is None, name
+            assert {t.base for t in img._tables} == {0}, name
+    with ewfprobe.open_ewf(_first(variants["smart-fast"])) as img:
+        assert img.compression_level == "fast"
+
+
+def test_the_smart_split_fixture_opens_from_any_member():
+    variants = dict(_variants())
+    files = variants["smart-split"]["files"]
+    assert len(files) >= 3, "the SMART split fixture did not actually split"
+    assert all(f.rsplit(".", 1)[1].startswith("s") for f in files)
+    with ewfprobe.open_ewf(os.path.join(FIXTURES, files[-1])) as img:
+        assert [os.path.basename(p) for p in img.paths] == files
+        assert _media_sha(img) == _manifest()["sha256"]
+
+
+def test_ftk_imager_fixtures_are_read_like_the_libewf_ones():
+    """Written by FTK Imager 4.7.3.61 from the same source image, so a writer that
+    is neither this reader nor libewf. Its SMART files carry a digest section with a
+    SHA-1 beside the MD5, and its split set opens from any member."""
+    variants = dict(_variants())
+    for name in ("ftk-smart", "ftk-smart-split", "ftk-e01"):
+        assert name in variants, f"the {name} fixture is missing"
+        assert variants[name]["writer"].startswith("FTK Imager"), name
+    for name in ("ftk-smart", "ftk-smart-split"):
+        with ewfprobe.open_ewf(os.path.join(FIXTURES, variants[name]["files"][-1])) as img:
+            assert img.format == ewfprobe.FORMAT_S01, name
+            assert set(img.stored_hashes) == {"MD5", "SHA1"}, name
+            assert len(img.paths) == len(variants[name]["files"]), name
+    with ewfprobe.open_ewf(_first(variants["ftk-e01"])) as img:
+        assert img.format == ewfprobe.FORMAT_E01

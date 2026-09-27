@@ -1,6 +1,6 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`) forensic images. One file, pure
+A read-only reader for EnCase/EWF (`.E01`) and SMART (`.s01`) forensic images. One file, pure
 Python, standard library only. No compiler, no network, nothing to install.
 
 It opens an acquisition, joins its segments, and presents the acquired disk as
@@ -46,11 +46,16 @@ acquisition recorded.
 ## What it reads
 
 Reads EWF-E01, which is what EnCase 6 and 7, FTK Imager and `ewfacquire` write,
-and by far the most common form in the field. Multi-segment sets are joined
-automatically from any member of the set.
+and by far the most common form in the field. Also reads EWF-S01, the variant
+ASR Data's SMART writes, with segments named `.s01`, `.s02` and on. Multi-segment
+sets are joined automatically from any member of the set.
 
-It does not read the newer Ex01 (EWF2), the SMART `.s01` variant, or logical
-`.L01` evidence, and it never writes.
+A SMART image records less than an E01 does. Its volume section has no media
+type, so `info` says "not recorded" rather than guessing, and its compression
+level is read from the header section instead.
+
+It does not read the newer Ex01 (EWF2) or logical `.L01` evidence, and it never
+writes.
 
 Two behaviours worth knowing:
 
@@ -78,6 +83,20 @@ compression set to none, fast and best, chunk geometries of 16, 64 and 256
 sectors, and a multi-segment set. Every variant reproduces its source byte for
 byte and matches its own stored hash. Three of those variants are committed
 under `tests/fixtures` so the suite runs without libewf present.
+
+SMART is covered the same way: two variants written by `ewfacquire -f smart`
+(libewf 20260924), one of them a four-segment set, are committed beside the
+E01 fixtures, and libewf 20140817 writes the same layout. So are SMART images
+written by FTK Imager 4.7.3.61 from the same source, one a single file and one a
+four-segment set, together with an FTK Imager E01: every one reproduces the
+source and matches the MD5 and SHA-1 FTK Imager recorded. SMART has not been
+checked against an image written by ASR Data's own SMART.
+
+The compression a SMART image reports is the value its header records, and FTK
+Imager records it inaccurately: its four-segment set was written at compression
+0, holds stored chunks, and its header still says "fast". FTK Imager's E01 errs
+the other way, as described below. Read that line as what the image
+claims, not as a measurement.
 
 **Against real evidence.** Physical acquisitions written by FTK Imager, from
 28.6 GiB to 238 GiB, including 15-segment sets. Decoded ranges are byte
@@ -113,6 +132,15 @@ The reference fixtures are regenerated with:
 
 ```
 python tools/make_fixtures.py tests/fixtures --small
+```
+
+To add variants without rewriting the committed ones, `--add` rebuilds the
+source image from an existing fixture, checks it against the manifest's SHA-256,
+and writes only the variants named. `EWFACQUIRE` picks which `ewfacquire` to run,
+and the manifest records which version wrote each variant:
+
+```
+EWFACQUIRE=/path/to/ewfacquire python tools/make_fixtures.py tests/fixtures --add smart-fast smart-split
 ```
 
 That tool shells out to `ewfacquire` and is for development only. libewf is used

@@ -7,10 +7,28 @@ test writer is not. libewf is LGPL and is used here only to produce test data:
 nothing from it ships, and ewfprobe imports nothing.
 
     python tools/make_fixtures.py <output folder> [--small]
+    python tools/make_fixtures.py <output folder> --add <variant> [<variant> ...]
 
 ``--small`` writes the compact set that is committed under tests/fixtures: a
-1 MiB source in three variants, enough to cover the current and older table
-layouts and a multi-segment set without putting megabytes into the repository.
+3 MiB source in a few variants, enough to cover the current and older table
+layouts, SMART, and multi-segment sets without putting megabytes into the
+repository.
+
+``--add`` writes only the named variants into a folder that already holds a
+manifest, leaving the existing fixtures alone. The source image is not
+committed, so it is rebuilt by reading an existing fixture back, and it must
+hash to the manifest's recorded SHA-256 before anything is written. Rebuilding
+it from the generator instead would depend on the imaging library encoding the
+same JPEG bytes years later.
+
+Variants whose ``writer`` in the manifest is not ewfacquire were written by
+hand in another tool (FTK Imager, from the same source image) and copied in.
+``--add`` leaves them alone; ``--small`` rebuilds the manifest from scratch and
+would drop them, so re-add them afterwards from the tool that wrote them.
+
+``EWFACQUIRE`` selects the ewfacquire binary (default: the one on PATH). Each
+variant records the version that wrote it, because libewf releases differ in
+what they can write: 20140817 writes Ex01 as an ordinary E01, 20260924 does not.
 
 It writes a raw source image with synthetic media at known offsets, acquires it
 in several EWF format variants, and records a manifest giving each variant's
@@ -30,6 +48,8 @@ import struct
 import subprocess
 import sys
 
+EWFACQUIRE = os.environ.get("EWFACQUIRE", "ewfacquire")
+
 # Acquisition variants. Between them these cover the older table layout with no
 # base offset, the current one, several compression settings including none at
 # all, two chunk geometries, and a multi-segment set.
@@ -45,6 +65,10 @@ VARIANTS = [
     ("encase6-chunk256", "encase6", "fast",      256,           None),
     # uncompressed so the source is big enough for -S to actually split it
     ("encase6-split", "encase6",  "none",        64,            "1M"),
+    ("smart-fast",    "smart",    "fast",        64,            None),
+    # SMART compresses every chunk; "none" stores them at zlib level 0, so the
+    # source stays large enough to split
+    ("smart-split",   "smart",    "none",        64,            "1M"),
 ]
 
 
@@ -139,7 +163,7 @@ def acquire(raw_path, out_dir, name, fmt, compression, sectors_per_chunk, segmen
         if stale.startswith(name + "."):
             os.remove(os.path.join(out_dir, stale))
     cmd = [
-        "ewfacquire", "-u", "-t", target, "-f", fmt, "-c", compression,
+        EWFACQUIRE, "-u", "-t", target, "-f", fmt, "-c", compression,
         "-b", str(sectors_per_chunk), "-d", "sha1",
         "-C", "FIXTURE", "-D", f"ewfprobe fixture {name}", "-E", "1",
         "-e", "ewfprobe", "-N", "synthetic test data, no evidence content",
@@ -151,8 +175,36 @@ def acquire(raw_path, out_dir, name, fmt, compression, sectors_per_chunk, segmen
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise SystemExit(f"ewfacquire failed for {name}:\n{result.stdout}\n{result.stderr}")
-    made = sorted(f for f in os.listdir(out_dir) if f.startswith(name + ".E"))
+    made = sorted(f for f in os.listdir(out_dir)
+                  if f.startswith(name + ".") and f[len(name) + 1:][:1] in "Es")
     return made
+
+
+def writer_version():
+    out = subprocess.run([EWFACQUIRE, "-V"], capture_output=True, text=True,
+                         check=False).stdout
+    return out.strip().splitlines()[0] if out.strip() else "unknown"
+
+
+def rebuild_source(out, manifest):
+    """The raw source, read back from a fixture and checked against the manifest."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import ewfprobe
+    first = next(os.path.join(out, v["files"][0]) for v in manifest["variants"].values())
+    raw_path = os.path.join(out, manifest["raw"])
+    digest = hashlib.sha256()
+    with ewfprobe.open_ewf(first) as img, open(raw_path, "wb") as fh:
+        while True:
+            block = img.read(1 << 20)
+            if not block:
+                break
+            digest.update(block)
+            fh.write(block)
+    if digest.hexdigest() != manifest["sha256"]:
+        os.remove(raw_path)
+        raise SystemExit(f"the source read back from {os.path.basename(first)} does not "
+                         f"match the manifest's sha256; nothing written")
+    return raw_path
 
 
 SMALL_VARIANTS = [
@@ -160,35 +212,54 @@ SMALL_VARIANTS = [
     ("encase5-fast",  "encase5",  "fast",        64,            None),
     # 1 MiB is libewf's minimum segment size, so the source must exceed it
     ("encase6-split", "encase6",  "none",        64,            "1M"),
+    ("smart-fast",    "smart",    "fast",        64,            None),
+    ("smart-split",   "smart",    "none",        64,            "1M"),
 ]
 
 
 def main(argv):
     args = [a for a in argv[1:] if not a.startswith("--")]
     small = "--small" in argv
-    if len(args) != 1:
+    add = "--add" in argv
+    if not args or (len(args) != 1 and not add) or (add and len(args) < 2):
         print(__doc__)
         return 2
     out = os.path.abspath(args[0])
     os.makedirs(out, exist_ok=True)
-    if not shutil.which("ewfacquire"):
-        raise SystemExit("ewfacquire not found; install libewf (test tool only)")
+    if not shutil.which(EWFACQUIRE):
+        raise SystemExit(f"{EWFACQUIRE} not found; install libewf (test tool only)")
+    writer = writer_version()
 
-    raw_path = os.path.join(out, "source.raw")
-    manifest = build_raw(raw_path, size=(3 << 20) if small else (8 << 20))
-    print(f"raw source: {manifest['size']:,} bytes, {len(manifest['media'])} media items")
+    if add:
+        with open(os.path.join(out, "manifest.json"), encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        known = {v[0]: v for v in VARIANTS + SMALL_VARIANTS}
+        unknown = [a for a in args[1:] if a not in known]
+        if unknown:
+            raise SystemExit(f"unknown variant(s): {', '.join(unknown)}")
+        chosen = [known[a] for a in args[1:]]
+        raw_path = rebuild_source(out, manifest)
+        print(f"raw source rebuilt and matches the manifest: {manifest['sha256'][:16]}")
+    else:
+        raw_path = os.path.join(out, "source.raw")
+        manifest = build_raw(raw_path, size=(3 << 20) if small else (8 << 20))
+        print(f"raw source: {manifest['size']:,} bytes, "
+              f"{len(manifest['media'])} media items")
+        manifest["variants"] = {}
+        chosen = SMALL_VARIANTS if small else VARIANTS
 
-    manifest["variants"] = {}
-    for name, fmt, comp, spc, seg in (SMALL_VARIANTS if small else VARIANTS):
+    for name, fmt, comp, spc, seg in chosen:
         made = acquire(raw_path, out, name, fmt, comp, spc, seg)
         manifest["variants"][name] = {
             "format": fmt, "compression": comp, "sectors_per_chunk": spc,
-            "segment_size": seg, "files": made,
+            "segment_size": seg, "files": made, "writer": writer,
         }
         total = sum(os.path.getsize(os.path.join(out, f)) for f in made)
         print(f"  {name:<20} {fmt:<9} {comp:<5} b={spc:<4} "
               f"{len(made)} file(s) {total:>10,} bytes")
 
+    if add:
+        os.remove(raw_path)
     with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
     print(f"\nmanifest written to {os.path.join(out, 'manifest.json')}")
