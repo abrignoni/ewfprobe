@@ -1,6 +1,6 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`, `.afd`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.sparsebundle`), and EnCase logical evidence (`.L01`). One file, pure
+A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`), AFF (`.aff`, `.afd`) and AFF4 (`.aff4`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.sparsebundle`), and EnCase logical evidence (`.L01`). One file, pure
 Python, standard library only. No compiler, no network, nothing to install (an
 LZFSE-compressed `.dmg` needs the optional `pyliblzfse` package, and an encrypted Apple
 disk image or an acquisition FTK Imager encrypted with AD encryption the optional
@@ -42,6 +42,7 @@ ewfprobe verify  evidence.E01     # recompute MD5 and SHA-1, compare with stored
 ewfprobe export  evidence.E01 -o out.raw
 ewfprobe export  evidence.E01 -o - --offset 1048576 --length 65536
 ewfprobe verify  acquisition.dmg  # also checks the checksums a .dmg records
+ewfprobe verify  image.aff4       # and the hashes an AFF4 records about its streams
 ewfprobe files   evidence.L01     # an L01's entries: kind, size, stored MD5, path
 ewfprobe export  evidence.L01 --entry "Folder/photo.jpg" -o photo.jpg
 ewfprobe info    --password-file pw.txt encrypted.dmg
@@ -107,6 +108,43 @@ the numbering is refused as a missing file. A missing last file cannot be seen
 from the numbering: when it held the image size, as it does in an AFD from
 `affconvert`, the image is refused; otherwise its pages are counted as missing
 pages by `info` and `verify`.
+
+Reads AFF4, the Advanced Forensic Format 4, as the AFF4 Standard v1.0 defines it and
+as the pre-standard images Evimetry 2.0 and 2.1 wrote (`.aff4`, `.af4`): a ZIP file
+whose `information.turtle` describes the image, the map that places its bytes, and the
+image streams that hold them in segments ("bevies") of chunks. A chunk is stored when
+its length is the chunk size and compressed otherwise, with Snappy, LZ4 or deflate,
+and the decoders for all three are in this file, so no package is needed. On an Apple
+M2 Max they decode about 110 MB/s (Snappy), 160 MB/s (LZ4) and 1.9 GB/s (deflate) on a
+mix of text, mostly empty and random 32 KiB chunks, and `verify` read and hashed an
+uncompressed AFF4 at about 470 MB/s. What no range of the map covers reads from the map's gap stream,
+zeros unless the map names another; `aff4:UnknownData` and `aff4:UnreadableData` read
+as the repeated strings the standard defines. `info` lists how many bytes of the image
+come from each stream, so a range the acquisition could not read shows there.
+
+A striped image, one image kept across several files, opens from any of them. A
+stream that is not in the file opened is looked for in the other `.aff4` and `.af4`
+files in the same folder, and one that is in none of them is refused as a missing
+file. A file in that folder joins the image only when it holds a segment the image
+needs, so an unrelated container beside it is never read as part of it.
+
+`verify` checks what an AFF4 records about itself: each image stream's linear hashes,
+each chunk's block hash and the hash of each stream's block hashes, each map's
+segment hashes, the block map hash of each map with its stream, and the image's hash
+over those, one level up for a striped image. The orderings are the ones pyaff4's
+validator uses, and the reference images agree with them. An AFF4 that records no hash
+of the whole disk is not hashed end to end. BlackBag's Digital Collector, for one,
+records the MD5 and SHA-1 of the image stream, the extents it captured, rather than
+of the disk, and that is what `verify` compares.
+
+Two writer differences, measured: c-aff4 writes an LZ4 chunk as a raw block, while
+pyaff4 writes python-lz4's default, the block after a four-byte length, which pyaff4
+then cannot read back itself; both are read. And c-aff4 writes a zlib stream, header
+included, under both its zlib and its deflate settings, with spare bytes after a
+deflate one; a chunk is read as zlib when it starts with a zlib header and as raw
+deflate otherwise, and bytes after the end of the stream are ignored. `info` also
+shows the image's properties outside the AFF4 vocabulary, such as BlackBag's
+`bbt:APFSContainerType`.
 
 Reads L01, EnCase's logical evidence: files collected from a device rather than a
 disk, in segments named `.L01`, `.L02` and on. The image object's stream is the
@@ -279,8 +317,8 @@ slots from offset 56 and names the next one at offset 12. The disk's sector coun
 0 on a 2 TiB image.
 
 `open_image()` is the same function as `open_ewf()`. `is_image()` is true for the
-disk images ewfprobe reads (EWF, EWF2, AFF, an AFD directory, UDIF, sparse images and
-sparse bundle folders), `is_logical_evidence()` for an L01, `is_ewf()` for EWF alone,
+disk images ewfprobe reads (EWF, EWF2, AFF, an AFD directory, AFF4, UDIF, sparse images
+and sparse bundle folders), `is_logical_evidence()` for an L01, `is_ewf()` for EWF alone,
 and `apple_image_kind()` names an Apple disk image as `UDIF`, `SPARSEIMAGE`,
 `SPARSEBUNDLE` or `ENCRYPTED` (any encrypted one, which `is_image()` leaves out
 because it opens only with its password). `is_image()` leaves out an AD-encrypted
@@ -306,6 +344,11 @@ Refused with a message naming the reason rather than read wrongly:
   a hash, the page size, the sector size or the bad-sector marker.
 - **AFM**, AFF metadata kept beside the image as split raw files (`.000`, `.001`
   and on).
+- **Encrypted AFF4** (`aff4:EncryptedStream`), **AFF4-L**, the logical form that holds
+  files rather than a disk, **an AFF4 kept as a folder** rather than a ZIP, and **an
+  AFF4 map whose ranges overlap**, which none of the eleven maps measured has. AFF4 written by
+  pyaff4 or Rekall before the standard has not been available to test; its Snappy
+  name, which marks every chunk compressed, is read as pyaff4 reads it.
 - **An encrypted Apple disk image opened with a certificate or a keybag** rather than
   a password, and **one in the older version 1 format** (`cdsaencr`, with its header at
   the end of the file), which is recognised in order to be refused. No sample of either
@@ -331,7 +374,11 @@ Two behaviours worth knowing:
   which is the kind of quiet wrong answer that matters here.
 - **Encrypted content stays encrypted.** An image of a BitLocker, FileVault or
   encrypted APFS volume reads back as the ciphertext that was acquired. The
-  reader is working; there is simply nothing plain in there to find.
+  reader is working; there is simply nothing plain in there to find. What was
+  acquired decrypted reads decrypted: on the Digital Collector AFF4 of an Apple
+  silicon Mac described below, the tool read the FileVault Data volume through the
+  Mac's own encryption, and 198 of 200 property lists on that volume parse, although
+  the volume's own flags still say it is encrypted.
 
 ## How it was validated
 
@@ -483,6 +530,27 @@ offsets. The private sample above, converted by `hdiutil` into a sparse bundle a
 split by `hdiutil segment` into 2 GB parts, read to the same SHA-256 across the whole
 disk in both forms as the original `.dmg` does.
 
+**AFF4, against the reference images and two other writers.** The ten AFF4 reference
+images ([aff4/ReferenceImages](https://github.com/aff4/ReferenceImages) at `84773b0`:
+Evimetry 2.x and 3.x, standard and pre-standard, allocated blocks only, with a read
+error, with all five block hash algorithms, striped across two files, and a sparse image
+of 9 exabytes) are not committed, because that repository states no licence; the tests
+read them from a folder named by `EWFPROBE_AFF4_REFERENCE`, and CI fetches them at that
+commit. Eight read to the SHA-1 pyaff4's own tests record for them, the pre-standard
+ones and both files of the striped pair included (pyaff4 0.34 read a different image
+from each striped file alone, and its container API did not open the pre-standard
+ones); the other two have no recorded image hash. Every hash all ten record
+about themselves verifies. Four containers pyaff4 wrote over known content (stored,
+Snappy, zlib, LZ4), and nine files `tools/make_aff4_fixtures.py` writes with chunks
+compressed by the lz4, python-snappy and zlib libraries, cover c-aff4's LZ4 and deflate
+forms, the always-compressed Snappy name, a gap stream other than zeros (a constructed
+case: no sample has one), a striped pair and what is refused; all are committed. One
+real acquisition stays outside the repository: a 926.4 GiB APFS container Digital
+Collector 3.7 wrote as an uncompressed AFF4 (libaff4 2.0.0), whose 80,170 map ranges are
+not in order and whose 38.4 GB image stream matches the MD5 and SHA-1 in the
+acquisition log. Nineteen deliberate breaks of the AFF4 code are each caught by the
+tests.
+
 ## Standalone executables
 
 Each release carries `ewfprobe` built as a single executable with PyInstaller on
@@ -533,6 +601,17 @@ install it do. The encrypted ones are skipped where neither `pycryptodome` nor
 most jobs with `pycryptodome`, one with `pycryptodomex`, and one with neither, where
 the refusal that names the package is what runs.
 
+The AFF4 fixtures come from their own tool, which needs the lz4 and python-snappy
+packages, and pyaff4 as well for the `pyaff4-*` set (the docstring says how it was
+installed). The AFF4 reference images are read from a checkout of
+[aff4/ReferenceImages](https://github.com/aff4/ReferenceImages); with
+`EWFPROBE_REQUIRE_AFF4_REFERENCE=1` a missing one fails rather than skips:
+
+```
+python tools/make_aff4_fixtures.py tests/fixtures --pyaff4
+EWFPROBE_AFF4_REFERENCE=/path/to/ReferenceImages python -m pytest tests/test_aff4.py -q
+```
+
 That tool shells out to `ewfacquire`, `affconvert` and `hdiutil` and is for development only.
 libewf and AFFLIB are used there solely to produce test data. Nothing from them
 ships and `ewfprobe` imports nothing.
@@ -554,6 +633,30 @@ flag values in its public header, `include/afflib/afflib.h`, in the
 AFFLIB finds, names and joins the files of one, in `lib/vnode_afd.cpp` at commit
 [`f35df6c`](https://github.com/sshock/AFFLIBv3/blob/f35df6c1d2610e3233c30d50054c00e29d7d5a23/lib/vnode_afd.cpp).
 No AFFLIB code is copied.
+
+For AFF4: the AFF4 Standard v1.0a (Bradley Schatz and Michael Cohen),
+[`inprogress/AFF4StandardSpecification-v1.0a.md`](https://github.com/aff4/Standard/blob/da883fe48b15dec933a373f40e85e48b7b6c9214/inprogress/AFF4StandardSpecification-v1.0a.md)
+at `da883fe`, for the container, the image stream and its index, the map and its gap
+stream, the symbolic streams and the block map hash. What the standard leaves to the
+implementations comes from pyaff4 at `6a91158` (Apache-2.0): the pre-standard index,
+32-bit offsets where each chunk ends
+([`aff4_image.py`, lines 461 to 503](https://github.com/aff4/pyaff4/blob/6a91158661edec6ed8a865a09e28dbf30d487e38/pyaff4/aff4_image.py#L461-L503)),
+Scudette's always-compressed Snappy
+([lines 689 to 691](https://github.com/aff4/pyaff4/blob/6a91158661edec6ed8a865a09e28dbf30d487e38/pyaff4/aff4_image.py#L689-L691)),
+the 1 MiB tiles of the repeated-string streams
+([`stream_factory.py`, lines 148 to 173](https://github.com/aff4/pyaff4/blob/6a91158661edec6ed8a865a09e28dbf30d487e38/pyaff4/stream_factory.py#L148-L173)),
+and the order of the block map hash and of a striped image's hash
+([`block_hasher.py`, lines 53 and 156 to 175](https://github.com/aff4/pyaff4/blob/6a91158661edec6ed8a865a09e28dbf30d487e38/pyaff4/block_hasher.py#L156-L175),
+[lines 475 to 488](https://github.com/aff4/pyaff4/blob/6a91158661edec6ed8a865a09e28dbf30d487e38/pyaff4/block_hasher.py#L475-L488)),
+and from c-aff4 at `63c9b2c` (Apache-2.0): how it compresses zlib, deflate and LZ4
+chunks ([`aff4/aff4_image.cc`, lines 28 to 160](https://github.com/Velocidex/c-aff4/blob/63c9b2c352f9f74fc14c874063c03b06c4d1065c/aff4/aff4_image.cc#L28-L160))
+and the method names it writes
+([`aff4/lexicon.inc`, lines 155 to 163](https://github.com/Velocidex/c-aff4/blob/63c9b2c352f9f74fc14c874063c03b06c4d1065c/aff4/lexicon.inc#L155-L163)).
+The Snappy decoder follows Google's
+[`format_description.txt`](https://github.com/google/snappy/blob/9c28114a38866f6deeaa826db918293bc28ae410/format_description.txt)
+at `9c28114` and the LZ4 decoder
+[`doc/lz4_Block_format.md`](https://github.com/lz4/lz4/blob/0774d05537f9762f838f7ab541b7765f1a729cb5/doc/lz4_Block_format.md)
+at `0774d05`. No code from any of them is copied.
 
 For Apple disk images: Joachim Metz, *Mac OS disk image types*, in the
 [libyal/libmodi](https://github.com/libyal/libmodi) repository under `documentation/`,

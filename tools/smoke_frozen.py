@@ -19,8 +19,11 @@ entry MD5 as matching. For each encrypted Apple disk image under "encrypted_dmg"
 byte-identical between the two, the export must hash to the disk hdiutil read back from it,
 and a wrong password must be refused the same way by both; so the executable carries the
 cipher package. The same holds for each set FTK Imager encrypted with AD encryption, under
-"ad_encrypted", whose export must hash to the disk it was made from. The executable's
---version must name the source's __version__.
+"ad_encrypted", whose export must hash to the disk it was made from. For the AFF4
+containers in AFF4_KNOWN (written by pyaff4 or by tools/make_aff4_fixtures.py, one Snappy,
+one LZ4, one deflate and a striped pair), `info`, `verify` and a full `export` must be
+byte-identical between the two and the export must hash to the content the container was
+written from. The executable's --version must name the source's __version__.
 """
 
 from __future__ import annotations
@@ -33,6 +36,15 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+
+# MD5 of the content each AFF4 fixture was written from (tools/make_aff4_fixtures.py)
+AFF4_KNOWN = {
+    "pyaff4-snappy.aff4": "8dd04764855150cb5ac7f36dd584571d",
+    "pyaff4-lz4.aff4": "8dd04764855150cb5ac7f36dd584571d",
+    "aff4-deflate-zlibstream.aff4": "8dd04764855150cb5ac7f36dd584571d",
+    "aff4-striped_1.aff4": "66fae939a0fd6b5b9608aa0a1615a71c",
+}
 
 
 def run(cmd: list[str], cwd: Path, want: int = 0, env=None) -> subprocess.CompletedProcess:
@@ -185,9 +197,25 @@ def main(argv: list[str]) -> int:
                   f"{len(out['exe'][3]):,} byte export identical; the export matches the disk "
                   f"FTK Imager imaged, and a wrong password is refused by both")
 
+        for name, md5 in sorted(AFF4_KNOWN.items()):
+            image = str(fixtures / name)
+            out = {}
+            for who, cmd in (("py", py), ("exe", exe)):
+                raw = work / f"{name}-{who}.raw"
+                out[who] = (run(cmd + ["info", image], work).stdout,
+                            run(cmd + ["verify", "-q", image], work).stdout,
+                            run(cmd + ["export", "-q", image, "-o", str(raw)], work).stdout,
+                            raw.read_bytes())
+            assert out["py"] == out["exe"], f"{name}: the executable's output differs"
+            assert hashlib.md5(out["exe"][3]).hexdigest() == md5, name
+            checks += 1
+            print(f"{name}: AFF4 info, verify and a {len(out['exe'][3]):,} byte export "
+                  f"identical; the export matches the content it was written from")
+
     assert checks == (len(manifest["variants"]) + len(manifest.get("logical", {})) + 2
                       + len(manifest.get("encrypted_dmg", {}).get("variants", {}))
-                      + len(manifest.get("ad_encrypted", {}).get("variants", {}))), checks
+                      + len(manifest.get("ad_encrypted", {}).get("variants", {}))
+                      + len(AFF4_KNOWN)), checks
     print(f"{checks} checks: the executable wrote the same bytes as the source")
     return 0
 

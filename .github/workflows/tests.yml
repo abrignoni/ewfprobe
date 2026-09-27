@@ -48,8 +48,27 @@ jobs:
         run: 'python -m pip install --only-binary=:all: pyliblzfse'
       - if: ${{ matrix.crypto != 'none' }}
         run: 'python -m pip install --only-binary=:all: ${{ matrix.crypto || ''pycryptodome'' }}'
+      # The AFF4 reference images carry no licence, so they are not in the repository;
+      # the tests read them from this checkout, pinned to the commit they were
+      # validated against.
+      - name: Fetch the AFF4 reference images
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=84773b088bf6cce551a515d8ebb486bad69b58b8
+          for f in AFF4PreStd/Base-Linear.af4 AFF4PreStd/Base-Allocated.af4 \
+                   AFF4PreStd/Base-Linear-ReadError.af4 AFF4Std/Base-Linear.aff4 \
+                   AFF4Std/Base-Linear-AllHashes.aff4 AFF4Std/Base-Linear-ReadError.aff4 \
+                   AFF4Std/Base-Allocated.aff4 AFF4Std/Striped/Base-Linear_1.aff4 \
+                   AFF4Std/Striped/Base-Linear_2.aff4 Errata/Base-ExabyteSparse.aff4; do
+            mkdir -p "aff4-reference/$(dirname "$f")"
+            curl -sSfL --retry 3 -o "aff4-reference/$f" \
+              "https://raw.githubusercontent.com/aff4/ReferenceImages/$sha/$f"
+          done
       - run: python -m pytest tests -q -rs
         env:
+          EWFPROBE_AFF4_REFERENCE: aff4-reference
+          EWFPROBE_REQUIRE_AFF4_REFERENCE: "1"
           EWFPROBE_REQUIRE_LZFSE: ${{ matrix.lzfse && '1' || '' }}
           EWFPROBE_REQUIRE_CRYPTO: ${{ matrix.crypto != 'none' && '1' || '' }}
           EWFPROBE_CRYPTO_PACKAGE: ${{ matrix.crypto == 'pycryptodomex' && 'Cryptodome' || matrix.crypto != 'none' && 'Crypto' || '' }}
