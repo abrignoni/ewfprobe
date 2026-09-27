@@ -27,11 +27,15 @@ written from. For the AD1s in AD1_KNOWN, written by FTK Imager (one of them AD-e
 `info`, `verify`, `files` and an `export --entry` must be byte-identical between the two,
 verify must report FTK's logged hashes and every entry's hashes as matching, the entry must
 hash to the content written to it, and a set missing a file must be refused the same way
-by both. The executable's --version must name the source's __version__.
+by both. For the virtual disks in VIRTUAL_KNOWN (from tests/fixtures/virtual), `info`,
+`verify` and a full `export` must be byte-identical between the two and the export must
+hash to the disk the fixtures' manifest records. The executable's --version must name the
+source's __version__.
 """
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -53,6 +57,14 @@ AFF4_KNOWN = {
 
 # AD1s FTK Imager wrote (tests/fixtures/ad1): the password, if any, one entry and the MD5
 # of the content written to it
+# Virtual disks from tests/fixtures/virtual/manifest.json: each is ungzipped and has to
+# export as the disk the manifest records. zstd is left out, since whether a build has a
+# zstd decompressor depends on the Python it was made with.
+VIRTUAL_KNOWN = ["windows-diff", "windows-diffx", "qemu-vmdk-streamOptimized",
+                 "qemu-vmdk-twoGbMaxExtentSparse", "qemu-qcow2-zlib", "qemu-qcow2-overlay",
+                 "qemu-qcow1", "qemu-qcow2-zeroed", "constructed-dirty-log",
+                 "constructed-cowd", "constructed-qcow1-compressed"]
+
 AD1_KNOWN = [
     ("lean-src-c0-1mb.ad1", None, "docs/exact-64k.bin", "931c16b5fb19651e435e08b9db899364"),
     ("lean-src-c6-1mb-adcrypt.ad1", "Ad1Test-2026!", "docs/pattern-2300k.bin",
@@ -259,10 +271,34 @@ def main(argv: list[str]) -> int:
         checks += 1
         print("an AD1 set missing a file is refused the same way by both")
 
+        virtual = json.loads((fixtures / "virtual" / "manifest.json").read_text(
+            encoding="utf-8"))["cases"]
+        by_name = {c["name"]: c for c in virtual}
+        for name in VIRTUAL_KNOWN:
+            case = by_name[name]
+            where = work / name
+            where.mkdir()
+            for f in case["files"]:
+                with gzip.open(fixtures / "virtual" / case["folder"] / (f + ".gz")) as g:
+                    (where / f).write_bytes(g.read())
+            image = str(where / case["open"])
+            out = {}
+            for who, cmd in (("py", py), ("exe", exe)):
+                raw = work / f"{name}-{who}.raw"
+                out[who] = (run(cmd + ["info", image], work).stdout,
+                            run(cmd + ["verify", "-q", image], work).stdout,
+                            run(cmd + ["export", "-q", image, "-o", str(raw)], work).stdout,
+                            raw.read_bytes())
+            assert out["py"] == out["exe"], f"{name}: the executable's output differs"
+            assert hashlib.sha256(out["exe"][3]).hexdigest() == case["sha256"], name
+            checks += 1
+            print(f"{name}: virtual disk info, verify and export identical; the export "
+                  f"matches the disk its manifest records")
+
     assert checks == (len(manifest["variants"]) + len(manifest.get("logical", {})) + 2
                       + len(manifest.get("encrypted_dmg", {}).get("variants", {}))
                       + len(manifest.get("ad_encrypted", {}).get("variants", {}))
-                      + len(AFF4_KNOWN) + len(AD1_KNOWN) + 1), checks
+                      + len(AFF4_KNOWN) + len(AD1_KNOWN) + 1 + len(VIRTUAL_KNOWN)), checks
     print(f"{checks} checks: the executable wrote the same bytes as the source")
     return 0
 

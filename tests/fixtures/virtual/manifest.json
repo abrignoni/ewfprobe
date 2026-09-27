@@ -1,0 +1,442 @@
+{
+ "cases": [
+  {
+   "name": "windows-fixed",
+   "open": "fixed.vhd",
+   "files": [
+    "fixed.vhd"
+   ],
+   "writer": "Windows 11 (10.0.26200) diskpart",
+   "sha256": "53df223cc3ec1bae6abb411f233f8da319abfd06751f8480f1786ba6b398fd92",
+   "size": 67108864,
+   "note": "the disk as Windows presented it, read through \\\\.\\PhysicalDriveN after a read-only attach",
+   "folder": "windows"
+  },
+  {
+   "name": "windows-dynamic",
+   "open": "dynamic.vhd",
+   "files": [
+    "dynamic.vhd"
+   ],
+   "writer": "Windows 11 (10.0.26200) diskpart",
+   "sha256": "9c3f0307666540e9a842d9ac25bb3b345315a1b11672ef6405f3d6025123a439",
+   "size": 67108864,
+   "note": "the disk as Windows presented it, read through \\\\.\\PhysicalDriveN after a read-only attach",
+   "folder": "windows"
+  },
+  {
+   "name": "windows-fixedx",
+   "open": "fixedx.vhdx",
+   "files": [
+    "fixedx.vhdx"
+   ],
+   "writer": "Windows 11 (10.0.26200) diskpart",
+   "sha256": "f091bbade3897804db1a21769865489ce4c199389ef084d1477f8a791966ceda",
+   "size": 67108864,
+   "note": "the disk as Windows presented it, read through \\\\.\\PhysicalDriveN after a read-only attach",
+   "folder": "windows"
+  },
+  {
+   "name": "windows-dynamicx",
+   "open": "dynamicx.vhdx",
+   "files": [
+    "dynamicx.vhdx"
+   ],
+   "writer": "Windows 11 (10.0.26200) diskpart",
+   "sha256": "accfb130d8eb8321c8e494f1864d6913caeb442e840ececef2566b92935d0703",
+   "size": 67108864,
+   "note": "the disk as Windows presented it, read through \\\\.\\PhysicalDriveN after a read-only attach",
+   "folder": "windows"
+  },
+  {
+   "name": "windows-diff",
+   "open": "diff.vhd",
+   "files": [
+    "diff.vhd",
+    "dynamic.vhd"
+   ],
+   "writer": "Windows 11 (10.0.26200) diskpart",
+   "sha256": "e659ec65ed1a1440f19623e93add1295ccc9bae6ffadd117cdb48570da488454",
+   "size": 67108864,
+   "note": "the disk as Windows presented it, read through \\\\.\\PhysicalDriveN after a read-only attach",
+   "folder": "windows"
+  },
+  {
+   "name": "windows-diffx",
+   "open": "diffx.vhdx",
+   "files": [
+    "diffx.vhdx",
+    "dynamicx.vhdx"
+   ],
+   "writer": "Windows 11 (10.0.26200) diskpart",
+   "sha256": "7b13afa8921351a813e8073705258ccf56fffb2bc3ca4762ce0103463f7dbb25",
+   "size": 67108864,
+   "note": "the disk as Windows presented it, read through \\\\.\\PhysicalDriveN after a read-only attach",
+   "folder": "windows"
+  },
+  {
+   "name": "qemu-vhd-dynamic",
+   "open": "vhd-dynamic.vhd",
+   "files": [
+    "vhd-dynamic.vhd"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "35a9e0259822cd934990ad1e371e1fa0e4c2e5d2fa0de831d84a1c49044cb429",
+   "size": 16781312,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vhd-fixed",
+   "open": "vhd-fixed.vhd",
+   "files": [
+    "vhd-fixed.vhd"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "35a9e0259822cd934990ad1e371e1fa0e4c2e5d2fa0de831d84a1c49044cb429",
+   "size": 16781312,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vhd-dynamic-oddsize",
+   "open": "vhd-dynamic-oddsize.vhd",
+   "files": [
+    "vhd-dynamic-oddsize.vhd"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "b647f57580e12365bf7d106acf8ac1cdfb8e29c2189c51c9ea4e134c6d4bd3d7",
+   "size": 16780800,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vhdx-dynamic",
+   "open": "vhdx-dynamic.vhdx",
+   "files": [
+    "vhdx-dynamic.vhdx"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vhdx-dynamic-1m",
+   "open": "vhdx-dynamic-1m.vhdx",
+   "files": [
+    "vhdx-dynamic-1m.vhdx"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vhdx-fixed",
+   "open": "vhdx-fixed.vhdx",
+   "files": [
+    "vhdx-fixed.vhdx"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vhdx-dynamic-oddsize",
+   "open": "vhdx-dynamic-oddsize.vhdx",
+   "files": [
+    "vhdx-dynamic-oddsize.vhdx"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "b647f57580e12365bf7d106acf8ac1cdfb8e29c2189c51c9ea4e134c6d4bd3d7",
+   "size": 16780800,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vmdk-monolithicSparse",
+   "open": "vmdk-monolithicSparse.vmdk",
+   "files": [
+    "vmdk-monolithicSparse.vmdk"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vmdk-monolithicFlat",
+   "open": "vmdk-monolithicFlat.vmdk",
+   "files": [
+    "vmdk-monolithicFlat.vmdk",
+    "vmdk-monolithicFlat-flat.vmdk"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vmdk-twoGbMaxExtentSparse",
+   "open": "vmdk-twoGbMaxExtentSparse.vmdk",
+   "files": [
+    "vmdk-twoGbMaxExtentSparse.vmdk",
+    "vmdk-twoGbMaxExtentSparse-s001.vmdk"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vmdk-twoGbMaxExtentFlat",
+   "open": "vmdk-twoGbMaxExtentFlat.vmdk",
+   "files": [
+    "vmdk-twoGbMaxExtentFlat.vmdk",
+    "vmdk-twoGbMaxExtentFlat-f001.vmdk"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vmdk-streamOptimized",
+   "open": "vmdk-streamOptimized.vmdk",
+   "files": [
+    "vmdk-streamOptimized.vmdk"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vmdk-oddsize",
+   "open": "vmdk-oddsize.vmdk",
+   "files": [
+    "vmdk-oddsize.vmdk"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "b647f57580e12365bf7d106acf8ac1cdfb8e29c2189c51c9ea4e134c6d4bd3d7",
+   "size": 16780800,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vmdk-delta",
+   "open": "vmdk-delta.vmdk",
+   "files": [
+    "vmdk-delta.vmdk",
+    "vmdk-base.vmdk"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "760ff6531c146c65a91bd48e08f82d59e23c6002340282eb449b6bf5c66947fe",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-vmdk-zeroed",
+   "open": "vmdk-zeroed.vmdk",
+   "files": [
+    "vmdk-zeroed.vmdk"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "83956cfb96debc8f1ae8f6a9fdf517ca6f173743c9a5105dd860a210becb6f10",
+   "size": 16777216,
+   "note": "version 2 with zeroed-grain entries: 256 KiB at 1 MiB written as zeros by qemu-io after conversion",
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-v2",
+   "open": "qcow2-v2.qcow2",
+   "files": [
+    "qcow2-v2.qcow2"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-v3",
+   "open": "qcow2-v3.qcow2",
+   "files": [
+    "qcow2-v3.qcow2"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-4k",
+   "open": "qcow2-4k.qcow2",
+   "files": [
+    "qcow2-4k.qcow2"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-extl2",
+   "open": "qcow2-extl2.qcow2",
+   "files": [
+    "qcow2-extl2.qcow2"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-oddsize",
+   "open": "qcow2-oddsize.qcow2",
+   "files": [
+    "qcow2-oddsize.qcow2"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "b647f57580e12365bf7d106acf8ac1cdfb8e29c2189c51c9ea4e134c6d4bd3d7",
+   "size": 16780800,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-zlib",
+   "open": "qcow2-zlib.qcow2",
+   "files": [
+    "qcow2-zlib.qcow2"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-zstd",
+   "open": "qcow2-zstd.qcow2",
+   "files": [
+    "qcow2-zstd.qcow2"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-overlay",
+   "open": "qcow2-overlay.qcow2",
+   "files": [
+    "qcow2-overlay.qcow2",
+    "qcow2-base.qcow2"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "5794a0fb70a7483949cb8f5e8166ce5ef202dffcdab29abae3b88027ef2bf5b6",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-snapshot",
+   "open": "qcow2-snapshot.qcow2",
+   "files": [
+    "qcow2-snapshot.qcow2"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "63c78ea4163887a3f25d40a0b0810640097d4590e83b5161d41f814cf86d8269",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-extdata",
+   "open": "qcow2-extdata.qcow2",
+   "files": [
+    "qcow2-extdata.qcow2",
+    "qcow2-extdata.data"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-extdata-raw",
+   "open": "qcow2-extdata-raw.qcow2",
+   "files": [
+    "qcow2-extdata-raw.qcow2",
+    "qcow2-extdata-raw.data"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow1",
+   "open": "qcow1.qcow",
+   "files": [
+    "qcow1.qcow"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "eda5100326096c7e523e664a6e8283d1559d5b9e46d63c688c6c5b9f1b690329",
+   "size": 16777216,
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-luks",
+   "open": "qcow2-luks.qcow2",
+   "files": [
+    "qcow2-luks.qcow2"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "refused": "encrypted",
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "qemu-qcow2-zeroed",
+   "open": "qcow2-zeroed.qcow2",
+   "files": [
+    "qcow2-zeroed.qcow2"
+   ],
+   "writer": "qemu-img 10.2.1",
+   "sha256": "83956cfb96debc8f1ae8f6a9fdf517ca6f173743c9a5105dd860a210becb6f10",
+   "size": 16777216,
+   "note": "version 3 with zero-flagged clusters that stay allocated: 256 KiB at 1 MiB written as zeros by qemu-io after conversion",
+   "folder": "qemu-compact"
+  },
+  {
+   "name": "constructed-dirty-log",
+   "open": "dirty-log.vhdx",
+   "files": [
+    "dirty-log.vhdx"
+   ],
+   "writer": "built from MS-VHDX (make_dirty_vhdx.py)",
+   "sha256": "ed4e6e6cc3093eca5981bac5ab621558634537c76e50f0710e84e18dc94062ef",
+   "size": 16777216,
+   "note": "qemu refuses it read-only and its replay of a copy reads the same",
+   "folder": "constructed-compact"
+  },
+  {
+   "name": "constructed-cowd",
+   "open": "cowd.vmdk",
+   "files": [
+    "cowd.vmdk",
+    "cowd-delta.vmdk"
+   ],
+   "writer": "built from VMware's Virtual Disk Format 5.0 (make_cowd.py)",
+   "sha256": "5af55fb7d8184968ab7905192a1bd6ac312f2108d7d5cfa0afd4e0a91388972e",
+   "size": 16777216,
+   "note": "qemu reads it the same",
+   "folder": "constructed-compact"
+  },
+  {
+   "name": "constructed-qcow1-compressed",
+   "open": "qcow1-compressed.qcow",
+   "files": [
+    "qcow1-compressed.qcow"
+   ],
+   "writer": "built from QEMU's block/qcow.c (make_qcow1_compressed.py)",
+   "sha256": "ed5094de99d8b4986f756b16489ecc9b2d38b35f7c9df13e24b77b849c9ad7b4",
+   "size": 16777216,
+   "note": "333 compressed clusters, one of them longer than half a cluster (the disk, with the cluster at 12 MiB replaced by 2,600 seeded random bytes); qemu-img 10.2.1 refused to write compressed clusters to version 1 but reads it the same",
+   "folder": "constructed-compact"
+  }
+ ]
+}

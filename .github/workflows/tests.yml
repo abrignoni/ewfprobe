@@ -38,6 +38,12 @@ jobs:
             lzfse: true
           - os: windows-latest
             python: "3.14"
+            vmdk_reference: true
+          # VMware's Photon OS OVA is 108 MB, so two jobs, one per operating system
+          # family, read VMware's own stream-optimized VMDK from it.
+          - os: ubuntu-latest
+            python: "3.13"
+            vmdk_reference: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -78,12 +84,25 @@ jobs:
             curl -sSfL --retry 3 -o "ad1-reference/$f" \
               "https://raw.githubusercontent.com/pcbje/pyad1/$sha/test_data/$f"
           done
+      # VMware's Photon OS 2.0 OVA, whose stream-optimized VMDK VMware's own tools
+      # wrote; the test checks its SHA-1 against the one the Photon OS project
+      # publishes before reading it.
+      - name: Fetch VMware's Photon OS 2.0 OVA
+        if: ${{ matrix.vmdk_reference }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p vmdk-reference
+          curl -sSfL --retry 3 -o vmdk-reference/photon.ova \
+            "https://packages.vmware.com/photon/2.0/GA/ova/photon-custom-hw11-2.0-304b817.ova"
       - run: python -m pytest tests -q -rs
         env:
           EWFPROBE_AFF4_REFERENCE: aff4-reference
           EWFPROBE_REQUIRE_AFF4_REFERENCE: "1"
           EWFPROBE_AD1_REFERENCE: ad1-reference
           EWFPROBE_REQUIRE_AD1_REFERENCE: "1"
+          EWFPROBE_VMDK_REFERENCE: ${{ matrix.vmdk_reference && 'vmdk-reference/photon.ova' || '' }}
+          EWFPROBE_REQUIRE_VMDK_REFERENCE: ${{ matrix.vmdk_reference && '1' || '' }}
           EWFPROBE_REQUIRE_LZFSE: ${{ matrix.lzfse && '1' || '' }}
           EWFPROBE_REQUIRE_CRYPTO: ${{ matrix.crypto != 'none' && '1' || '' }}
           EWFPROBE_CRYPTO_PACKAGE: ${{ matrix.crypto == 'pycryptodomex' && 'Cryptodome' || matrix.crypto != 'none' && 'Crypto' || '' }}

@@ -15,7 +15,9 @@ password (hdiutil -encryption, AES-128 or AES-256) opens with that password and
 needs the optional pycryptodome package, and so does an E01, SMART or raw (dd) set
 FTK Imager encrypted with AD encryption. From an L01, EnCase's logical evidence, and
 an AD1, FTK Imager's (AD-encrypted or not), it lists the files collected and reads
-each one's content.
+each one's content. It also reads the disks virtual machines keep: VHD and VHDX,
+VMDK and QCOW (versions 1 to 3), including a differencing disk, delta or overlay
+read through its parent.
 
     with ewfprobe.open_ewf("evidence.E01") as img:
         img.seek(0)
@@ -49,18 +51,22 @@ encryption" section of the EWF documentation, with what it leaves open measured 
 sets FTK Imager wrote. The AD1 reader follows Petter Chr. Bjelland's notes and reader
 (pcbje/pyad1, Apache-2.0) and the structures of al3ks1s/AD1-tools, with what the time
 records and item types mean measured on images FTK Imager wrote; no code from either
-is copied.
+is copied. The virtual disk readers follow Microsoft's "Virtual Hard Disk Image Format
+Specification" (2006) and [MS-VHDX], VMware's "Virtual Disk Format 5.0" technical note,
+and QEMU's docs/interop/qcow2.rst and block/qcow.c, with what they leave open measured on
+disks Windows, VMware's tools and qemu-img wrote; no code from any of them is copied.
 
 Scope. This reads EWF-E01, the format EnCase 6 and 7 and FTK Imager write and
 by far the most common one in the field, EWF-S01, the variant ASR Data's SMART
 writes, EWF2-Ex01, which EnCase 7 and later write, AFF, including AFD, and
 EWF-L01 logical evidence, FTK Imager's AD1 (version 4), and UDIF, sparse image and
 sparse bundle Apple disk images, encrypted with a password or not, AD-encrypted E01,
-SMART, raw and AD1 sets, and AFF4 containers, standard and pre-standard, striped or
-not. It does not read Lx01 logical evidence, encrypted AFF4 or AFF4-L, an AD1 other
+SMART, raw and AD1 sets, AFF4 containers, standard and pre-standard, striped or
+not, and VHD, VHDX, VMDK and QCOW virtual disks. It does not read Lx01 logical evidence, encrypted AFF4 or AFF4-L, an AD1 other
 than version 4, an AD-encrypted image protected by a certificate, an Apple disk
 image unlocked by a certificate or a keybag rather than a password, or one in the
-older version 1 encrypted format (cdsaencr), encrypted Ex01 images (the encryption
+older version 1 encrypted format (cdsaencr), an encrypted QCOW, a VMDK SESPARSE
+extent, a VHD split into .v01 files, encrypted Ex01 images (the encryption
 is not publicly documented), Ex01 images compressed with bzip2 (no sample exists to
 validate against), encrypted AFF, or AFM (AFF metadata beside split raw files), and
 it never writes.
@@ -86,6 +92,7 @@ import re
 import struct
 import sys
 import urllib.parse
+import uuid
 import zipfile
 import zlib
 from collections import OrderedDict
@@ -99,7 +106,7 @@ try:
 except ImportError:
     lzma = None
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 
 # ---------------------------------------------------------------- constants
 
@@ -133,6 +140,10 @@ FORMAT_S01 = "EWF-S01"
 FORMAT_EX01 = "EWF2-Ex01"
 FORMAT_L01 = "EWF-L01"
 FORMAT_AD1 = "AD1"
+FORMAT_VHD = "VHD"
+FORMAT_VHDX = "VHDX"
+FORMAT_VMDK = "VMDK"
+FORMAT_QCOW = "QCOW"
 
 # EWF2 (Ex01). A 32-byte file header, then sections whose 64-byte descriptor sits
 # AFTER the section's data and points back at the previous descriptor, so a
@@ -493,9 +504,9 @@ def _family(ext):
 def is_image(path) -> bool:
     """True when ``path`` is a disk image ewfprobe reads: a file beginning with the
     EWF, EWF2 or AFF signature, an AFF4 container, an AFD directory holding AFF files,
-    or an Apple UDIF (.dmg), sparse image (.sparseimage) or sparse bundle
-    (.sparsebundle). An
-    L01 holds files rather than a disk; is_logical_evidence answers for it. An
+    an Apple UDIF (.dmg), sparse image (.sparseimage) or sparse bundle
+    (.sparsebundle), or a virtual disk virtual_disk_kind names (VHD, VHDX, VMDK,
+    QCOW). An L01 holds files rather than a disk; is_logical_evidence answers for it. An
     encrypted Apple disk image is not counted, because it opens only with its
     password; apple_image_kind reports it as ENCRYPTED."""
     if os.path.isdir(path):
@@ -514,7 +525,8 @@ def is_image(path) -> bool:
                 return True
     except OSError:
         return False
-    return is_aff4(path) or apple_image_kind(path) in (FORMAT_UDIF, FORMAT_SPARSEIMAGE)
+    return (is_aff4(path) or apple_image_kind(path) in (FORMAT_UDIF, FORMAT_SPARSEIMAGE)
+            or virtual_disk_kind(path) is not None)
 
 
 def _sparsebundle_info(path):
@@ -2761,6 +2773,248 @@ class _Ad1File(io.RawIOBase):
         return done
 
 
+# -- virtual disks --------------------------------------------------------------
+# VHD, from Microsoft's "Virtual Hard Disk Image Format Specification" (version 1.0,
+# October 2006): big-endian throughout; a 512-byte footer whose cookie is "conectix"
+# at the end of the file (511 bytes in images older than Virtual PC 2004), its
+# checksum the one's complement of the sum of its bytes with the checksum field left
+# out; a fixed disk is the disk's data followed by the footer; a dynamic or
+# differencing disk starts with a copy of the footer, has a 1,024-byte "cxsparse"
+# header at the footer's data offset, and a block allocation table of 32-bit sector
+# offsets, 0xFFFFFFFF where no block is stored. A stored block is a sector bitmap,
+# padded to 512 bytes, then the block's data. In a differencing disk a set bit means
+# the sector is in this file and a clear one that it is in the parent.
+VHD_COOKIE = b"conectix"
+_VHD_FOOTER = struct.Struct(">8sIIQI4sI4sQQIII16sB")
+_VHD_DYNAMIC = struct.Struct(">8sQQIIII16sI4x")    # then the parent's name, locators
+_VHD_LOCATOR = struct.Struct(">4sIIIQ")
+_VHD_TYPES = {2: "fixed", 3: "dynamic", 4: "differencing"}
+_VHD_UNUSED = 0xFFFFFFFF
+_VHD_EPOCH = 946684800                              # 2000-01-01 00:00:00 UTC
+# A virtual disk's blocks can be large (a VHD's are 2 MiB by default), so it is read
+# in pieces of at most this size, each inside one block.
+_VIRTUAL_CHUNK = 1 << 20
+_VIRTUAL_MAX_PARENTS = 32
+_opening_parents: list[str] = []                     # the chain being opened, for loops
+
+
+def _vhd_checksum(data, at):
+    """The one's complement of the sum of ``data``'s bytes, leaving out the four at
+    ``at``, as the VHD specification's appendix computes a footer's and a dynamic
+    disk header's checksum."""
+    return ~(sum(data) - sum(data[at:at + 4])) & 0xFFFFFFFF
+
+
+def _vhd_footer(data):
+    """A VHD footer's fields, or None when ``data`` (512 bytes, or the 511 of an image
+    older than Virtual PC 2004) does not begin with one whose checksum matches."""
+    if len(data) < 511 or data[:8] != VHD_COOKIE:
+        return None
+    (_cookie, features, version, data_offset, stamp, app, app_version, host, original,
+     current, geometry, disk_type, checksum, unique_id, saved) = _VHD_FOOTER.unpack_from(data)
+    if _vhd_checksum(data[:512], 64) != checksum:
+        return None
+    return {"features": features, "version": version, "data_offset": data_offset,
+            "timestamp": stamp, "creator": app, "creator_version": app_version,
+            "host": host, "original_size": original, "current_size": current,
+            "geometry": (geometry >> 16, (geometry >> 8) & 0xFF, geometry & 0xFF),
+            "type": disk_type, "unique_id": unique_id, "saved_state": saved}
+
+
+def virtual_disk_kind(path):
+    """The virtual disk format of ``path``, judged from its own bytes: "VHDX" when the
+    file begins with "vhdxfile"; "VMDK" for a VMDK descriptor file or a sparse extent
+    ("KDMV" or "COWD"); "QCOW" for QEMU's qcow of version 1, 2 or 3; "VHD" when it
+    ends in a VHD footer's cookie ("conectix") or begins with a copy of one;
+    otherwise None."""
+    if os.path.isdir(path):
+        return None
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            head = fh.read(512)
+            fh.seek(max(0, size - 512))
+            tail = fh.read(512)
+    except OSError:
+        return None
+    if head[:8] == VHDX_SIGNATURE:
+        return FORMAT_VHDX
+    if head[:4] in (VMDK_SPARSE_MAGIC, VMDK_COWD_MAGIC) or _is_vmdk_descriptor(head):
+        return FORMAT_VMDK
+    if head[:4] == QCOW_MAGIC and head[4:8] in (b"\0\0\0\1", b"\0\0\0\2", b"\0\0\0\3"):
+        return FORMAT_QCOW
+    # The cookie alone names a VHD, so one whose footer fails its checksum is refused
+    # as a damaged VHD rather than read as something else.
+    if VHD_COOKIE in (tail[:8], tail[1:9], head[:8]):
+        return FORMAT_VHD
+    return None
+
+
+# VHDX, from Microsoft's [MS-VHDX] (Open Specifications): little-endian; "vhdxfile"
+# at the start; two 4-KB headers at 64 KB and 128 KB, each with a CRC-32C, the one with
+# the greater sequence number current; two copies of a 64-KB region table at 192 KB and
+# 256 KB naming the BAT and the metadata region; a log that has to be replayed, in
+# memory for a reader, when the current header's LogGuid is not zero; and a BAT of
+# 64-bit entries, the state in the low 3 bits and the file offset in MiB in the top 44,
+# with one sector bitmap entry after each chunk's payload entries.
+VHDX_SIGNATURE = b"vhdxfile"
+_VHDX_HEADER = struct.Struct("<4sIQ16s16s16sHHIQ")
+_VHDX_REGION_BAT = uuid.UUID("2DC27766-F623-4200-9D64-115E9BFD4A08").bytes_le
+_VHDX_REGION_METADATA = uuid.UUID("8B7CA206-4790-4B9A-B8FE-575F050F886E").bytes_le
+_VHDX_FILE_PARAMETERS = uuid.UUID("CAA16737-FA36-4D43-B3B6-33F0AA44E76B").bytes_le
+_VHDX_DISK_SIZE = uuid.UUID("2FA54224-CD1B-4876-B211-5DBED83BF4B8").bytes_le
+_VHDX_DISK_ID = uuid.UUID("BECA12AB-B2E6-4523-93EF-C309E000C746").bytes_le
+_VHDX_LOGICAL_SECTOR = uuid.UUID("8141BF1D-A96F-4709-BA47-F233A8FAAB5F").bytes_le
+_VHDX_PHYSICAL_SECTOR = uuid.UUID("CDA348C7-445D-4471-9CC9-E9885251C556").bytes_le
+_VHDX_PARENT_LOCATOR = uuid.UUID("A8D35F2D-B30B-454D-ABF7-D3D84834AB0C").bytes_le
+_VHDX_LOCATOR_VHDX = uuid.UUID("B04AEFB7-D19E-4A81-B789-25B8E9445913").bytes_le
+_VHDX_KNOWN_ITEMS = {_VHDX_FILE_PARAMETERS, _VHDX_DISK_SIZE, _VHDX_DISK_ID,
+                     _VHDX_LOGICAL_SECTOR, _VHDX_PHYSICAL_SECTOR, _VHDX_PARENT_LOCATOR}
+# Payload block states, and the sector bitmap block's present state.
+_VHDX_NOT_PRESENT, _VHDX_UNDEFINED, _VHDX_ZERO, _VHDX_UNMAPPED = 0, 1, 2, 3
+_VHDX_FULLY_PRESENT, _VHDX_PARTIALLY_PRESENT = 6, 7
+_VHDX_STATE_NAMES = {0: "not present", 1: "undefined", 2: "zero", 3: "unmapped",
+                     6: "fully present", 7: "partially present"}
+_VHDX_SB_PRESENT = 6
+_MIB = 1 << 20
+
+
+# VMDK, from VMware's "Virtual Disk Format 5.0" technical note (2011): a text
+# descriptor, in its own file or embedded in the first sparse extent, lists the
+# extents in order (FLAT, SPARSE, ZERO, VMFS, VMFSSPARSE), the disk's content id and
+# its parent's. A hosted sparse extent ("KDMV", little-endian) maps the disk through a
+# grain directory of 32-bit sector offsets of grain tables, each of 512 32-bit grain
+# offsets, 0 where no grain is stored and 1 for a grain of zeros (version 2); a
+# stream-optimized one compresses each grain behind a 12-byte marker holding its LBA
+# and length. An ESXi sparse extent ("COWD") has 4,096-entry grain tables.
+VMDK_SPARSE_MAGIC = b"KDMV"
+VMDK_COWD_MAGIC = b"COWD"
+_VMDK_DESCRIPTOR_START = b"# Disk DescriptorFile"
+_VMDK_SPARSE = struct.Struct("<4sIIQQQQIQQQB4sH")
+_VMDK_COWD = struct.Struct("<4sIIIIIII")
+_VMDK_GD_AT_END = 0xFFFFFFFFFFFFFFFF
+_VMDK_EXTENT = re.compile(
+    r'^\s*(RW|RDONLY|NOACCESS)\s+(\d+)\s+([A-Za-z]+)(?:\s+"([^"]*)"(?:\s+(\d+))?)?\s*$',
+    re.I)
+_VMDK_MAX_DESCRIPTOR = 1 << 20
+
+
+def _vmdk_descriptor_text(raw):
+    """A VMDK descriptor's text, NUL padding and a byte-order mark removed."""
+    text = raw.split(b"\0")[0]
+    if text.startswith(b"\xef\xbb\xbf"):
+        text = text[3:]
+    try:
+        return text.decode("utf-8")
+    except UnicodeDecodeError:
+        return text.decode("latin-1")
+
+
+def _is_vmdk_descriptor(head):
+    start = head[3:] if head.startswith(b"\xef\xbb\xbf") else head
+    return start[:len(_VMDK_DESCRIPTOR_START)].lower() == _VMDK_DESCRIPTOR_START.lower()
+
+
+# QCOW, from QEMU's own documents: docs/interop/qcow2.rst for versions 2 and 3, and
+# block/qcow.c for version 1 (both at QEMU commit 81ce3a8). Big-endian; a two-level
+# map, an L1 table of L2 table offsets and L2 tables of cluster descriptors, 0 where a
+# cluster is not stored (read from the backing file, or zeros); version 3 adds a
+# zeros flag (bit 0), extended L2 entries of 32 subclusters each, and zstd as a second
+# compression. Compressed clusters are raw deflate, without zlib's header.
+QCOW_MAGIC = b"QFI\xfb"
+_QCOW1_HEADER = struct.Struct(">4sIQIIQBBxxIQ")
+_QCOW2_HEADER = struct.Struct(">4sIQIIQIIQQIIQ")
+_QCOW_COPIED = 1 << 63
+_QCOW_COMPRESSED = 1 << 62
+_QCOW1_COMPRESSED = 1 << 63
+_QCOW_OFFSET = ((1 << 56) - 1) & ~0x1FF        # bits 9 to 55
+_QCOW_BACKING_FORMAT = 0xE2792ACA
+_QCOW_EXTERNAL_DATA = 0x44415441
+_QCOW_KNOWN_INCOMPATIBLE = 0x1F
+
+
+def _zstd_decompressor():
+    """A zstd decompressor factory, from the standard library (Python 3.14) or the
+    backports.zstd or zstandard package; None when none is installed."""
+    try:
+        from compression import zstd                    # Python 3.14
+        return lambda: zstd.ZstdDecompressor()
+    except ImportError:
+        pass
+    try:
+        from backports import zstd as backport          # type: ignore
+        return lambda: backport.ZstdDecompressor()
+    except ImportError:
+        pass
+    try:
+        import zstandard                                # type: ignore
+        return lambda: zstandard.ZstdDecompressor().decompressobj()
+    except ImportError:
+        return None
+
+
+class _RawParent:
+    """A backing file that is a plain raw disk, read as it is."""
+
+    def __init__(self, path):
+        self.paths = [path]
+        self.media_size = os.path.getsize(path)
+        self._fh = open(path, "rb")
+
+    def seek(self, offset):
+        self._fh.seek(offset)
+
+    def read(self, n):
+        return self._fh.read(n)
+
+    def close(self):
+        self._fh.close()
+
+
+def _crc32c_table():
+    table = []
+    for i in range(256):
+        c = i
+        for _ in range(8):
+            c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
+        table.append(c)
+    return table
+
+
+_CRC32C = _crc32c_table()
+
+
+def _crc32c(data):
+    """CRC-32C (Castagnoli), which VHDX uses for its headers, region tables and log
+    entries; the standard library has only the other CRC-32."""
+    crc = 0xFFFFFFFF
+    table = _CRC32C
+    for byte in data:
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc ^ 0xFFFFFFFF
+
+
+def _crc32c_zeroed(data, at=4):
+    """The CRC-32C of ``data`` with its four checksum bytes at ``at`` taken as zero."""
+    return _crc32c(bytes(data[:at]) + b"\0\0\0\0" + bytes(data[at + 4:]))
+
+
+def _vhd_split(path):
+    """True when ``path`` is part of a VHD that Virtual PC 2004 or earlier split into
+    files (name.vhd, then name.v01, name.v02 and on, the footer at the end of the last,
+    per the VHD specification)."""
+    base, ext = os.path.splitext(path)
+    if re.fullmatch(r"\.v\d\d", ext, re.I):
+        return True
+    return ext.lower() == ".vhd" and any(os.path.exists(base + e) for e in (".v01", ".V01"))
+
+
+def _uuid_text(raw):
+    """A 16-byte identifier as the usual hyphenated text, big-endian as stored."""
+    h = raw.hex()
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+
+
 class EwfImage:
     """An EWF-E01, EWF-S01, EWF2-Ex01, AFF or AFD acquisition, read as one seekable stream,
     or an EWF-L01, read as its media data with its entries in ``logical_entries``.
@@ -2785,6 +3039,12 @@ class EwfImage:
         elif self._afd:
             self.paths = _afd_members(self._afd)
         elif _is_aff(path) or is_aff4(path) or apple_image_kind(path):
+            self.paths = [os.path.abspath(path)]
+        elif _vhd_split(path):
+            raise EwfFormatError(f"{os.path.basename(path)} is part of a VHD split into "
+                                 f"files by Virtual PC 2004 or earlier (.vhd, .v01 and "
+                                 f"on), which ewfprobe does not read")
+        elif virtual_disk_kind(path):
             self.paths = [os.path.abspath(path)]
         elif adcrypt_set(path):
             self.paths = adcrypt_set(path)
@@ -2838,6 +3098,18 @@ class EwfImage:
         self.aff4 = None
         self._aff4 = None
         self._aff4_reader = None
+        # Virtual disks: what the file records about itself, the block table, and
+        # the disk it depends on, for a differencing disk.
+        self.vhd = None
+        self._vhd_bat: list[int] = []
+        self._vhd_bitmaps: OrderedDict[int, bytes] = OrderedDict()
+        self.parent = None
+        self.vhdx = None
+        self._vhdx_bat: list[int] = []
+        self._vhdx_overlay: dict[int, bytes | None] = {}
+        self.vmdk = None
+        self._vmdk_extents: list[dict] = []
+        self.qcow = None
         # AD1: what the image records about itself, and how its logical space maps
         # onto its files.
         self.ad1 = None
@@ -2896,6 +3168,18 @@ class EwfImage:
             return
         if kind == FORMAT_UDIF:
             self._index_udif()
+            return
+        if virtual_disk_kind(self.paths[0]) == FORMAT_VHD:
+            self._index_vhd()
+            return
+        if virtual_disk_kind(self.paths[0]) == FORMAT_VHDX:
+            self._index_vhdx()
+            return
+        if virtual_disk_kind(self.paths[0]) == FORMAT_VMDK:
+            self._index_vmdk()
+            return
+        if virtual_disk_kind(self.paths[0]) == FORMAT_QCOW:
+            self._index_qcow()
             return
         if magic == ADCRYPT_SIGNATURE:
             magic = self._unlock_adcrypt()
@@ -4348,6 +4632,1308 @@ class EwfImage:
             i += 1
         return bytes(out)
 
+    def _index_vhd(self):
+        """Read a VHD's footer (or, when it fails its checksum, the copy at the start
+        of a dynamic disk), and for a dynamic or differencing disk its header and
+        block allocation table; open a differencing disk's parent."""
+        path = self.paths[0]
+        name = os.path.basename(path)
+        size = os.path.getsize(path)
+        fh = self._handle(0)
+        fh.seek(max(0, size - 512))
+        tail = fh.read(512)
+        fh.seek(0)
+        head = fh.read(512)
+        footer, source, end = _vhd_footer(tail), "the footer at the end of the file", size - 512
+        if footer is None and _vhd_footer(tail[1:]):
+            footer, source, end = _vhd_footer(tail[1:]), "a 511-byte footer at the end", size - 511
+        if footer is None:
+            footer = _vhd_footer(head)
+            if footer is None or footer["type"] == 2:
+                raise EwfFormatError(f"{name} has no VHD footer whose checksum matches")
+            source = ("the copy at the start of the file; the footer at the end does "
+                      "not match its checksum")
+        if footer["version"] >> 16 != 1:
+            raise EwfFormatError(f"{name} is VHD format version "
+                                 f"{footer['version'] >> 16}.{footer['version'] & 0xFFFF}; "
+                                 f"only 1.0 is read")
+        kind = _VHD_TYPES.get(footer["type"])
+        if kind is None:
+            raise EwfFormatError(f"{name} records VHD disk type {footer['type']}, which is "
+                                 f"not a fixed, dynamic or differencing disk")
+        disk = footer["current_size"]
+        if disk % 512:
+            raise EwfFormatError(f"{name} records a disk of {disk:,} bytes, not a whole "
+                                 f"number of 512-byte sectors")
+        stamp = datetime.datetime.fromtimestamp(_VHD_EPOCH + footer["timestamp"],
+                                                datetime.timezone.utc)
+        self.vhd = {
+            "disk_type": kind, "footer": source,
+            "creator": footer["creator"].decode("latin-1").rstrip("\0 "),
+            "creator_version": f"{footer['creator_version'] >> 16}."
+                               f"{footer['creator_version'] & 0xFFFF}",
+            "creator_host": footer["host"].decode("latin-1").rstrip("\0 "),
+            "created": stamp.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "original_size": footer["original_size"], "disk_size": disk,
+            "geometry": footer["geometry"], "unique_id": _uuid_text(footer["unique_id"]),
+            "saved_state": bool(footer["saved_state"]),
+            "block_size": None, "blocks": None, "blocks_stored": None,
+            "bitmap_bytes": 0, "data_after_disk": 0, "parent": None}
+        self._vhd_unique_id = footer["unique_id"]
+        self.compression_level = "none"
+        if kind == "fixed":
+            if end < disk:
+                raise EwfIncompleteSetError(
+                    f"{name} holds {end:,} bytes of disk data where its footer records a "
+                    f"disk of {disk:,}; the file is cut short")
+            self.vhd["data_after_disk"] = end - disk
+            self.chunk_size = _VIRTUAL_CHUNK
+            self._apple_finish(disk // 512, FORMAT_VHD)
+            return
+
+        offset = footer["data_offset"]
+        fh.seek(offset)
+        dyn = fh.read(1024)
+        if len(dyn) < 1024 or dyn[:8] != b"cxsparse":
+            raise EwfFormatError(f"{name} has no dynamic disk header at offset {offset:,}, "
+                                 f"where its footer points")
+        (_cookie, _next, table, version, entries, block, checksum, parent_id,
+         parent_stamp) = _VHD_DYNAMIC.unpack_from(dyn)
+        if _vhd_checksum(dyn, 36) != checksum:
+            raise EwfFormatError(f"{name}'s dynamic disk header does not match its "
+                                 f"checksum")
+        if version >> 16 != 1:
+            raise EwfFormatError(f"{name}'s dynamic disk header is version "
+                                 f"{version >> 16}.{version & 0xFFFF}; only 1.0 is read")
+        if block < 512 or block & (block - 1):
+            raise EwfFormatError(f"{name} records a block size of {block:,} bytes, not a "
+                                 f"power of two of at least 512")
+        needed = -(-disk // block)
+        if entries < needed:
+            raise EwfFormatError(f"{name}'s block table has {entries:,} entries for a disk "
+                                 f"of {needed:,} blocks")
+        if table + 4 * needed > size:
+            raise EwfIncompleteSetError(f"{name} ends inside its block table; the file is "
+                                        f"cut short")
+        fh.seek(table)
+        bat = list(struct.unpack(f">{needed}I", _read_exactly(fh, 4 * needed)))
+        bitmap = -(-(block // 512) // 8)
+        bitmap = -(-bitmap // 512) * 512
+        stored = []
+        for i, entry in enumerate(bat):
+            if entry == _VHD_UNUSED:
+                continue
+            start = entry * 512
+            want = bitmap + min(block, disk - i * block)
+            if start + want > end:
+                raise EwfIncompleteSetError(f"{name} ends inside block {i:,}; the file is "
+                                            f"cut short")
+            stored.append((start, start + want, i))
+        stored.sort()
+        for (a0, a1, i), (b0, _b1, j) in zip(stored, stored[1:]):
+            if b0 < a1:
+                raise EwfFormatError(f"{name} stores blocks {i:,} and {j:,} in bytes that "
+                                     f"overlap")
+        self._vhd_bat = bat
+        self.vhd.update(block_size=block, blocks=needed, blocks_stored=len(stored),
+                        bitmap_bytes=bitmap)
+        self.chunk_size = min(block, _VIRTUAL_CHUNK)
+        if kind == "differencing":
+            self._vhd_open_parent(name, dyn, parent_id, parent_stamp)
+        self._apple_finish(disk // 512, FORMAT_VHD)
+
+    def _vhd_open_parent(self, name, dyn, parent_id, parent_stamp):
+        """Open the disk a differencing VHD was made from. It is looked for where the
+        disk's parent locators say, relative first, then by its file name beside this
+        one; it must be a VHD whose identifier is the one this disk records."""
+        here = os.path.dirname(self.paths[0])
+        parent_name = dyn[64:576].decode("utf-16-be", "replace").split("\0")[0]
+        candidates, locators = [], []
+        fh = self._handle(0)
+        for n in range(8):
+            code, _space, length, _reserved, offset = _VHD_LOCATOR.unpack_from(
+                dyn, 576 + 24 * n)
+            if code == b"\0\0\0\0" or not length or length > 65536:
+                continue
+            fh.seek(offset)
+            data = fh.read(length)
+            if code in (b"W2ru", b"W2ku"):
+                text = data.decode("utf-16-le", "replace").split("\0")[0]
+                locators.append((code.decode(), text))
+                if code == b"W2ru":
+                    candidates.append(os.path.join(here, *[part for part in
+                                      re.split(r"[\\/]", text) if part not in ("", ".")]))
+                else:
+                    candidates.append(text)
+                    candidates.append(os.path.join(here, re.split(r"[\\/]", text)[-1]))
+            elif code == b"MacX":
+                text = data.decode("utf-8", "replace").split("\0")[0]
+                locators.append((code.decode(), text))
+                local = urllib.parse.unquote(urllib.parse.urlparse(text).path)
+                candidates.append(local)
+                candidates.append(os.path.join(here, os.path.basename(local)))
+        if parent_name:
+            candidates.append(os.path.join(here, re.split(r"[\\/]", parent_name)[-1]))
+        self.vhd["parent"] = {
+            "unique_id": _uuid_text(parent_id), "name": parent_name, "locators": locators,
+            "file": None,
+            # The spec calls this the parent's modification time; the parent's own
+            # footer records its creation time, so the two are not compared.
+            # Windows 11 writes 0 here, which records nothing.
+            "timestamp": datetime.datetime.fromtimestamp(
+                _VHD_EPOCH + parent_stamp, datetime.timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S UTC") if parent_stamp else None}
+        if len(_opening_parents) >= _VIRTUAL_MAX_PARENTS:
+            raise EwfFormatError(f"{name} is more than {_VIRTUAL_MAX_PARENTS} differencing "
+                                 f"disks deep")
+        mine = os.path.realpath(self.paths[0])
+        wrong = []
+        seen = set()
+        _opening_parents.append(mine)
+        try:
+            for path in candidates:
+                real = os.path.realpath(path)
+                if real in seen or not os.path.isfile(real):
+                    continue
+                seen.add(real)
+                if real in _opening_parents:
+                    raise EwfFormatError(f"{name}'s chain of parent disks loops back to "
+                                         f"{os.path.basename(real)}")
+                if virtual_disk_kind(real) != FORMAT_VHD:
+                    wrong.append(f"{os.path.basename(real)} is not a VHD")
+                    continue
+                parent = EwfImage(real)
+                if parent._vhd_unique_id != parent_id:
+                    wrong.append(f"{os.path.basename(real)} is disk "
+                                 f"{parent.vhd['unique_id']}")
+                    parent.close()
+                    continue
+                self.parent = parent
+                self.vhd["parent"]["file"] = os.path.basename(real)
+                return
+        finally:
+            _opening_parents.pop()
+        wanted = parent_name or (locators[0][1] if locators else "not recorded")
+        if wrong:
+            raise EwfFormatError(
+                f"{name} is a differencing disk whose parent is disk "
+                f"{_uuid_text(parent_id)} ({_shown(wanted)}); "
+                f"{'; '.join(wrong)}, so its parent is not beside it")
+        raise EwfIncompleteSetError(
+            f"{name} is a differencing disk; its parent, {_shown(wanted)}, is not "
+            f"beside it. Put the parent disk in the same folder.")
+
+    def _chunk_data_vhd(self, n):
+        start = n * self.chunk_size
+        want = min(self.chunk_size, self.media_size - start)
+        fh = self._handle(0)
+        if self.vhd["disk_type"] == "fixed":
+            fh.seek(start)
+            return _read_exactly(fh, want)
+        block = self.vhd["block_size"]
+        i, within = divmod(start, block)
+        entry = self._vhd_bat[i]
+        if entry == _VHD_UNUSED:
+            return self._parent_read(start, want) if self.parent else bytes(want)
+        fh.seek(entry * 512 + self.vhd["bitmap_bytes"] + within)
+        data = _read_exactly(fh, want)
+        if self.parent is None:
+            return data
+        bitmap = self._vhd_bitmap(i, entry)
+        first = within // 512
+        out = bytearray(data)
+        count = want // 512
+        s = 0
+        while s < count:
+            bit = (bitmap[(first + s) >> 3] >> (7 - ((first + s) & 7))) & 1
+            e = s + 1
+            while e < count and (bitmap[(first + e) >> 3] >> (7 - ((first + e) & 7))) & 1 == bit:
+                e += 1
+            if not bit:
+                out[s * 512:e * 512] = self._parent_read(start + s * 512, (e - s) * 512)
+            s = e
+        return bytes(out)
+
+    def _vhd_bitmap(self, i, entry):
+        cached = self._vhd_bitmaps.get(i)
+        if cached is None:
+            fh = self._handle(0)
+            fh.seek(entry * 512)
+            cached = _read_exactly(fh, self.vhd["bitmap_bytes"])
+            if len(self._vhd_bitmaps) >= 64:
+                self._vhd_bitmaps.popitem(last=False)
+            self._vhd_bitmaps[i] = cached
+        return cached
+
+    def _parent_read(self, offset, n):
+        """``n`` bytes of the parent disk at ``offset``; past its end, zeros."""
+        have = max(0, min(n, self.parent.media_size - offset))
+        data = b""
+        if have:
+            self.parent.seek(offset)
+            data = self.parent.read(have)
+        return data + bytes(n - len(data))
+
+    def _index_qcow(self):
+        """Read a QCOW header (version 1, 2 or 3), its L1 table, its header extensions
+        and snapshot table, and open its backing file and external data file."""
+        path = self.paths[0]
+        name = os.path.basename(path)
+        size = os.path.getsize(path)
+        fh = self._handle(0)
+        fh.seek(0)
+        head = fh.read(4096)
+        version = struct.unpack_from(">I", head, 4)[0]
+        extensions, features = {}, []
+        snapshots = []
+        if version == 1:
+            (_m, _v, backing_at, backing_len, mtime, disk, cluster_bits, l2_bits, crypt,
+             l1_at) = _QCOW1_HEADER.unpack_from(head)
+            if not 9 <= cluster_bits <= 16 or not 6 <= l2_bits <= 13:
+                raise EwfFormatError(f"{name} records {cluster_bits} cluster bits and "
+                                     f"{l2_bits} L2 bits, which QEMU's qcow does not allow")
+            l1_size = -(-disk // (1 << (cluster_bits + l2_bits)))
+            entry_bytes = 8
+            l2_entries = 1 << l2_bits
+            incompatible = 0
+        else:
+            (_m, _v, backing_at, backing_len, cluster_bits, disk, crypt, l1_size, l1_at,
+             _rc_at, _rc_clusters, nb_snapshots, snapshots_at) = _QCOW2_HEADER.unpack_from(head)
+            mtime = None
+            incompatible = compatible = 0
+            header_length, compression = 72, 0
+            if version == 3:
+                incompatible, compatible, _auto, _order, header_length = struct.unpack_from(
+                    ">QQQII", head, 72)
+                if header_length > 104:
+                    compression = head[104]
+            if incompatible & ~_QCOW_KNOWN_INCOMPATIBLE:
+                raise EwfFormatError(f"{name} sets incompatible feature bits "
+                                     f"{incompatible & ~_QCOW_KNOWN_INCOMPATIBLE:#x}, which "
+                                     f"this reader does not know")
+            if not 9 <= cluster_bits <= 21:
+                raise EwfFormatError(f"{name} records {cluster_bits} cluster bits")
+            entry_bytes = 16 if incompatible & 16 else 8
+            l2_entries = (1 << cluster_bits) // entry_bytes
+            at = header_length if version == 3 else 72
+            while at + 8 <= min(len(head), 1 << cluster_bits):
+                kind, length = struct.unpack_from(">II", head, at)
+                if kind == 0:
+                    break
+                extensions[kind] = head[at + 8:at + 8 + length]
+                at += 8 + -(-length // 8) * 8
+            for flag, label in ((1, "dirty"), (2, "marked corrupt"),
+                                (4, "external data file"), (8, "zstd" if
+                                compression == 1 else "compression type"),
+                                (16, "extended L2 entries")):
+                if incompatible & flag:
+                    features.append(label)
+            if compatible & 1:
+                features.append("lazy refcounts")
+            if nb_snapshots:
+                fh.seek(snapshots_at)
+                table = fh.read(min(nb_snapshots * 1024 + 65536, max(0, size - snapshots_at)))
+                pos = 0
+                for _ in range(nb_snapshots):
+                    if pos + 40 > len(table):
+                        break
+                    (_l1, _l1n, id_len, name_len, sec, _nsec, _vm_ns, vm_state,
+                     extra_len) = struct.unpack_from(">QIHHIIQII", table, pos)
+                    q = pos + 40 + extra_len
+                    snap_id = table[q:q + id_len].decode("utf-8", "replace")
+                    snap_name = table[q + id_len:q + id_len + name_len].decode(
+                        "utf-8", "replace")
+                    snapshots.append({"id": snap_id, "name": snap_name,
+                                      "taken": datetime.datetime.fromtimestamp(
+                                          sec, datetime.timezone.utc).strftime(
+                                          "%Y-%m-%d %H:%M:%S UTC"),
+                                      "vm_state": bool(vm_state)})
+                    pos = q + id_len + name_len
+                    pos += -pos % 8
+        if crypt:
+            raise EwfFormatError(f"{name} is encrypted ({'AES' if crypt == 1 else 'LUKS' if crypt == 2 else crypt}), "
+                                 f"which this reader does not decrypt")
+        cluster = 1 << cluster_bits
+        needed = -(-disk // (cluster * l2_entries))
+        if l1_size < needed:
+            raise EwfFormatError(f"{name}'s L1 table has {l1_size:,} entries for a disk "
+                                 f"that needs {needed:,}")
+        if l1_at + 8 * needed > size:
+            raise EwfIncompleteSetError(f"{name} ends inside its L1 table; the file is cut "
+                                        f"short")
+        fh.seek(l1_at)
+        l1 = list(struct.unpack(f">{needed}Q", _read_exactly(fh, 8 * needed)))
+        compression_name = "deflate"                   # QEMU's default codec
+        if version > 1 and incompatible & 8 and compression == 1:
+            compression_name = "zstd"
+        elif version > 1 and incompatible & 8:
+            raise EwfFormatError(f"{name} records compression type {compression}; deflate "
+                                 f"(0) and zstd (1) are read")
+        self.qcow = {"version": version, "cluster_size": cluster, "disk_size": disk,
+                     "features": features, "snapshots": snapshots,
+                     "backing_file": None, "backing_format": None, "backing_opened": None,
+                     "external_data_file": None, "compression": compression_name,
+                     "modified": (datetime.datetime.fromtimestamp(
+                         mtime, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                         if mtime else None)}
+        self._qcow_l1 = l1
+        self._qcow_l2 = OrderedDict()
+        self._qcow_clusters = OrderedDict()
+        self._qcow_l2_entries = l2_entries
+        self._qcow_entry_bytes = entry_bytes
+        self._qcow_data = 0
+        self._qcow_zstd = None
+        if compression_name == "zstd":
+            self._qcow_zstd = _zstd_decompressor()
+            if self._qcow_zstd is None:
+                raise EwfFormatError(f"{name} compresses its clusters with zstd, which "
+                                     f"needs Python 3.14 or the optional backports.zstd "
+                                     f"package")
+        here = os.path.dirname(path)
+        if version > 1 and incompatible & 4:
+            data_name = extensions.get(_QCOW_EXTERNAL_DATA, b"").decode("utf-8", "replace")
+            self.qcow["external_data_file"] = data_name or None
+            data_path = os.path.join(here, os.path.basename(data_name)) if data_name else ""
+            if not data_name or not os.path.isfile(data_path):
+                raise EwfIncompleteSetError(
+                    f"{name} keeps its data in an external file"
+                    f"{', ' + _shown(data_name) + ',' if data_name else ''} which is not "
+                    f"beside it")
+            self.paths.append(data_path)
+            self._qcow_data = len(self.paths) - 1
+        if backing_at and backing_len:
+            if backing_len > 1023 or backing_at + backing_len > size:
+                raise EwfFormatError(f"{name}'s backing file name does not fit its header")
+            fh.seek(backing_at)
+            backing = fh.read(backing_len).decode("utf-8", "replace")
+            fmt = extensions.get(_QCOW_BACKING_FORMAT, b"").decode("utf-8", "replace")
+            self.qcow["backing_file"] = backing
+            self.qcow["backing_format"] = fmt or None
+            self._qcow_open_backing(name, here, backing, fmt)
+        self.compression_level = (f"{'zstd' if compression_name == 'zstd' else 'deflate'}"
+                                  f" for any cluster stored compressed")
+        self.chunk_size = _VIRTUAL_CHUNK
+        self._apple_finish(-(-disk // 512), FORMAT_QCOW,
+                           sizes=[os.path.getsize(p) for p in self.paths])
+        self.media_size = self.size = disk              # need not be whole sectors
+        self.chunk_count = self._indexed_chunks = self._needed_chunks()
+
+    def _qcow_open_backing(self, name, here, backing, fmt):
+        """Open a QCOW's backing file by its recorded name, relative to this file or
+        (when absolute and present) where it names, then by file name beside it. QCOW
+        records no identity for its backing file, so only the name ties them."""
+        parts = [part for part in re.split(r"[\\/]", backing) if part not in ("", ".")]
+        candidates = []
+        if os.path.isabs(backing):
+            candidates.append(backing)
+        elif not re.match(r"^[A-Za-z]:", backing) and not re.match(r"^[a-z]+:", backing):
+            candidates.append(os.path.join(here, *parts))
+        if parts:
+            candidates.append(os.path.join(here, parts[-1]))
+        if len(_opening_parents) >= _VIRTUAL_MAX_PARENTS:
+            raise EwfFormatError(f"{name} is more than {_VIRTUAL_MAX_PARENTS} backing files "
+                                 f"deep")
+        mine = os.path.realpath(self.paths[0])
+        _opening_parents.append(mine)
+        try:
+            for path in candidates:
+                real = os.path.realpath(path)
+                if not os.path.isfile(real):
+                    continue
+                if real in _opening_parents:
+                    raise EwfFormatError(f"{name}'s chain of backing files loops back to "
+                                         f"{os.path.basename(real)}")
+                if fmt == "raw" or (not fmt and virtual_disk_kind(real) is None
+                                    and not is_image(real)):
+                    self.parent = _RawParent(real)
+                else:
+                    self.parent = EwfImage(real)
+                self.qcow["backing_opened"] = os.path.basename(real)
+                return
+        finally:
+            _opening_parents.pop()
+        raise EwfIncompleteSetError(f"{name} has a backing file, {_shown(backing)}, which "
+                                    f"is not beside it. Put it in the same folder.")
+
+    def _qcow_l2_table(self, index):
+        table = self._qcow_l2.get(index)
+        if table is None:
+            entry = self._qcow_l1[index]
+            offset = entry & _QCOW_OFFSET if self.qcow["version"] > 1 else entry
+            if not offset:
+                return None
+            count = self._qcow_l2_entries * (self._qcow_entry_bytes // 8)
+            fh = self._handle(0)
+            fh.seek(offset)
+            raw = fh.read(8 * count)
+            if len(raw) < 8 * count:
+                raise EwfIncompleteSetError(f"{os.path.basename(self.paths[0])} ends inside "
+                                            f"an L2 table; the file is cut short")
+            table = struct.unpack(f">{count}Q", raw)
+            if len(self._qcow_l2) >= 64:
+                self._qcow_l2.popitem(last=False)
+            self._qcow_l2[index] = table
+        return table
+
+    def _qcow_compressed(self, entry, cluster_index):
+        cached = self._qcow_clusters.get(cluster_index)
+        if cached is not None:
+            return cached
+        cluster = self.qcow["cluster_size"]
+        bits = cluster.bit_length() - 1
+        if self.qcow["version"] == 1:
+            offset = entry & ((1 << (63 - bits)) - 1)
+            length = (entry >> (63 - bits)) & (cluster - 1)
+        else:
+            x = 62 - (bits - 8)
+            offset = entry & ((1 << x) - 1)
+            sectors = (entry >> x) & ((1 << (62 - x)) - 1)
+            length = (sectors + 1) * 512 - (offset & 511)
+        fh = self._handle(0)
+        fh.seek(offset)
+        blob = fh.read(length)
+        try:
+            if self._qcow_zstd is not None:
+                data = self._qcow_zstd().decompress(blob)
+            else:
+                data = zlib.decompressobj(-15).decompress(blob, cluster)
+        except Exception as exc:                            # zlib.error, zstd errors
+            raise EwfFormatError(f"{os.path.basename(self.paths[0])}: cluster "
+                                 f"{cluster_index:,} does not decompress ({exc})") from None
+        data = data[:cluster] + bytes(max(0, cluster - len(data)))
+        if len(self._qcow_clusters) >= 32:
+            self._qcow_clusters.popitem(last=False)
+        self._qcow_clusters[cluster_index] = data
+        return data
+
+    def _chunk_data_qcow(self, n):
+        start = n * self.chunk_size
+        want = min(self.chunk_size, self.media_size - start)
+        cluster = self.qcow["cluster_size"]
+        version = self.qcow["version"]
+        out = bytearray()
+        at = start
+        while at < start + want:
+            index, within = divmod(at, cluster)
+            take = min(cluster - within, start + want - at)
+            l1_index, l2_index = divmod(index, self._qcow_l2_entries)
+            table = self._qcow_l2_table(l1_index) if l1_index < len(self._qcow_l1) else None
+            entry = bitmap = 0
+            if table is not None:
+                if self._qcow_entry_bytes == 16:
+                    entry, bitmap = table[2 * l2_index], table[2 * l2_index + 1]
+                else:
+                    entry = table[l2_index]
+            out += self._qcow_piece(entry, bitmap, index, within, take, at, version)
+            at += take
+        return bytes(out)
+
+    def _qcow_piece(self, entry, bitmap, index, within, take, at, version):
+        """``take`` bytes of cluster ``index`` from ``within``, by its L2 entry."""
+        cluster = self.qcow["cluster_size"]
+        if version == 1:
+            if not entry:
+                return self._qcow_absent(at, take)
+            if entry & _QCOW1_COMPRESSED:
+                return self._qcow_compressed(entry, index)[within:within + take]
+            return self._qcow_stored(entry, within, take)
+        if entry & _QCOW_COMPRESSED:
+            return self._qcow_compressed(entry & ~(_QCOW_COPIED | _QCOW_COMPRESSED),
+                                         index)[within:within + take]
+        offset = entry & _QCOW_OFFSET
+        allocated = bool(offset) or (bool(entry & _QCOW_COPIED) and self._qcow_data)
+        if self._qcow_entry_bytes == 16:
+            sub = cluster // 32
+            out = bytearray()
+            while take > 0:
+                k, inside = divmod(within, sub)
+                part = min(sub - inside, take)
+                if bitmap >> k & 1:
+                    out += self._qcow_stored(offset, within, part)
+                elif bitmap >> (32 + k) & 1:
+                    out += bytes(part)
+                else:
+                    out += self._qcow_absent(at, part)
+                within += part
+                at += part
+                take -= part
+            return bytes(out)
+        if version == 3 and entry & 1:
+            return bytes(take)
+        if not allocated:
+            return self._qcow_absent(at, take)
+        return self._qcow_stored(offset, within, take)
+
+    def _qcow_stored(self, offset, within, take):
+        fh = self._handle(self._qcow_data)
+        fh.seek(offset + within)
+        data = fh.read(take)
+        if len(data) < take:
+            raise EwfIncompleteSetError(f"{os.path.basename(self.paths[self._qcow_data])} "
+                                        f"ends inside a cluster; the file is cut short")
+        return data
+
+    def _qcow_absent(self, at, take):
+        return self._parent_read(at, take) if self.parent is not None else bytes(take)
+
+    def _vmdk_find_descriptor(self, path, name):
+        """The descriptor file beside a VMDK extent opened on its own: the one text
+        descriptor in the same folder whose extent lines name it."""
+        here = os.path.dirname(path)
+        base = os.path.basename(path)
+        found = []
+        for entry in sorted(os.listdir(here)):
+            other = os.path.join(here, entry)
+            if other == path or not os.path.isfile(other):
+                continue
+            if os.path.getsize(other) > _VMDK_MAX_DESCRIPTOR:
+                continue
+            with open(other, "rb") as fh:
+                raw = fh.read(_VMDK_MAX_DESCRIPTOR)
+            if not _is_vmdk_descriptor(raw):
+                continue
+            for line in _vmdk_descriptor_text(raw).splitlines():
+                m = _VMDK_EXTENT.match(line)
+                if m and m.group(4) and os.path.basename(
+                        m.group(4).replace("\\", "/")) == base:
+                    found.append(other)
+                    break
+        if len(found) == 1:
+            return found[0]
+        raise EwfIncompleteSetError(
+            f"{name} is one extent of a VMDK and holds no descriptor of its own; "
+            f"{'no descriptor file beside it lists it' if not found else 'several descriptor files beside it list it'}"
+            f". Open the descriptor .vmdk instead.")
+
+    def _index_vmdk(self):
+        """Read a VMDK's descriptor, open each extent it lists, and for a delta link its
+        parent."""
+        path = self.paths[0]
+        name = os.path.basename(path)
+        with open(path, "rb") as fh:
+            head = fh.read(_VMDK_SPARSE.size)
+        if head[:4] == VMDK_COWD_MAGIC:
+            path = self._vmdk_find_descriptor(path, name)
+        elif head[:4] == VMDK_SPARSE_MAGIC:
+            fields = _VMDK_SPARSE.unpack_from(head)
+            embedded = ""
+            if fields[5]:
+                with open(path, "rb") as fh:
+                    fh.seek(fields[5] * 512)
+                    embedded = _vmdk_descriptor_text(fh.read(min(fields[6] * 512,
+                                                                 _VMDK_MAX_DESCRIPTOR)))
+            # An extent of a multi-extent disk carries no descriptor, or (as qemu-img
+            # writes it) an empty one; its descriptor is a file beside it.
+            if not any(_VMDK_EXTENT.match(line.strip()) for line in embedded.splitlines()):
+                path = self._vmdk_find_descriptor(path, name)
+        name = os.path.basename(path)
+        here = os.path.dirname(path)
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            head = fh.read(_VMDK_SPARSE.size)
+            if head[:4] == VMDK_SPARSE_MAGIC:
+                fields = _VMDK_SPARSE.unpack_from(head)
+                fh.seek(fields[5] * 512)
+                raw = fh.read(min(fields[6] * 512, _VMDK_MAX_DESCRIPTOR))
+                where = f"embedded in {name}"
+            else:
+                if size > _VMDK_MAX_DESCRIPTOR:
+                    raise EwfFormatError(f"{name} is too large to be a VMDK descriptor")
+                fh.seek(0)
+                raw = fh.read()
+                where = name
+        text = _vmdk_descriptor_text(raw)
+        header, ddb, extents = {}, {}, []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            m = _VMDK_EXTENT.match(stripped)
+            if m:
+                extents.append((m.group(1).upper(), int(m.group(2)), m.group(3).upper(),
+                                m.group(4), int(m.group(5) or 0)))
+                continue
+            if "=" in stripped:
+                key, value = stripped.split("=", 1)
+                key, value = key.strip(), value.strip().strip('"')
+                if key.lower().startswith("ddb."):
+                    ddb[key[4:]] = value
+                else:
+                    header[key.lower()] = value
+        if not extents:
+            raise EwfFormatError(f"the VMDK descriptor {where} lists no extents")
+        create = header.get("createtype", "")
+        if create.lower() in ("fulldevice", "partitioneddevice", "vmfsraw", "vmfsrdm",
+                              "vmfsrdmp", "vmfsrawdevicemap",
+                              "vmfspassthroughrawdevicemap"):
+            raise EwfFormatError(f"{name} is a {create} VMDK, whose extents are a physical "
+                                 f"device rather than files, so there is nothing in it to "
+                                 f"read")
+        self.paths = [path]
+        start = 0
+        listed = []
+        # A descriptor embedded in a sparse extent that lists one sparse extent is
+        # describing the file it sits in, whatever name it recorded: VMware's OVF tool
+        # writes "generated-stream.vmdk" there.
+        embedded_self = (where.startswith("embedded") and len(extents) == 1
+                         and extents[0][2] == "SPARSE")
+        for access, sectors, kind, file_name, offset in extents:
+            length = sectors * 512
+            extent = {"start": start, "length": length, "type": kind, "file": file_name,
+                      "offset": offset * 512, "index": None}
+            if access == "NOACCESS":
+                raise EwfFormatError(f"{name} lists an extent marked NOACCESS")
+            if kind != "ZERO":
+                if not file_name:
+                    raise EwfFormatError(f"{name} lists a {kind} extent with no file")
+                extent_path = path if embedded_self else os.path.join(
+                    here, *[part for part in re.split(r"[\\/]", file_name)
+                            if part not in ("", ".")])
+                if not os.path.isfile(extent_path):
+                    raise EwfIncompleteSetError(
+                        f"{name} lists the extent {_shown(file_name)}, which is not beside "
+                        f"it. Put every file of the disk in one folder.")
+                if extent_path not in self.paths:
+                    self.paths.append(extent_path)
+                extent["index"] = self.paths.index(extent_path)
+                extent_size = os.path.getsize(extent_path)
+                if kind in ("FLAT", "VMFS", "VMFSTHIN"):
+                    if extent["offset"] + length > extent_size:
+                        raise EwfIncompleteSetError(
+                            f"{_shown(file_name)} is {extent_size:,} bytes where the "
+                            f"descriptor places {length:,} bytes of disk in it from "
+                            f"offset {extent['offset']:,}; the file is cut short")
+                elif kind == "SPARSE":
+                    self._vmdk_open_sparse(extent, extent_path, sectors, extent_size)
+                elif kind == "VMFSSPARSE":
+                    self._vmdk_open_cowd(extent, extent_path, sectors, extent_size)
+                else:
+                    raise EwfFormatError(f"{name} lists a {kind} extent, which this reader "
+                                         f"does not read")
+            listed.append({"type": kind, "file": file_name, "sectors": sectors,
+                           "access": access, "this_file": embedded_self})
+            self._vmdk_extents.append(extent)
+            start += length
+        self.vmdk = {"create_type": create, "descriptor": where,
+                     "cid": header.get("cid"), "parent_cid": header.get("parentcid"),
+                     "parent_hint": header.get("parentfilenamehint"), "extents": listed,
+                     "ddb": ddb, "parent": None,
+                     "compressed": any(e.get("compressed") for e in self._vmdk_extents)}
+        self.compression_level = "deflate" if self.vmdk["compressed"] else "none"
+        parent_cid = (header.get("parentcid") or "ffffffff").lower()
+        if parent_cid != "ffffffff":
+            self._vmdk_open_parent(name, here, parent_cid, header.get("parentfilenamehint"))
+        self.chunk_size = _VIRTUAL_CHUNK
+        self._vmdk_grain_cache = OrderedDict()
+        self._apple_finish(start // 512, FORMAT_VMDK, sizes=[os.path.getsize(p)
+                                                             for p in self.paths])
+
+    def _vmdk_open_sparse(self, extent, path, sectors, size):
+        label = os.path.basename(path)
+        with open(path, "rb") as fh:
+            head = fh.read(_VMDK_SPARSE.size)
+            if head[:4] != VMDK_SPARSE_MAGIC:
+                raise EwfFormatError(f"{label} is listed as a SPARSE extent but is not a "
+                                     f"hosted sparse extent")
+            (_magic, version, flags, capacity, grain, _doff, _dsize, per_gt, _rgd, gd,
+             _over, _unclean, _chars, compress) = _VMDK_SPARSE.unpack_from(head)
+            if version not in (1, 2, 3):
+                raise EwfFormatError(f"{label} is a version {version} sparse extent; "
+                                     f"versions 1 to 3 are read")
+            if gd == _VMDK_GD_AT_END:
+                fh.seek(max(0, size - 1024))
+                foot = fh.read(_VMDK_SPARSE.size)
+                if foot[:4] != VMDK_SPARSE_MAGIC:
+                    raise EwfFormatError(f"{label} keeps its grain directory at its end, "
+                                         f"but has no footer there")
+                (_m, _v, flags, capacity, grain, _do, _ds, per_gt, _r, gd, _o, _u, _c,
+                 compress) = _VMDK_SPARSE.unpack_from(foot)
+            if grain < 1 or grain & (grain - 1) or not per_gt or per_gt > 65536:
+                raise EwfFormatError(f"{label} records a grain of {grain:,} sectors and "
+                                     f"{per_gt:,} entries to a grain table")
+            compressed = bool(flags & (1 << 16))
+            if compressed and compress != 1:
+                raise EwfFormatError(f"{label} records compression algorithm {compress}; "
+                                     f"only deflate (1) is read")
+            coverage = per_gt * grain * 512
+            count = -(-capacity * 512 // coverage)
+            if gd * 512 + 4 * count > size:
+                raise EwfIncompleteSetError(f"{label} ends inside its grain directory; "
+                                            f"the file is cut short")
+            fh.seek(gd * 512)
+            directory = list(struct.unpack(f"<{count}I", _read_exactly(fh, 4 * count)))
+        if capacity < sectors:
+            raise EwfFormatError(f"{label} holds {capacity:,} sectors where the descriptor "
+                                 f"lists {sectors:,}")
+        extent.update(grain=grain * 512, per_gt=per_gt, table_bytes=4, directory=directory,
+                      compressed=compressed, zero_grains=bool(flags & 4),
+                      tables=OrderedDict(), file_size=size)
+
+    def _vmdk_open_cowd(self, extent, path, sectors, size):
+        label = os.path.basename(path)
+        with open(path, "rb") as fh:
+            head = fh.read(_VMDK_COWD.size)
+            if head[:4] != VMDK_COWD_MAGIC:
+                raise EwfFormatError(f"{label} is listed as a VMFSSPARSE extent but is not "
+                                     f"an ESXi sparse extent")
+            (_magic, version, _flags, total, grain, gd, count,
+             _free) = _VMDK_COWD.unpack_from(head)
+            if version != 1:
+                raise EwfFormatError(f"{label} is a version {version} ESXi sparse extent; "
+                                     f"only version 1 is read")
+            if grain < 1 or not count or gd * 512 + 4 * count > size:
+                raise EwfFormatError(f"{label}'s grain directory does not fit the file")
+            fh.seek(gd * 512)
+            directory = list(struct.unpack(f"<{count}I", _read_exactly(fh, 4 * count)))
+        if total < sectors:
+            raise EwfFormatError(f"{label} holds {total:,} sectors where the descriptor "
+                                 f"lists {sectors:,}")
+        extent.update(grain=grain * 512, per_gt=4096, table_bytes=4, directory=directory,
+                      compressed=False, zero_grains=False, tables=OrderedDict(),
+                      file_size=size)
+
+    def _vmdk_open_parent(self, name, here, parent_cid, hint):
+        """Open the parent link of a VMDK delta by its parentFileNameHint (by file name
+        beside this one when the hint names another machine's path); its descriptor's
+        content id must be the parentCID this link records."""
+        self.vmdk["parent"] = {"cid": parent_cid, "hint": hint, "file": None}
+        if not hint:
+            raise EwfFormatError(f"{name} is a delta link with no parentFileNameHint")
+        candidates = []
+        parts = [part for part in re.split(r"[\\/]", hint) if part not in ("", ".")]
+        if not os.path.isabs(hint) and not re.match(r"^[A-Za-z]:", hint):
+            candidates.append(os.path.join(here, *parts))
+        elif os.path.isabs(hint):
+            candidates.append(hint)
+        candidates.append(os.path.join(here, parts[-1] if parts else hint))
+        if len(_opening_parents) >= _VIRTUAL_MAX_PARENTS:
+            raise EwfFormatError(f"{name} is more than {_VIRTUAL_MAX_PARENTS} delta links "
+                                 f"deep")
+        mine = os.path.realpath(self.paths[0])
+        wrong, seen = [], set()
+        _opening_parents.append(mine)
+        try:
+            for path in candidates:
+                real = os.path.realpath(path)
+                if real in seen or not os.path.isfile(real):
+                    continue
+                seen.add(real)
+                if real in _opening_parents:
+                    raise EwfFormatError(f"{name}'s chain of parent disks loops back to "
+                                         f"{os.path.basename(real)}")
+                if virtual_disk_kind(real) != FORMAT_VMDK:
+                    wrong.append(f"{os.path.basename(real)} is not a VMDK")
+                    continue
+                parent = EwfImage(real)
+                if (parent.vmdk["cid"] or "").lower() != parent_cid:
+                    wrong.append(f"{os.path.basename(real)} has content id "
+                                 f"{parent.vmdk['cid']}")
+                    parent.close()
+                    continue
+                self.parent = parent
+                self.vmdk["parent"]["file"] = os.path.basename(real)
+                return
+        finally:
+            _opening_parents.pop()
+        if wrong:
+            raise EwfFormatError(f"{name} is a delta link whose parent has content id "
+                                 f"{parent_cid} ({_shown(hint)}); {'; '.join(wrong)}, so "
+                                 f"its parent is not beside it")
+        raise EwfIncompleteSetError(f"{name} is a delta link; its parent, {_shown(hint)}, "
+                                    f"is not beside it. Put the parent disk in the same "
+                                    f"folder.")
+
+    def _chunk_data_vmdk(self, n):
+        start = n * self.chunk_size
+        want = min(self.chunk_size, self.media_size - start)
+        out = bytearray()
+        at = start
+        for extent in self._vmdk_extents:
+            if at >= start + want:
+                break
+            e0, e1 = extent["start"], extent["start"] + extent["length"]
+            if e1 <= at:
+                continue
+            take = min(e1, start + want) - at
+            out += self._vmdk_extent_read(extent, at - e0, take, at)
+            at += take
+        return bytes(out) + bytes(want - len(out))
+
+    def _vmdk_extent_read(self, extent, rel, n, disk_offset):
+        kind = extent["type"]
+        if kind == "ZERO":
+            return bytes(n)
+        fh = self._handle(extent["index"])
+        if kind in ("FLAT", "VMFS", "VMFSTHIN"):
+            fh.seek(extent["offset"] + rel)
+            return _read_exactly(fh, n)
+        grain = extent["grain"]
+        out = bytearray()
+        while n > 0:
+            g, within = divmod(rel, grain)
+            take = min(n, grain - within)
+            entry = self._vmdk_grain_entry(extent, g)
+            if entry == 0:
+                out += (self._parent_read(disk_offset, take) if self.parent is not None
+                        else bytes(take))
+            elif entry == 1 and extent["zero_grains"]:
+                out += bytes(take)
+            elif extent["compressed"]:
+                out += self._vmdk_compressed_grain(extent, g, entry)[within:within + take]
+            else:
+                if entry * 512 + within + take > extent["file_size"]:
+                    raise EwfIncompleteSetError(
+                        f"{_shown(extent['file'])} ends inside grain {g:,}; the file is "
+                        f"cut short")
+                fh.seek(entry * 512 + within)
+                out += _read_exactly(fh, take)
+            rel += take
+            disk_offset += take
+            n -= take
+        return bytes(out)
+
+    def _vmdk_grain_entry(self, extent, g):
+        per_gt = extent["per_gt"]
+        t, k = divmod(g, per_gt)
+        if t >= len(extent["directory"]):
+            return 0
+        table_at = extent["directory"][t]
+        if not table_at:
+            return 0
+        table = extent["tables"].get(t)
+        if table is None:
+            if table_at * 512 + 4 * per_gt > extent["file_size"]:
+                raise EwfIncompleteSetError(f"{_shown(extent['file'])} ends inside a grain "
+                                            f"table; the file is cut short")
+            fh = self._handle(extent["index"])
+            fh.seek(table_at * 512)
+            table = struct.unpack(f"<{per_gt}I", _read_exactly(fh, 4 * per_gt))
+            if len(extent["tables"]) >= 256:
+                extent["tables"].popitem(last=False)
+            extent["tables"][t] = table
+        return table[k]
+
+    def _vmdk_compressed_grain(self, extent, g, entry):
+        key = (id(extent), g)
+        cached = self._vmdk_grain_cache.get(key)
+        if cached is not None:
+            return cached
+        fh = self._handle(extent["index"])
+        fh.seek(entry * 512)
+        head = _read_exactly(fh, 12)
+        lba, size = struct.unpack("<QI", head)
+        if lba * 512 != g * extent["grain"]:
+            raise EwfFormatError(f"{_shown(extent['file'])}: the grain marker at sector "
+                                 f"{entry:,} records sector {lba:,}, not the start of grain "
+                                 f"{g:,}")
+        blob = _read_exactly(fh, size)
+        try:
+            data = zlib.decompress(blob)
+        except zlib.error:
+            try:
+                data = zlib.decompressobj(-15).decompress(blob)
+            except zlib.error as exc:
+                raise EwfFormatError(f"{_shown(extent['file'])}: grain {g:,} does not "
+                                     f"decompress ({exc})") from None
+        if len(data) < extent["grain"]:
+            data += bytes(extent["grain"] - len(data))
+        if len(self._vmdk_grain_cache) >= 32:
+            self._vmdk_grain_cache.popitem(last=False)
+        self._vmdk_grain_cache[key] = data
+        return data
+
+    def _vhdx_read(self, offset, n):
+        """``n`` bytes of a VHDX file at ``offset``, with the log's replayed updates laid
+        over them in memory; past the end of the file, zeros (a replayed log can extend
+        the file)."""
+        fh = self._handle(0)
+        fh.seek(offset)
+        data = bytearray(fh.read(n))
+        data.extend(bytes(n - len(data)))
+        if self._vhdx_overlay:
+            first = offset - offset % 4096
+            for sector in range(first, offset + n, 4096):
+                if sector in self._vhdx_overlay:
+                    content = self._vhdx_overlay[sector] or bytes(4096)
+                    a, b = max(sector, offset), min(sector + 4096, offset + n)
+                    data[a - offset:b - offset] = content[a - sector:b - sector]
+        return bytes(data)
+
+    def _vhdx_replay(self, name, log_guid, log_offset, log_length, size):
+        """Find the active log sequence (MS-VHDX 2.3.3) and lay its updates over the
+        file in memory. Returns the number of log entries replayed."""
+        fh = self._handle(0)
+        if log_length % _MIB or log_offset % _MIB or log_offset + log_length > size:
+            raise EwfFormatError(f"{name}'s log is recorded at offset {log_offset:,}, "
+                                 f"{log_length:,} bytes, which the file cannot hold")
+        fh.seek(log_offset)
+        # The log is a ring, so an entry can run past its end and continue at its start;
+        # two copies end to end let every entry be read as one run of bytes.
+        log = _read_exactly(fh, log_length) * 2
+
+        def entry(at):
+            """The entry at ``at`` in the log, as (sequence, tail, length, flushed,
+            last, updates), or None when it is not a valid entry."""
+            if log[at:at + 4] != b"loge":
+                return None
+            (_sig, checksum, length, tail, seq, count, _res, guid, flushed,
+             last) = struct.unpack_from("<4sIIIQII16sQQ", log, at)
+            if (guid != log_guid or not seq or length % 4096 or not length
+                    or length > log_length or tail % 4096 or tail >= log_length):
+                return None
+            if _crc32c_zeroed(log[at:at + length]) != checksum:
+                return None
+            desc_sectors = -(-(64 + 32 * count) // 4096) if count else 1
+            data_at = at + 4096 * desc_sectors
+            updates = []
+            for k in range(count):
+                d = at + 64 + 32 * k
+                sig = log[d:d + 4]
+                if sig == b"zero":
+                    _z, _r, length_z, file_off, dseq = struct.unpack_from("<4sIQQQ", log, d)
+                    if dseq != seq or length_z % 4096 or file_off % 4096:
+                        return None
+                    updates.append((file_off, length_z, None))
+                elif sig == b"desc":
+                    _d, trailing, leading, file_off, dseq = struct.unpack_from(
+                        "<4s4s8sQQ", log, d)
+                    if dseq != seq or file_off % 4096 or data_at + 4096 > at + length:
+                        return None
+                    sector = log[data_at:data_at + 4096]
+                    high, low = struct.unpack_from("<I", sector, 4)[0], struct.unpack_from(
+                        "<I", sector, 4092)[0]
+                    if sector[:4] != b"data" or (high << 32 | low) != seq:
+                        return None
+                    updates.append((file_off, 4096, leading + sector[8:4092] + trailing))
+                    data_at += 4096
+                else:
+                    return None
+            return seq, tail, length, flushed, last, updates
+
+        best, best_seq = None, 0
+        tail = old = 0
+        while True:
+            sequence, head, seq = [], tail, 0
+            while True:
+                found = entry(head)
+                if found is None or (sequence and found[0] != seq + 1):
+                    break
+                sequence.append((head, found))
+                seq = found[0]
+                head = (head + found[2]) % log_length
+                if len(sequence) > log_length // 4096:
+                    break
+            valid = bool(sequence) and any(
+                start == sequence[-1][1][1] for start, _found in sequence)
+            if valid and seq > best_seq:
+                best, best_seq = sequence, seq
+            tail = (tail + 4096) % log_length if not valid else head
+            if tail < old or tail == old:
+                break
+            old = tail
+        if best is None:
+            raise EwfFormatError(f"{name}'s log is not empty but holds no complete, valid "
+                                 f"sequence of entries, so the file is corrupt")
+        head_entry = best[-1][1]
+        if size < head_entry[3]:
+            raise EwfIncompleteSetError(f"{name} is {size:,} bytes where its log records "
+                                        f"it was at least {head_entry[3]:,}; the file is "
+                                        f"cut short")
+        start = next(i for i, (at, _f) in enumerate(best) if at == head_entry[1])
+        for _at, (_seq, _tail, _len, _flushed, _last, updates) in best[start:]:
+            for file_off, length, content in updates:
+                for k in range(0, length, 4096):
+                    self._vhdx_overlay[file_off + k] = (
+                        content[k:k + 4096] if content is not None else None)
+        return len(best) - start
+
+    def _index_vhdx(self):
+        """Read a VHDX: its current header, the log replayed in memory when it holds
+        entries, the region table, the metadata the disk is described by, and the BAT;
+        open a differencing disk's parent."""
+        path = self.paths[0]
+        name = os.path.basename(path)
+        size = os.path.getsize(path)
+        fh = self._handle(0)
+        fh.seek(0)
+        ident = _read_exactly(fh, 520)
+        creator = ident[8:520].decode("utf-16-le", "replace").split("\0")[0]
+        headers = []
+        for at in (64 << 10, 128 << 10):
+            fh.seek(at)
+            raw = fh.read(4096)
+            if len(raw) < 4096 or raw[:4] != b"head":
+                continue
+            fields = _VHDX_HEADER.unpack_from(raw)
+            if _crc32c_zeroed(raw) != fields[1]:
+                continue
+            headers.append(fields)
+        if not headers:
+            raise EwfFormatError(f"{name} has no VHDX header whose checksum matches")
+        (_sig, _ck, sequence, _file_guid, data_guid, log_guid, log_version, version,
+         log_length, log_offset) = max(headers, key=lambda h: h[2])
+        if version != 1:
+            raise EwfFormatError(f"{name} is VHDX version {version}; only version 1 is read")
+        replayed = 0
+        if log_guid != bytes(16):
+            if log_version != 0:
+                raise EwfFormatError(f"{name}'s log is version {log_version} and holds "
+                                     f"entries; only version 0 is replayed")
+            replayed = self._vhdx_replay(name, log_guid, log_offset, log_length, size)
+        regions = None
+        for at in (192 << 10, 256 << 10):
+            table = self._vhdx_read(at, 65536)
+            if table[:4] != b"regi" or _crc32c_zeroed(table) != struct.unpack_from(
+                    "<I", table, 4)[0]:
+                continue
+            count = struct.unpack_from("<I", table, 8)[0]
+            if count > 2047:
+                continue
+            regions = {}
+            for k in range(count):
+                guid, offset, length, required = struct.unpack_from("<16sQII", table,
+                                                                    16 + 32 * k)
+                if guid in (_VHDX_REGION_BAT, _VHDX_REGION_METADATA):
+                    regions[guid] = (offset, length)
+                elif required & 1:
+                    raise EwfFormatError(f"{name} holds a region marked required, "
+                                         f"{uuid.UUID(bytes_le=guid)}, which this reader "
+                                         f"does not know")
+            break
+        if regions is None:
+            raise EwfFormatError(f"{name} has no region table whose checksum matches")
+        if len(regions) != 2:
+            raise EwfFormatError(f"{name}'s region table lacks the "
+                                 f"{'BAT' if _VHDX_REGION_BAT not in regions else 'metadata'}"
+                                 f" region")
+        meta_off, meta_len = regions[_VHDX_REGION_METADATA]
+        meta = self._vhdx_read(meta_off, meta_len)
+        if meta[:8] != b"metadata":
+            raise EwfFormatError(f"{name} has no metadata table at offset {meta_off:,}, "
+                                 f"where its region table points")
+        count = struct.unpack_from("<H", meta, 10)[0]
+        if count > 2047:
+            raise EwfFormatError(f"{name}'s metadata table lists {count:,} entries")
+        items = {}
+        for k in range(count):
+            guid, offset, length, flags = struct.unpack_from("<16sIII", meta, 32 + 32 * k)
+            if guid in _VHDX_KNOWN_ITEMS and not flags & 1:
+                if offset + length > meta_len:
+                    raise EwfFormatError(f"{name}'s metadata item "
+                                         f"{uuid.UUID(bytes_le=guid)} runs past the "
+                                         f"metadata region")
+                items[guid] = meta[offset:offset + length]
+            elif flags & 4:
+                raise EwfFormatError(f"{name} holds a metadata item marked required, "
+                                     f"{uuid.UUID(bytes_le=guid)}, which this reader does "
+                                     f"not know")
+        for guid, label, width in ((_VHDX_FILE_PARAMETERS, "file parameters", 8),
+                                   (_VHDX_DISK_SIZE, "virtual disk size", 8),
+                                   (_VHDX_LOGICAL_SECTOR, "logical sector size", 4)):
+            if len(items.get(guid, b"")) < width:
+                raise EwfFormatError(f"{name}'s metadata lacks its {label}")
+        block, flags = struct.unpack_from("<II", items[_VHDX_FILE_PARAMETERS])
+        disk = struct.unpack_from("<Q", items[_VHDX_DISK_SIZE])[0]
+        logical = struct.unpack_from("<I", items[_VHDX_LOGICAL_SECTOR])[0]
+        physical = (struct.unpack_from("<I", items[_VHDX_PHYSICAL_SECTOR])[0]
+                    if len(items.get(_VHDX_PHYSICAL_SECTOR, b"")) >= 4 else None)
+        has_parent = bool(flags & 2)
+        if block < _MIB or block > 256 * _MIB or block & (block - 1):
+            raise EwfFormatError(f"{name} records a block size of {block:,} bytes, not a "
+                                 f"power of two from 1 to 256 MiB")
+        if logical not in (512, 4096):
+            raise EwfFormatError(f"{name} records a logical sector size of {logical:,} "
+                                 f"bytes; 512 and 4,096 are the sizes VHDX allows")
+        if disk % logical:
+            raise EwfFormatError(f"{name} records a disk of {disk:,} bytes, not a whole "
+                                 f"number of its {logical:,}-byte sectors")
+        ratio = (1 << 23) * logical // block
+        payload = -(-disk // block)
+        bitmaps = -(-payload // ratio)
+        entries = bitmaps * (ratio + 1) if has_parent else payload + (payload - 1) // ratio
+        bat_off, bat_len = regions[_VHDX_REGION_BAT]
+        if bat_len < 8 * entries:
+            raise EwfFormatError(f"{name}'s BAT holds {bat_len // 8:,} entries for a disk "
+                                 f"that needs {entries:,}")
+        raw_bat = self._vhdx_read(bat_off, 8 * entries)
+        bat = list(struct.unpack(f"<{entries}Q", raw_bat))
+        states = {}
+        for i in range(payload):
+            state = bat[i + i // ratio] & 7
+            if state in (4, 5) or (state == _VHDX_PARTIALLY_PRESENT and not has_parent):
+                raise EwfFormatError(f"{name} records block {i:,} in state {state}, which "
+                                     f"is not valid for this disk")
+            states[state] = states.get(state, 0) + 1
+            if state in (_VHDX_FULLY_PRESENT, _VHDX_PARTIALLY_PRESENT):
+                at = (bat[i + i // ratio] >> 20) * _MIB
+                want = min(block, disk - i * block)
+                if at < _MIB:
+                    raise EwfFormatError(f"{name} places block {i:,} inside its header "
+                                         f"section")
+                if at + want > size:
+                    raise EwfIncompleteSetError(f"{name} ends inside block {i:,}; the "
+                                                f"file is cut short")
+        self._vhdx_bat = bat
+        disk_id = items.get(_VHDX_DISK_ID, b"")
+        self.vhdx = {
+            "disk_type": ("differencing" if has_parent else
+                          "fixed" if flags & 1 else "dynamic"),
+            "creator": creator, "block_size": block, "logical_sector_size": logical,
+            "physical_sector_size": physical, "disk_size": disk,
+            "disk_id": str(uuid.UUID(bytes_le=disk_id)) if len(disk_id) == 16 else None,
+            "data_write_guid": str(uuid.UUID(bytes_le=data_guid)),
+            "header_sequence": sequence, "log_entries_replayed": replayed,
+            "chunk_ratio": ratio, "blocks": payload,
+            "block_states": {_VHDX_STATE_NAMES[k]: v for k, v in sorted(states.items())},
+            "parent": None}
+        self._vhdx_data_guid = data_guid
+        self._vhdx_bitmaps = OrderedDict()
+        self.compression_level = "none"
+        self.chunk_size = _VIRTUAL_CHUNK
+        if has_parent:
+            self._vhdx_open_parent(name, items.get(_VHDX_PARENT_LOCATOR, b""))
+        self._apple_finish(disk // 512, FORMAT_VHDX)
+        if logical != 512:
+            self.sector_size = logical
+            self.sector_count = disk // logical
+            self.sectors_per_chunk = self.chunk_size // logical
+
+    def _vhdx_open_parent(self, name, locator):
+        """Open the disk a differencing VHDX was made from, by its relative path, then
+        its volume and absolute paths (by file name beside this one when those name
+        another machine's drive); the parent's DataWriteGuid must be one of the
+        parent_linkage values the locator records."""
+        if len(locator) < 20 or locator[:16] != _VHDX_LOCATOR_VHDX:
+            raise EwfFormatError(f"{name} is a differencing disk whose parent locator is "
+                                 f"not the VHDX locator type")
+        pairs = {}
+        count = struct.unpack_from("<H", locator, 18)[0]
+        for k in range(count):
+            ko, vo, kl, vl = struct.unpack_from("<IIHH", locator, 20 + 12 * k)
+            key = locator[ko:ko + kl].decode("utf-16-le", "replace")
+            pairs[key] = locator[vo:vo + vl].decode("utf-16-le", "replace")
+        # An all-zero value (Windows writes parent_linkage2 so) names no parent.
+        linkage = {pairs[k].strip("{}").lower() for k in ("parent_linkage",
+                                                         "parent_linkage2") if k in pairs}
+        linkage.discard(str(uuid.UUID(int=0)))
+        here = os.path.dirname(self.paths[0])
+        candidates = []
+        if "relative_path" in pairs:
+            candidates.append(os.path.join(here, *[part for part in re.split(
+                r"[\\/]", pairs["relative_path"]) if part not in ("", ".")]))
+        for key in ("volume_path", "absolute_win32_path"):
+            if key in pairs:
+                text = pairs[key]
+                if os.name == "nt":
+                    candidates.append(text)
+                candidates.append(os.path.join(here, re.split(r"[\\/]", text)[-1]))
+        self.vhdx["parent"] = {"linkage": sorted(linkage), "locator": dict(pairs),
+                               "file": None}
+        if len(_opening_parents) >= _VIRTUAL_MAX_PARENTS:
+            raise EwfFormatError(f"{name} is more than {_VIRTUAL_MAX_PARENTS} differencing "
+                                 f"disks deep")
+        mine = os.path.realpath(self.paths[0])
+        wrong, seen = [], set()
+        _opening_parents.append(mine)
+        try:
+            for path in candidates:
+                real = os.path.realpath(path)
+                if real in seen or not os.path.isfile(real):
+                    continue
+                seen.add(real)
+                if real in _opening_parents:
+                    raise EwfFormatError(f"{name}'s chain of parent disks loops back to "
+                                         f"{os.path.basename(real)}")
+                if virtual_disk_kind(real) != FORMAT_VHDX:
+                    wrong.append(f"{os.path.basename(real)} is not a VHDX")
+                    continue
+                parent = EwfImage(real)
+                if str(uuid.UUID(bytes_le=parent._vhdx_data_guid)) not in linkage:
+                    wrong.append(f"{os.path.basename(real)} has DataWriteGuid "
+                                 f"{parent.vhdx['data_write_guid']}")
+                    parent.close()
+                    continue
+                if parent.vhdx["logical_sector_size"] != self.vhdx["logical_sector_size"]:
+                    parent.close()
+                    raise EwfFormatError(f"{name} and its parent have different logical "
+                                         f"sector sizes")
+                self.parent = parent
+                self.vhdx["parent"]["file"] = os.path.basename(real)
+                return
+        finally:
+            _opening_parents.pop()
+        wanted = pairs.get("relative_path") or pairs.get("absolute_win32_path") or \
+            pairs.get("volume_path") or "not recorded"
+        if wrong:
+            raise EwfFormatError(f"{name} is a differencing disk whose parent has "
+                                 f"DataWriteGuid {' or '.join(sorted(linkage))} "
+                                 f"({_shown(wanted)}); {'; '.join(wrong)}, so its parent "
+                                 f"is not beside it")
+        raise EwfIncompleteSetError(f"{name} is a differencing disk; its parent, "
+                                    f"{_shown(wanted)}, is not beside it. Put the parent "
+                                    f"disk in the same folder.")
+
+    def _chunk_data_vhdx(self, n):
+        start = n * self.chunk_size
+        want = min(self.chunk_size, self.media_size - start)
+        v = self.vhdx
+        block, ratio = v["block_size"], v["chunk_ratio"]
+        i, within = divmod(start, block)
+        entry = self._vhdx_bat[i + i // ratio]
+        state = entry & 7
+        if state == _VHDX_FULLY_PRESENT or state == _VHDX_PARTIALLY_PRESENT:
+            fh = self._handle(0)
+            fh.seek((entry >> 20) * _MIB + within)
+            data = fh.read(want)
+            data += bytes(want - len(data))
+            if state == _VHDX_FULLY_PRESENT:
+                return data
+            return self._vhdx_merge(start, want, data)
+        if self.parent is not None and state == _VHDX_NOT_PRESENT:
+            return self._parent_read(start, want)
+        return bytes(want)
+
+    def _vhdx_merge(self, start, want, data):
+        """A partially present block's bytes: sectors whose bit in the sector bitmap is
+        set from this file, the rest from the parent. Bit 0 of byte 0 is the first
+        sector (MS-VHDX 2.4)."""
+        logical = self.vhdx["logical_sector_size"]
+        ratio = self.vhdx["chunk_ratio"]
+        per_chunk = 1 << 23
+        out = bytearray(data)
+        count = want // logical
+        first = start // logical
+        s = 0
+        while s < count:
+            sector = first + s
+            chunk, bit = divmod(sector, per_chunk)
+            bitmap = self._vhdx_bitmap(chunk, ratio)
+            present = (bitmap[bit >> 3] >> (bit & 7)) & 1
+            e = s + 1
+            while e < count:
+                c2, b2 = divmod(first + e, per_chunk)
+                if c2 != chunk or ((bitmap[b2 >> 3] >> (b2 & 7)) & 1) != present:
+                    break
+                e += 1
+            if not present:
+                out[s * logical:e * logical] = self._parent_read(start + s * logical,
+                                                                 (e - s) * logical)
+            s = e
+        return bytes(out)
+
+    def _vhdx_bitmap(self, chunk, ratio):
+        cached = self._vhdx_bitmaps.get(chunk)
+        if cached is None:
+            entry = self._vhdx_bat[chunk * (ratio + 1) + ratio]
+            if entry & 7 != _VHDX_SB_PRESENT:
+                raise EwfFormatError(f"{os.path.basename(self.paths[0])} holds a partly "
+                                     f"present block whose sector bitmap is not stored")
+            cached = self._vhdx_read((entry >> 20) * _MIB, _MIB)
+            if len(self._vhdx_bitmaps) >= 8:
+                self._vhdx_bitmaps.popitem(last=False)
+            self._vhdx_bitmaps[chunk] = cached
+        return cached
+
     def _index_sparseimage(self):
         """Read the header chain of a sparse image into a map of stored bands."""
         path = self.paths[0]
@@ -4760,6 +6346,14 @@ class EwfImage:
             return self._keep(n, self._chunk_data_raw(n), want)
         if self.format == FORMAT_AD1:
             return self._keep(n, self._chunk_data_ad1(n), want)
+        if self.format == FORMAT_VHD:
+            return self._keep(n, self._chunk_data_vhd(n), want)
+        if self.format == FORMAT_VHDX:
+            return self._keep(n, self._chunk_data_vhdx(n), want)
+        if self.format == FORMAT_VMDK:
+            return self._keep(n, self._chunk_data_vmdk(n), want)
+        if self.format == FORMAT_QCOW:
+            return self._keep(n, self._chunk_data_qcow(n), want)
 
         segment, start, end, compressed = self._chunk_location(n)
         fh = self._handle(segment)
@@ -4865,6 +6459,8 @@ class EwfImage:
         self._band_handles.clear()
         self._cache.clear()
         self._closed = True
+        if self.parent is not None:
+            self.parent.close()
 
     def __enter__(self):
         return self
@@ -4980,6 +6576,10 @@ class EwfImage:
             "sparsebundle": None if self.sparsebundle is None else dict(self.sparsebundle),
             "encryption": None if self.encryption is None else dict(self.encryption),
             "aff4": None if self.aff4 is None else dict(self.aff4),
+            "vhd": None if self.vhd is None else dict(self.vhd),
+            "vhdx": None if self.vhdx is None else dict(self.vhdx),
+            "vmdk": None if self.vmdk is None else dict(self.vmdk),
+            "qcow": None if self.qcow is None else dict(self.qcow),
             "ad1": None if self.ad1 is None else {
                 key: value for key, value in self.ad1.items()
                 if key not in ("first_item", "footer")},
@@ -4992,7 +6592,9 @@ def open_ewf(path, segments=None, password=None) -> EwfImage:
     container (a striped one from any of its files), an Apple
     .dmg (a segmented one from its .dmg) or .sparseimage, or a sparse bundle from its
     folder, an AD1 set from any of its files, or an AD-encrypted E01, SMART or raw set
-    from its first file (a raw or AD1 set from any of its files). An encrypted Apple disk image or AD-encrypted set opens
+    from its first file (a raw or AD1 set from any of its files), or a VHD, VHDX,
+    VMDK or QCOW virtual disk from its file (a VMDK from its descriptor or any of its
+    extents). An encrypted Apple disk image or AD-encrypted set opens
     with ``password`` (a str, used as UTF-8, or bytes); without one it raises
     EwfPasswordRequiredError, and with one that does not open it
     EwfWrongPasswordError."""
@@ -5130,6 +6732,100 @@ def _cmd_info(args):
                         print(f"  {len(b[key]):,} {text}: {names}{more}")
                 if b["backup_matches"] is False:
                     print("Info.bckup      differs from Info.plist; Info.plist was used")
+            elif d["format"] == FORMAT_VMDK:
+                v = d["vmdk"]
+                print(f"create type     {_shown(v['create_type']) or 'not recorded'}")
+                print(f"descriptor      {_shown(v['descriptor'])}")
+                for ext in v["extents"]:
+                    where = (f" in this file, recorded as {_shown(ext['file'])}"
+                             if ext.get("this_file") else
+                             f" in {_shown(ext['file'])}" if ext["file"] else "")
+                    print(f"extent          {ext['access']} {ext['type']} "
+                          f"{ext['sectors'] * 512:,} bytes{where}")
+                print(f"content id      {v['cid'] or 'not recorded'}")
+                if v["parent"]:
+                    par = v["parent"]
+                    print(f"parent          {_shown(par['file']) if par['file'] else 'not opened'}"
+                          f", content id {par['cid']}"
+                          f"{', named ' + _shown(par['hint']) if par['hint'] else ''}")
+                for key, value in v["ddb"].items():
+                    print(f"ddb.{_shown(key):<22}{_shown(value)}")
+            elif d["format"] == FORMAT_QCOW:
+                q = d["qcow"]
+                print(f"qcow version    {q['version']}")
+                print(f"cluster size    {q['cluster_size']:,} bytes")
+                if q["features"]:
+                    print(f"features        {', '.join(q['features'])}")
+                if q["modified"]:
+                    print(f"modified        {q['modified']}")
+                if q["backing_file"]:
+                    print(f"backing file    {_shown(q['backing_file'])}"
+                          f"{' (' + _shown(q['backing_format']) + ')' if q['backing_format'] else ''}"
+                          f", opened as {_shown(q['backing_opened'])}; qcow records no "
+                          f"identity for it, so only its name ties them")
+                if q["external_data_file"]:
+                    print(f"external data   {_shown(q['external_data_file'])}")
+                for snap in q["snapshots"]:
+                    print(f"snapshot        {_shown(snap['name'])} (id {_shown(snap['id'])}), "
+                          f"taken {snap['taken']}{', with VM state' if snap['vm_state'] else ''}"
+                          f"; not read, the active disk is")
+            elif d["format"] == FORMAT_VHDX:
+                v = d["vhdx"]
+                print(f"disk type       {v['disk_type']}")
+                print(f"block size      {v['block_size']:,} bytes")
+                states = ", ".join(f"{count:,} {state}" for state, count in
+                                   v["block_states"].items())
+                print(f"blocks          {v['blocks']:,}: {states}")
+                if v["physical_sector_size"]:
+                    print(f"physical sector {v['physical_sector_size']:,} bytes")
+                print(f"creator         {_shown(v['creator']) or 'not recorded'}")
+                print(f"disk id         {v['disk_id'] or 'not recorded'}")
+                print(f"data write id   {v['data_write_guid']}")
+                if v["log_entries_replayed"]:
+                    print(f"log             {v['log_entries_replayed']:,} entries replayed "
+                          f"in memory; the file itself is not changed")
+                else:
+                    print("log             empty")
+                if v["parent"]:
+                    par = v["parent"]
+                    print(f"parent disk     {_shown(par['file']) if par['file'] else 'not opened'}"
+                          f", data write id {' or '.join(par['linkage'])}")
+                    for key, value in par["locator"].items():
+                        if key.startswith("parent_linkage"):
+                            continue
+                        print(f"parent locator  {_shown(key)} {_shown(value)}")
+            elif d["format"] == FORMAT_VHD:
+                v = d["vhd"]
+                print(f"disk type       {v['disk_type']}")
+                if v["block_size"]:
+                    print(f"block size      {v['block_size']:,} bytes")
+                    print(f"blocks stored   {v['blocks_stored']:,} of {v['blocks']:,}")
+                c, h, s_ = v["geometry"]
+                print(f"geometry        {c:,} cylinders, {h} heads, {s_} sectors per "
+                      f"track ({c * h * s_ * 512:,} bytes)")
+                print(f"original size   {v['original_size']:,} bytes")
+                print(f"created         {v['created']}")
+                print(f"creator         {_shown(v['creator'])} {v['creator_version']} on "
+                      f"{_shown(v['creator_host'])}")
+                print(f"disk id         {v['unique_id']}")
+                if v["saved_state"]:
+                    print("saved state     set: the virtual machine was saved while "
+                          "running")
+                if v["data_after_disk"]:
+                    print(f"                {v['data_after_disk']:,} bytes between the "
+                          f"disk's data and the footer are not part of the disk")
+                print(f"footer          {v['footer']}")
+                if v["parent"]:
+                    par = v["parent"]
+                    print(f"parent disk     {par['unique_id']}, "
+                          f"{_shown(par['file']) if par['file'] else 'not opened'}")
+                    if par["name"]:
+                        print(f"parent name     {_shown(par['name'])}")
+                    for code, text in par["locators"]:
+                        print(f"parent locator  {code} {_shown(text)}")
+                    if par["timestamp"]:
+                        print(f"parent time     {par['timestamp']}, the parent's "
+                              f"modification time as this disk records it")
             elif d["format"] in (FORMAT_UDRW, FORMAT_RAW):
                 pass                            # the disk itself: no chunks or bands
             elif d["format"] == FORMAT_AFF4:
@@ -5317,7 +7013,8 @@ def main(argv=None):
         prog="ewfprobe",
         description="Read an EnCase/EWF (.E01, .Ex01), SMART (.s01), AFF (.aff, "
                     ".afd) or AFF4 (.aff4) forensic image, an Apple disk image (.dmg, .sparseimage, "
-                    ".sparsebundle), an E01, SMART or raw set FTK Imager encrypted "
+                    ".sparsebundle), a virtual machine disk (.vhd, .vhdx, .vmdk, .qcow2), "
+                    "an E01, SMART or raw set FTK Imager encrypted "
                     "with AD encryption, or logical evidence: EnCase's (.L01) or "
                     "FTK Imager's (.ad1). Read only.")
     ap.add_argument("--version", action="version", version=f"ewfprobe {__version__}")
