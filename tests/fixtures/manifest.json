@@ -473,5 +473,39 @@
         "image": "dmg-enc-sparsebundle-aes256.sparsebundle"
       }
     }
+  },
+  "ad_encrypted": {
+    "writer": "FTK Imager 4.7.3.61",
+    "password": "ewfprobe-ad-test",
+    "source": {
+      "size": 1257984,
+      "md5": "fbc8c24845be0e9f7596b46ef88b27a2",
+      "sha1": "c8fcc8e1eb278de2ae4d0d058867ec561c4b38d3",
+      "sha256": "b824970a22f4c9a99128bba83eff9494b6beac41c1664481891b2fde2cb37a15",
+      "made_by": "tools/make_fixtures.py ad_source()"
+    },
+    "ftk_recorded": {
+      "MD5": "fbc8c24845be0e9f7596b46ef88b27a2",
+      "SHA1": "c8fcc8e1eb278de2ae4d0d058867ec561c4b38d3"
+    },
+    "variants": {
+      "ftk-ad-e01": {
+        "format": "e01",
+        "fragment_mb": 1,
+        "compression": 0,
+        "files": [
+          "ftk-ad-e01.E01",
+          "ftk-ad-e01.E02"
+        ]
+      },
+      "ftk-ad-raw": {
+        "format": "raw",
+        "fragment_mb": 1,
+        "files": [
+          "ftk-ad-raw.001",
+          "ftk-ad-raw.002"
+        ]
+      }
+    }
   }
 }

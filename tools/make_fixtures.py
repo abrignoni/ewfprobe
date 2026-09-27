@@ -36,6 +36,13 @@ dmg-encrypted`` rebuilds them). Each one is attached by hdiutil with that passwo
 and its /dev/rdisk read back before it is kept, so its known answer, the disk's
 SHA-256, is macOS's own reading and not ewfprobe's.
 
+The manifest's ``ad_encrypted`` section describes sets FTK Imager wrote with AD
+encryption, from a small disk of their own that ``ad_source()`` regenerates
+(``--ad-source <file>`` writes it for FTK Imager to image), with the test
+password it records. FTK Imager cannot be driven from here, so the files are made
+by hand and copied in; the known answer is that disk's hashes, which FTK Imager
+also recorded. Both modes keep that section as it is.
+
 The manifest's ``logical`` section describes an L01 EnCase wrote, copied from
 Digital Corpora with known answers taken from libewf's ewfexport. It has its own
 source rather than this tool's, so both modes keep that section as it is.
@@ -549,7 +556,28 @@ SMALL_VARIANTS = [
 ]
 
 
+AD_SECTORS = 2457                   # just over 1 MB, so a 1 MB fragment makes two files
+
+
+def ad_source():
+    """The disk the AD-encrypted fixtures were made from: a SHA-256 counter stream,
+    so nothing in it compresses and it can be rebuilt rather than committed."""
+    out = bytearray()
+    i = 0
+    while len(out) < AD_SECTORS * 512:
+        out += hashlib.sha256(b"ewfprobe AD encryption fixture %d" % i).digest()
+        i += 1
+    return bytes(out[:AD_SECTORS * 512])
+
+
 def main(argv):
+    if "--ad-source" in argv:
+        target = argv[argv.index("--ad-source") + 1]
+        with open(target, "wb") as fh:
+            fh.write(ad_source())
+        print(f"wrote {target}: {AD_SECTORS * 512:,} bytes, "
+              f"sha256 {hashlib.sha256(ad_source()).hexdigest()}")
+        return 0
     args = [a for a in argv[1:] if not a.startswith("--")]
     small = "--small" in argv
     add = "--add" in argv
@@ -589,14 +617,17 @@ def main(argv):
         raw_path = rebuild_source(out, manifest)
         print(f"raw source rebuilt and matches the manifest: {manifest['sha256'][:16]}")
     else:
-        kept = None
+        kept = kept_ad = None
         if os.path.exists(os.path.join(out, "manifest.json")):
             with open(os.path.join(out, "manifest.json"), encoding="utf-8") as fh:
-                kept = json.load(fh).get("logical")
+                previous = json.load(fh)
+            kept, kept_ad = previous.get("logical"), previous.get("ad_encrypted")
         raw_path = os.path.join(out, "source.raw")
         manifest = build_raw(raw_path, size=(3 << 20) if small else (8 << 20))
         if kept:
             manifest["logical"] = kept
+        if kept_ad:
+            manifest["ad_encrypted"] = kept_ad
         print(f"raw source: {manifest['size']:,} bytes, "
               f"{len(manifest['media'])} media items")
         manifest["variants"] = {}

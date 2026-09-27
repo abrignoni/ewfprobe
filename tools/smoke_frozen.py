@@ -18,7 +18,9 @@ entry MD5 as matching. For each encrypted Apple disk image under "encrypted_dmg"
 `verify` and a full `export`, given its password through --password-env, must be
 byte-identical between the two, the export must hash to the disk hdiutil read back from it,
 and a wrong password must be refused the same way by both; so the executable carries the
-cipher package. The executable's --version must name the source's __version__.
+cipher package. The same holds for each set FTK Imager encrypted with AD encryption, under
+"ad_encrypted", whose export must hash to the disk it was made from. The executable's
+--version must name the source's __version__.
 """
 
 from __future__ import annotations
@@ -158,8 +160,34 @@ def main(argv: list[str]) -> int:
                   f"{len(out['exe'][3]):,} byte export identical; the export matches the disk "
                   f"hdiutil read back, and a wrong password is refused by both")
 
+        ad = manifest.get("ad_encrypted", {"variants": {}})
+        for name, variant in sorted(ad["variants"].items()):
+            image = str(fixtures / variant["files"][0])
+            pw = ["--password-env", "EWFPROBE_SMOKE_PASSWORD"]
+            env = dict(os.environ, EWFPROBE_SMOKE_PASSWORD=ad["password"])
+            out = {}
+            for who, cmd in (("py", py), ("exe", exe)):
+                raw = work / f"{name}-{who}.raw"
+                out[who] = (run(cmd + ["info", *pw, image], work, env=env).stdout,
+                            run(cmd + ["verify", "-q", *pw, image], work, env=env).stdout,
+                            run(cmd + ["export", "-q", *pw, image, "-o", str(raw)], work,
+                                env=env).stdout,
+                            raw.read_bytes())
+            assert out["py"] == out["exe"], f"{name}: the executable's output differs"
+            assert hashlib.sha256(out["exe"][3]).hexdigest() == ad["source"]["sha256"], name
+            bad = dict(os.environ, EWFPROBE_SMOKE_PASSWORD=ad["password"] + "x")
+            a = run(py + ["info", *pw, image], work, want=2, env=bad).stderr
+            b = run(exe + ["info", *pw, image], work, want=2, env=bad).stderr
+            assert a.replace(b"\r\n", b"\n") == b.replace(b"\r\n", b"\n"), (a, b)
+            assert b"does not open" in b, b
+            checks += 1
+            print(f"{name}: AD encryption opened with its password, info, verify and a "
+                  f"{len(out['exe'][3]):,} byte export identical; the export matches the disk "
+                  f"FTK Imager imaged, and a wrong password is refused by both")
+
     assert checks == (len(manifest["variants"]) + len(manifest.get("logical", {})) + 2
-                      + len(manifest.get("encrypted_dmg", {}).get("variants", {}))), checks
+                      + len(manifest.get("encrypted_dmg", {}).get("variants", {}))
+                      + len(manifest.get("ad_encrypted", {}).get("variants", {}))), checks
     print(f"{checks} checks: the executable wrote the same bytes as the source")
     return 0
 

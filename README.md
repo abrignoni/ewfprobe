@@ -3,7 +3,8 @@
 A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`, `.afd`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.sparsebundle`), and EnCase logical evidence (`.L01`). One file, pure
 Python, standard library only. No compiler, no network, nothing to install (an
 LZFSE-compressed `.dmg` needs the optional `pyliblzfse` package, and an encrypted Apple
-disk image the optional `pycryptodome` package).
+disk image or an acquisition FTK Imager encrypted with AD encryption the optional
+`pycryptodome` package).
 
 It opens an acquisition, joins its segments, and presents the acquired disk as
 an ordinary seekable file object, so anything that can read a raw image can read
@@ -44,12 +45,14 @@ ewfprobe verify  acquisition.dmg  # also checks the checksums a .dmg records
 ewfprobe files   evidence.L01     # an L01's entries: kind, size, stored MD5, path
 ewfprobe export  evidence.L01 --entry "Folder/photo.jpg" -o photo.jpg
 ewfprobe info    --password-file pw.txt encrypted.dmg
+ewfprobe verify  --password-env CASE_PW evidence.E01   # FTK Imager AD encryption
 ```
 
 `verify` exits non-zero when the recomputed hash does not match the one the
 acquisition recorded.
 
-An encrypted Apple disk image needs its password. `--password-file FILE` reads it
+An encrypted image (an Apple disk image, or an acquisition FTK Imager wrote with AD
+encryption) needs its password. `--password-file FILE` reads it
 from the first line of a file and `--password-env NAME` from an environment
 variable; without either, ewfprobe asks for it at a terminal. It is never taken as
 an argument's value, which would put it in the process list and the shell history.
@@ -192,6 +195,16 @@ alone. It refused the images `hdiutil segment` wrote, with a decompression error
 on a constructed image whose chunks all decompress to the same length it returned the
 wrong chunks' bytes for 24 of its 32 sectors without an error.
 
+Those positions count from the start of the data fork, which the trailer places.
+`hdiutil` writes the fork at the start of the file, where the two are the same.
+Measured with a copy moved 512 bytes into its file: `hdiutil attach` read it with
+the positions left as they were, and called it corrupt with them shifted by 512, so
+ewfprobe adds the fork's offset too (0.5.0 did not, and got both copies wrong). Some
+images also count a byte or two past the end of their property list in the XML
+length the trailer records ([dmgwiz issue 19](https://github.com/citruz/dmgwiz/issues/19));
+`hdiutil attach` read the same image with NUL bytes and with text added there, and so
+does ewfprobe, which reads the property list to its `</plist>`.
+
 A segmented image is opened from its `.dmg`. Measured on images `hdiutil segment`
 wrote: every segment ends in its own trailer, which records one identifier shared by
 the whole set, the number of segments, the segment's own number, and where its data
@@ -239,6 +252,24 @@ password set in NFC. What decrypts is a UDIF image, a sparse image, or the disk.
 the Mac they were measured on, 512 MiB images read at about 100 MiB/s (UDRW) and
 140 MiB/s (UDZO).
 
+Reads acquisitions FTK Imager encrypted with AD encryption: E01, SMART and raw (dd)
+sets, which are the formats FTK Imager 4.7.3.61 offers it for (for AFF it offers AFF's
+own encryption, which is not read). Every file of the set is encrypted, and only the
+first carries the header, so a set is opened from its first file, and a raw set from
+any of its numbered files. What an E01 or SMART set decrypts to is read as it would
+be unencrypted, stored hashes included; a raw set decrypts to the disk itself, in
+numbered files, and is reported as format `RAW`. The layout (a 512-byte header, AES
+in CTR mode with the file's index shifted left 64 bits as the IV and the counter
+little endian) follows the EWF documentation's "AD encryption" section, credited
+below. Measured on sets FTK Imager wrote, where that section says nothing: the key
+made from the password is PBKDF2-HMAC-SHA1 of the header's hash (SHA-512 on every set
+seen) of the password's UTF-8 bytes, over the header's salt and iteration count
+(4,000); the header's HMAC of the encrypted file key, under that hash, checks the
+password; and the file key is decrypted from the header with AES-CTR from counter 0.
+`is_adcrypt()` tells whether a file begins with the header and `adcrypt_set()` lists
+the files of the set a path belongs to. An AD1 (FTK's logical image) is recognised
+inside and refused, as is an image protected by a certificate rather than a password.
+
 A sparse image longer than about a gigabyte of written bands carries more than one
 header. Measured on images `hdiutil` wrote, beyond what the format documentation
 covers: the first header holds 1,008 band slots, and once they are used it names a
@@ -252,7 +283,8 @@ disk images ewfprobe reads (EWF, EWF2, AFF, an AFD directory, UDIF, sparse image
 sparse bundle folders), `is_logical_evidence()` for an L01, `is_ewf()` for EWF alone,
 and `apple_image_kind()` names an Apple disk image as `UDIF`, `SPARSEIMAGE`,
 `SPARSEBUNDLE` or `ENCRYPTED` (any encrypted one, which `is_image()` leaves out
-because it opens only with its password).
+because it opens only with its password). `is_image()` leaves out an AD-encrypted
+acquisition for the same reason; `is_adcrypt()` and `adcrypt_set()` answer for it.
 
 Refused with a message naming the reason rather than read wrongly:
 
@@ -422,6 +454,21 @@ an image opened with a certificate or a keybag, the version 1 container and dama
 files are tested on files the test suite writes from the published layout, with the
 cipher library's own CBC mode rather than ewfprobe's.
 
+**AD encryption, against FTK Imager.** FTK Imager 4.7.3.61 wrote an E01 (no
+compression), a SMART and a raw set, each AD-encrypted with a test password in 1 MB
+fragments, from a 1,257,984-byte disk of SHA-256 output that
+`tools/make_fixtures.py` regenerates. All three decrypt to that disk, the E01 and
+SMART sets match the MD5 and SHA-1 stored in them, and both files of every set read.
+The E01 and raw sets are committed (the SMART set reads through the same code as the
+E01). An E01 FTK Imager 4.7.3.81 wrote, from the test images of
+[fox-it/dissect.evidence](https://github.com/fox-it/dissect.evidence) at `b2d1ac2`,
+read as data, matched the hashes stored in it, and the 13 files of an encrypted AD1
+from the same place each decrypted to the AD1 segment signature under its own
+counter; those files are AGPL and are not committed. Other ciphers and hashes, a
+later numbered file, damaged headers, an AD1 inside, and the wrapped EWF, SMART and
+Ex01 fixtures are tested on sets the test suite writes, with the cipher library's CTR
+mode rather than ewfprobe's.
+
 **Segmented images and sparse bundles, against `hdiutil attach`.** 36 images `hdiutil`
 wrote from HFS+ and APFS test disks read byte for byte the same as the same image
 attached read-only and read from its raw device: each of UDZO, UDBZ, ULMO, ULFO, UDCO
@@ -521,8 +568,8 @@ and 7-Zip, which reads the same offset as `StartPackPos`
 ([`DmgHandler.cpp`, line 658 at `0766b73`](https://github.com/ip7z/7zip/blob/0766b733fe3e06dd2a7f9a3cfbf2108ac73abd17/CPP/7zip/Archive/DmgHandler.cpp#L658))
 and adds it at
 [line 1909](https://github.com/ip7z/7zip/blob/0766b733fe3e06dd2a7f9a3cfbf2108ac73abd17/CPP/7zip/Archive/DmgHandler.cpp#L1909).
-7-Zip also adds the trailer's data fork offset; every image measured had 0 there, so
-that difference is not exercised. No code from either is copied.
+7-Zip also adds the trailer's data fork offset, and `hdiutil attach` does too, measured
+on an image moved into its file as described above. No code from either is copied.
 ADC follows Joachim Metz, *ADC compressed data format*, in
 [libyal/libfmos](https://github.com/libyal/libfmos) at commit
 [`3396edf`](https://github.com/libyal/libfmos/blob/3396edfc19d172795971c00a2e848d8146cf7523/documentation/ADC%20compressed%20data%20format.asciidoc).
@@ -541,6 +588,11 @@ also give the version 1 signature), and kev365/xways-imageio-dmg, `encrypted_sou
 ([lines 30 to 98](https://github.com/kev365/xways-imageio-dmg/blob/406e738d1a43dfcb9d8f421d33a31d43078fb4b5/encrypted_source.cpp#L30-L98)
 at `406e738`), both MIT. No code from either is copied. What current macOS writes
 differently was measured, as described above.
+
+For FTK Imager's AD encryption: the "AD encryption" section of the EWF documentation
+above ([lines 3376 to 3465 at `d76fd0b`](https://github.com/libyal/libewf/blob/d76fd0bb21601e2969bc88ffdaeb861023f6a5b2/documentation/Expert%20Witness%20Compression%20Format%20(EWF).asciidoc?plain=1#L3376-L3465)),
+which it takes from AccessData's white paper. What that section leaves open was
+measured on sets FTK Imager wrote, as described above.
 
 ## License
 
