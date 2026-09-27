@@ -1,6 +1,6 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`, `.Ex01`) and SMART (`.s01`) forensic images. One file, pure
+A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`) forensic images. One file, pure
 Python, standard library only. No compiler, no network, nothing to install.
 
 It opens an acquisition, joins its segments, and presents the acquired disk as
@@ -60,6 +60,19 @@ eight-byte pattern, and the MD5 and SHA-1 the acquisition recorded. Case and dri
 details are reported under the specification's own names; the two times it keeps,
 target time and actual time, are shown as stored, seconds since 1970 in UTC.
 
+Reads AFF, the Advanced Forensic Format that AFFLIB and FTK Imager write: pages
+stored deflated, LZMA-compressed, as a run of zeros or as they are, and the MD5,
+SHA-1 and SHA-256 the file recorded. Case details AFF shares with EWF (case
+number, examiner, notes, acquisition date) are reported under the same names;
+every other text segment keeps the name AFFLIB stores it under. A page that is
+missing from the file is read the way AFFLIB reads it, filled with the file's own
+bad-sector marker, and `info` and `verify` count it. FTK Imager's AFF stores no
+hash of the disk (FTK Imager keeps its hashes in its text log), so `verify` has
+nothing to compare against on one.
+
+`open_image()` is the same function as `open_ewf()`, and `is_image()` is true for
+every signature ewfprobe reads, where `is_ewf()` stays true for EWF alone.
+
 Refused with a message naming the reason rather than read wrongly:
 
 - **Encrypted Ex01.** EnCase can encrypt an Ex01, and the encryption is not
@@ -67,6 +80,11 @@ Refused with a message naming the reason rather than read wrongly:
 - **Ex01 compressed with bzip2.** The format allows it, EnCase does not appear to
   offer it, and no sample exists to check a reader against.
 - **Logical evidence** (`.L01`, `.Lx01`). These hold files, not a disk image.
+- **Encrypted AFF**, and **AFF pages compressed with bzip2**, which AFFLIB itself
+  never implemented.
+- **An AFF file with no image size.** AFF records the size when the acquisition
+  finishes, so its absence means the file may be incomplete.
+- **AFD and AFM**, the forms of AFF split across several files.
 
 It never writes.
 
@@ -119,6 +137,15 @@ libewf was also checked by hand. No Ex01 written by EnCase itself has been
 available, so Ex01 support rests on the EWF2 documentation and on libewf's writer
 until one is.
 
+AFF is covered by three fixtures written by `affconvert` from AFFLIB 3.7.22, with
+a 64 KiB page so that zero pages, deflated pages, LZMA pages and stored pages all
+occur, and one written by FTK Imager 4.7.3.61. FTK Imager's AFF names AFFLIB
+3.7.18 as its writer, so it is a second AFFLIB version rather than an independent
+implementation. Every one reproduces the source, and the three from `affconvert`
+match the MD5 and SHA-1 they recorded. A writer in the test suite covers the
+cases the fixtures cannot: a missing page, encrypted segments, a truncated file,
+the older `seg` page names, and an image size above 4 GiB.
+
 **Against real evidence.** Physical acquisitions written by FTK Imager, from
 28.6 GiB to 238 GiB, including 15-segment sets. Decoded ranges are byte
 identical to `ewfexport`'s output for the same ranges, including ranges that
@@ -164,9 +191,9 @@ and the manifest records which version wrote each variant:
 EWFACQUIRE=/path/to/ewfacquire python tools/make_fixtures.py tests/fixtures --add smart-fast smart-split
 ```
 
-That tool shells out to `ewfacquire` and is for development only. libewf is used
-there solely to produce test data. Nothing from it ships and `ewfprobe` imports
-nothing.
+That tool shells out to `ewfacquire` and `affconvert` and is for development only.
+libewf and AFFLIB are used there solely to produce test data. Nothing from them
+ships and `ewfprobe` imports nothing.
 
 ## Format reference
 
@@ -175,6 +202,11 @@ Compression Format 2 (EWF2)*, in the
 [libyal/libewf](https://github.com/libyal/libewf) repository under
 `documentation/`. The format is publicly documented, which is what makes an
 independent implementation possible.
+
+For AFF: AFFLIB's own documentation (`doc/affdoc.doc`) and the segment names and
+flag values in its public header, `include/afflib/afflib.h`, in the
+[sshock/AFFLIBv3](https://github.com/sshock/AFFLIBv3) repository. No AFFLIB code
+is copied.
 
 ## License
 

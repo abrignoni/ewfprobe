@@ -3,12 +3,12 @@
     python tools/smoke_frozen.py <source folder> <executable> [<executable args> ...]
 
 <source folder> is a checkout holding ewfprobe.py and tests/fixtures (the build workflow
-checks out the tag being released there). The fixtures were written by libewf's
-ewfacquire or FTK Imager, not by ewfprobe. For each one (EnCase 5 and 6, SMART and Ex01,
-single files and multi-segment sets) `info`, `verify` and a full `export` are run once
-through `python ewfprobe.py` and once
-through the executable. Their output must be byte-identical, verify must report the stored
-hashes as matching, and the export must hash to the source disk the manifest records. A
+checks out the tag being released there). The fixtures were written by libewf's ewfacquire,
+affconvert or FTK Imager, not by ewfprobe. For each one (EnCase 5 and 6, SMART, Ex01 and
+AFF, single files and multi-segment sets) `info`, `verify` and a full `export` are run once
+through `python ewfprobe.py` and once through the executable. Their output must be
+byte-identical, verify must report the stored hashes as matching (or, for an image that
+stores none, say so), and the export must hash to the source disk the manifest records. A
 byte range exported to stdout must equal the manifest's media item at that offset, and a
 split set with a segment missing must be refused the same way by both. The executable's
 --version must name the source's __version__.
@@ -61,7 +61,10 @@ def main(argv: list[str]) -> int:
                             raw.read_bytes())
             assert out["py"] == out["exe"], f"{name}: the executable's output differs from the source's"
             verify = out["exe"][1].decode()
-            assert verify.count("matches the stored hash") >= 1 and "does not match" not in verify.lower(), verify
+            if variant.get("stores_no_hash"):
+                assert "recorded no hash" in verify and "does not match" not in verify.lower(), verify
+            else:
+                assert verify.count("matches the stored hash") >= 1 and "does not match" not in verify.lower(), verify
             assert hashlib.sha256(out["exe"][3]).hexdigest() == manifest["sha256"], f"{name}: export hash"
             checks += 1
             print(f"{name}: info, verify and a {len(out['exe'][3]):,} byte export identical; "

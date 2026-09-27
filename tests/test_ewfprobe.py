@@ -713,3 +713,222 @@ def test_ex01_extension_sequence_and_detection(tmp_path):
     assert ewfprobe._family("Ex01") == "Ex" and ewfprobe._family("EXA") == "E"
     path = write_ex01(str(tmp_path), "img", ex01_sample(n_chunks=2))[0]
     assert ewfprobe.is_ewf(path) is True
+
+
+# ---------------------------------------------------------- AFF, spec-written
+
+def _aff_segment(out, name, data=b"", arg=0):
+    raw = name.encode("utf-8")
+    out.write(struct.pack(">4sIII", b"AFF\x00", len(raw), len(data), arg) + raw + data)
+    out.write(struct.pack(">4sI", b"ATT\x00", 16 + len(raw) + len(data) + 8))
+
+
+def _aff_quad(value):
+    return struct.pack(">II", value & 0xFFFFFFFF, value >> 32)
+
+
+AFF_BADFLAG = b"BAD SECTOR\x00" + bytes(range(256)) * 2
+AFF_BADFLAG = AFF_BADFLAG[:512]
+
+
+def write_aff(path, data, *, page_size=1024, kinds=None, drop=(), badflag=AFF_BADFLAG,
+              image_size=None, record_image_size=True, prefix="page", sector_text=False,
+              extra=(), hashes=True):
+    """Write ``data`` as an AFF file from AFFLIB's documented layout.
+
+    ``kinds`` gives each page's form: "z" deflate, "l" LZMA, "0" zero page, "r"
+    stored, "b" bzip2. Pages listed in ``drop`` are left out of the file.
+    """
+    import lzma
+    pages = [data[i:i + page_size] for i in range(0, len(data), page_size)]
+    with open(path, "wb") as out:
+        out.write(b"AFF10\r\n\x00")
+        if badflag:
+            _aff_segment(out, "badflag", badflag)
+        _aff_segment(out, "badsectors", _aff_quad(0), 2)
+        _aff_segment(out, "case_num", b"CASE-3")
+        _aff_segment(out, "acquisition_tecnician", b"Examiner")
+        _aff_segment(out, "image_gid", bytes(range(16)))
+        _aff_segment(out, "not_text", b"\xff\xfe\x00\x01")
+        if sector_text:
+            _aff_segment(out, "sectorsize", b"512")
+        else:
+            _aff_segment(out, "sectorsize", b"", 512)
+        _aff_segment(out, "segsize" if prefix == "seg" else "pagesize", b"", page_size)
+        for name, value, arg in extra:
+            _aff_segment(out, name, value, arg)
+        for n, page in enumerate(pages):
+            if n in drop:
+                continue
+            kind = kinds[n] if kinds else ("0" if not any(page) else "z")
+            if kind == "z":
+                body, arg = zlib.compress(page, 6), 0x01
+            elif kind == "l":
+                body, arg = lzma.compress(page, format=lzma.FORMAT_ALONE), 0x21
+            elif kind == "0":
+                assert not any(page)
+                body, arg = struct.pack(">I", len(page)), 0x33
+            elif kind == "b":
+                body, arg = b"BZh9" + page, 0x11
+            else:
+                body, arg = page, 0x00
+            _aff_segment(out, f"{prefix}{n}", body, arg)
+        if record_image_size:
+            _aff_segment(out, "imagesize", _aff_quad(image_size or len(data)), 2)
+        if hashes:
+            _aff_segment(out, "md5", hashlib.md5(data).digest())
+            _aff_segment(out, "sha1", hashlib.sha1(data).digest())
+            _aff_segment(out, "sha256", hashlib.sha256(data).digest())
+    return str(path)
+
+
+def aff_sample(n_pages=5, page_size=1024):
+    rnd = random.Random(31)
+    out = bytearray()
+    for i in range(n_pages):
+        if i % 3 == 1:
+            out += bytes(page_size)
+        else:
+            out += bytes([65 + i]) * (page_size // 2) + bytes(
+                rnd.randrange(256) for _ in range(page_size // 2))
+    return bytes(out)
+
+
+def test_aff_every_page_form_reads(tmp_path):
+    data = aff_sample(4) + b"tail"
+    path = write_aff(tmp_path / "img.aff", data, kinds=["z", "0", "l", "r", "r"])
+    with ewfprobe.open_ewf(path) as img:
+        assert img.format == ewfprobe.FORMAT_AFF
+        assert sorted(arg for _o, _l, arg in img._aff_pages.values()) == [
+            0x00, 0x00, 0x01, 0x21, 0x33]
+        assert img.media_size == len(data)
+        assert img.read() == data
+        result = img.verify()
+    assert set(result["stored"]) == {"MD5", "SHA1", "SHA256"}
+    assert result["computed"] == result["stored"]
+    assert result["match"] is True and result["missing_page_count"] == 0
+
+
+def test_aff_metadata_and_geometry(tmp_path):
+    path = write_aff(tmp_path / "img.aff", aff_sample(2), sector_text=True,
+                     extra=[("acquisition_seconds", b"", 42)])
+    with ewfprobe.open_image(path) as img:
+        assert (img.sector_size, img.chunk_size, img.sectors_per_chunk) == (512, 1024, 2)
+        meta = img.metadata
+        assert img.bad_sectors == 0
+    assert meta["case_number"] == "CASE-3" and meta["examiner"] == "Examiner"
+    assert meta["image_gid"] == bytes(range(16)).hex()
+    assert meta["acquisition_seconds"] == "42"
+    assert "not_text" not in meta and "badflag" not in meta and "sectorsize" not in meta
+
+
+def test_aff_legacy_segment_names_read(tmp_path):
+    data = aff_sample(3)
+    path = write_aff(tmp_path / "img.aff", data, prefix="seg")
+    with ewfprobe.open_ewf(path) as img:
+        assert img.read() == data
+
+
+def test_aff_image_size_above_four_gib_is_read_whole(tmp_path):
+    """The 64-bit value is two big-endian 32-bit words, low first (AFFLIB's
+    struct aff_quad). Swapping them makes this size 512 << 32 or 1 << 32 wrong."""
+    page = 1 << 24
+    size = (1 << 32) + 512
+    path = write_aff(tmp_path / "big.aff", bytes(page), page_size=page, kinds=["0"],
+                     image_size=size, hashes=False)
+    with ewfprobe.open_ewf(path) as img:
+        assert img.media_size == size
+        assert img.missing_page_ranges == [(1, img.chunk_count - 1)]
+
+
+def test_aff_missing_page_reads_as_the_bad_sector_marker(tmp_path):
+    data = aff_sample(4)
+    path = write_aff(tmp_path / "img.aff", data, drop=(2,))
+    with ewfprobe.open_ewf(path) as img:
+        assert img.missing_page_ranges == [(2, 2)] and img.missing_page_count == 1
+        got = img.read()
+        result = img.verify()
+    assert got[:2048] == data[:2048] and got[3072:] == data[3072:]
+    assert got[2048:3072] == (AFF_BADFLAG * 2)[:1024]
+    assert result["missing_page_count"] == 1 and result["match"] is False
+
+
+def test_aff_missing_page_without_a_marker_is_refused_on_read(tmp_path):
+    path = write_aff(tmp_path / "img.aff", aff_sample(3), drop=(1,), badflag=b"")
+    with ewfprobe.open_ewf(path) as img:
+        img.read(1024)
+        with pytest.raises(ewfprobe.EwfFormatError, match="no bad-sector marker"):
+            img.read(1024)
+
+
+@pytest.mark.parametrize("name", ["page0/aes256", "affkey_aes256"])
+def test_encrypted_aff_is_refused(tmp_path, name):
+    path = write_aff(tmp_path / "img.aff", aff_sample(2), extra=[(name, b"\x00" * 32, 0)])
+    with pytest.raises(ewfprobe.EwfFormatError, match="encrypted"):
+        ewfprobe.open_ewf(path)
+
+
+def test_aff_without_an_image_size_is_refused(tmp_path):
+    path = write_aff(tmp_path / "img.aff", aff_sample(2), record_image_size=False)
+    with pytest.raises(ewfprobe.EwfIncompleteSetError, match="image size"):
+        ewfprobe.open_ewf(path)
+
+
+def test_a_truncated_aff_is_refused(tmp_path):
+    path = write_aff(tmp_path / "img.aff", aff_sample(3))
+    raw = open(path, "rb").read()
+    open(path, "wb").write(raw[:len(raw) - 30])
+    with pytest.raises(ewfprobe.EwfIncompleteSetError, match="truncated"):
+        ewfprobe.open_ewf(path)
+
+
+def test_an_aff_segment_with_a_wrong_tail_is_refused(tmp_path):
+    path = write_aff(tmp_path / "img.aff", aff_sample(2))
+    raw = bytearray(open(path, "rb").read())
+    at = raw.find(b"ATT\x00")
+    raw[at + 7] ^= 0x01
+    open(path, "wb").write(bytes(raw))
+    with pytest.raises(ewfprobe.EwfFormatError, match="matching tail"):
+        ewfprobe.open_ewf(path)
+
+
+def test_a_bzip2_aff_page_is_refused(tmp_path):
+    path = write_aff(tmp_path / "img.aff", aff_sample(2), kinds=["z", "b"])
+    with ewfprobe.open_ewf(path) as img:
+        img.read(1024)
+        with pytest.raises(ewfprobe.EwfFormatError, match="compression algorithm"):
+            img.read(1024)
+
+
+def test_aff_detection_and_the_afd_form(tmp_path):
+    path = write_aff(tmp_path / "img.aff", aff_sample(1))
+    assert ewfprobe.is_image(path) is True and ewfprobe.is_ewf(path) is False
+    afd = tmp_path / "set.afd"
+    afd.mkdir()
+    with pytest.raises(ewfprobe.EwfFormatError, match="AFD"):
+        ewfprobe.open_ewf(str(afd))
+
+
+def test_the_chunk_cache_is_bounded_in_bytes(tmp_path):
+    """An AFF page is 16 MiB by default; 64 of them would hold a gigabyte."""
+    page = 1 << 24
+    path = write_aff(tmp_path / "big.aff", bytes(4 * page), page_size=page,
+                     kinds=["0"] * 4, hashes=False)
+    with ewfprobe.open_ewf(path) as img:
+        for n in range(4):
+            img.seek(n * page)
+            img.read(1)
+        assert len(img._cache) <= 2
+
+
+def test_a_damaged_aff_image_size_does_not_make_the_reader_count_to_it(tmp_path):
+    """The image size comes from the file. One that claims far more pages than the
+    file holds must be opened in time proportional to the pages present."""
+    import time
+    path = write_aff(tmp_path / "img.aff", aff_sample(3), image_size=1 << 60,
+                     hashes=False)
+    started = time.monotonic()
+    with ewfprobe.open_ewf(path) as img:
+        assert img.missing_page_ranges == [(3, (1 << 60) // 1024 - 1)]
+        assert img.missing_page_count == (1 << 60) // 1024 - 3
+    assert time.monotonic() - started < 5

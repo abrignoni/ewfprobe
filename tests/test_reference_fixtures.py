@@ -71,9 +71,13 @@ def test_every_variant_reproduces_the_source_exactly(name, variant):
 def test_every_variant_matches_its_own_stored_hash(name, variant):
     with ewfprobe.open_ewf(_first(variant)) as img:
         result = img.verify()
+    assert result["checksum_errors"] == [], name
+    if variant.get("stores_no_hash"):
+        # FTK Imager's AFF keeps its hashes in its text log, not in the image.
+        assert result["stored"] == {} and result["match"] is None, name
+        return
     assert result["stored"], f"{name} recorded no hash"
     assert result["match"] is True, name
-    assert result["checksum_errors"] == [], name
 
 
 @pytest.mark.parametrize("name,variant", _variants())
@@ -203,3 +207,22 @@ def test_libewf_ex01_fixtures_read_as_ex01():
                 for k in range(len(table.entries) // 16):
                     seen.add(ewfprobe._TABLE_V2_ENTRY.unpack_from(table.entries, 16 * k)[2])
     assert {0x01, 0x02, 0x05} <= seen, seen
+
+
+def test_aff_fixtures_cover_every_page_form_and_read_as_aff():
+    """affconvert (AFFLIB 3.7.22) with 64 KiB pages writes zero pages, deflated
+    pages, LZMA pages and stored pages; FTK Imager's AFF is one 16 MiB page."""
+    variants = dict(_variants())
+    forms = set()
+    for name in ("aff-zlib", "aff-lzma", "aff-none", "ftk-aff"):
+        assert name in variants, f"the {name} fixture is missing"
+        with ewfprobe.open_ewf(_first(variants[name])) as img:
+            assert img.format == ewfprobe.FORMAT_AFF, name
+            assert img.missing_page_count == 0, name
+            forms |= {arg for _off, _len, arg in img._aff_pages.values()}
+    assert {0x00, 0x01, 0x21, 0x33} <= forms, sorted(forms)
+    with ewfprobe.open_ewf(_first(variants["ftk-aff"])) as img:
+        assert img.metadata["case_number"] == "FIXTURE"
+        assert img.metadata["examiner"] == "ewfprobe"
+        assert img.sector_size == 512          # FTK Imager stores it as text
+        assert img.chunk_size == 16 << 20

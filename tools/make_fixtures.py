@@ -49,6 +49,17 @@ import subprocess
 import sys
 
 EWFACQUIRE = os.environ.get("EWFACQUIRE", "ewfacquire")
+AFFCONVERT = os.environ.get("AFFCONVERT", "affconvert")
+
+# AFF variants, written by affconvert from AFFLIB. A 64 KiB page (the default is
+# 16 MiB) gives the 3 MiB source 48 pages, so zero pages, deflated pages, LZMA
+# pages and stored pages all occur.
+AFF_VARIANTS = [
+    # name,        affconvert options
+    ("aff-zlib",   ["-s64k"]),
+    ("aff-lzma",   ["-L", "-s64k"]),
+    ("aff-none",   ["-x", "-s64k"]),
+]
 
 # Acquisition variants. Between them these cover the older table layout with no
 # base offset, the current one, several compression settings including none at
@@ -186,8 +197,23 @@ def acquire(raw_path, out_dir, name, fmt, compression, sectors_per_chunk, segmen
     return made
 
 
-def writer_version():
-    out = subprocess.run([EWFACQUIRE, "-V"], capture_output=True, text=True,
+def acquire_aff(raw_path, out_dir, name, options):
+    """One AFF variant. affconvert records its command line in the image, so it runs
+    in the output folder with relative names, keeping local paths out of the fixture."""
+    target = name + ".aff"
+    stale = os.path.join(out_dir, target)
+    if os.path.exists(stale):
+        os.remove(stale)
+    result = subprocess.run(
+        [AFFCONVERT, "-q", *options, "-o", target, os.path.basename(raw_path)],
+        cwd=out_dir, capture_output=True, text=True, check=False)
+    if result.returncode != 0 or not os.path.exists(stale):
+        raise SystemExit(f"affconvert failed for {name}:\n{result.stdout}\n{result.stderr}")
+    return [target]
+
+
+def writer_version(tool=None):
+    out = subprocess.run([tool or EWFACQUIRE, "-V"], capture_output=True, text=True,
                          check=False).stdout
     return out.strip().splitlines()[0] if out.strip() else "unknown"
 
@@ -234,18 +260,24 @@ def main(argv):
         return 2
     out = os.path.abspath(args[0])
     os.makedirs(out, exist_ok=True)
-    if not shutil.which(EWFACQUIRE):
+    aff_known = dict(AFF_VARIANTS)
+    ewf_wanted = not add or any(a not in aff_known for a in args[1:])
+    aff_wanted = not add or any(a in aff_known for a in args[1:])
+    if ewf_wanted and not shutil.which(EWFACQUIRE):
         raise SystemExit(f"{EWFACQUIRE} not found; install libewf (test tool only)")
-    writer = writer_version()
+    if aff_wanted and not shutil.which(AFFCONVERT):
+        raise SystemExit(f"{AFFCONVERT} not found; install AFFLIB (test tool only)")
+    writer = writer_version() if ewf_wanted else None
 
     if add:
         with open(os.path.join(out, "manifest.json"), encoding="utf-8") as fh:
             manifest = json.load(fh)
         known = {v[0]: v for v in VARIANTS + SMALL_VARIANTS}
-        unknown = [a for a in args[1:] if a not in known]
+        unknown = [a for a in args[1:] if a not in known and a not in aff_known]
         if unknown:
             raise SystemExit(f"unknown variant(s): {', '.join(unknown)}")
-        chosen = [known[a] for a in args[1:]]
+        chosen = [known[a] for a in args[1:] if a in known]
+        chosen_aff = [(a, aff_known[a]) for a in args[1:] if a in aff_known]
         raw_path = rebuild_source(out, manifest)
         print(f"raw source rebuilt and matches the manifest: {manifest['sha256'][:16]}")
     else:
@@ -255,6 +287,7 @@ def main(argv):
               f"{len(manifest['media'])} media items")
         manifest["variants"] = {}
         chosen = SMALL_VARIANTS if small else VARIANTS
+        chosen_aff = list(AFF_VARIANTS)
 
     for name, fmt, comp, spc, seg in chosen:
         made = acquire(raw_path, out, name, fmt, comp, spc, seg)
@@ -265,6 +298,16 @@ def main(argv):
         total = sum(os.path.getsize(os.path.join(out, f)) for f in made)
         print(f"  {name:<20} {fmt:<9} {comp:<5} b={spc:<4} "
               f"{len(made)} file(s) {total:>10,} bytes")
+
+    aff_writer = ("affconvert " + writer_version(AFFCONVERT).split()[-1]
+                  if chosen_aff else None)
+    for name, options in chosen_aff:
+        made = acquire_aff(raw_path, out, name, options)
+        manifest["variants"][name] = {
+            "format": "aff", "options": options, "files": made, "writer": aff_writer,
+        }
+        size = os.path.getsize(os.path.join(out, made[0]))
+        print(f"  {name:<20} aff       {' '.join(options):<14} {size:>10,} bytes")
 
     if add:
         os.remove(raw_path)
