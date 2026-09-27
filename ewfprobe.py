@@ -58,7 +58,7 @@ disks Windows, VMware's tools and qemu-img wrote; no code from any of them is co
 
 Scope. This reads EWF-E01, the format EnCase 6 and 7 and FTK Imager write and
 by far the most common one in the field, EWF-S01, the variant ASR Data's SMART
-writes, EWF2-Ex01, which EnCase 7 and later write, AFF, including AFD, and
+writes, EWF2-Ex01, which EnCase 7 and later write, AFF, including AFD and AFM, and
 EWF-L01 logical evidence, FTK Imager's AD1 (version 4), and UDIF, sparse image and
 sparse bundle Apple disk images, encrypted with a password or not, AD-encrypted E01,
 SMART, raw and AD1 sets, AFF4 containers, standard and pre-standard, striped or
@@ -67,8 +67,8 @@ than version 4, an AD-encrypted image protected by a certificate, an Apple disk
 image unlocked by a certificate or a keybag rather than a password, or one in the
 older version 1 encrypted format (cdsaencr), an encrypted QCOW, a VMDK SESPARSE
 extent, a VHD split into .v01 files, encrypted Ex01 images (the encryption
-is not publicly documented), Ex01 images compressed with bzip2 (no sample exists to
-validate against), or AFM (AFF metadata beside split raw files), and it never writes.
+is not publicly documented), or Ex01 images compressed with bzip2 (no sample exists to
+validate against), and it never writes.
 An encrypted AFF opens with its passphrase or with the private key of a certificate
 it is sealed to.
 
@@ -243,6 +243,14 @@ _AFF_MAX_SMALL = 1 << 16                         # non-page segments read into m
 # segment from the first file that holds it, and names the files it writes
 # file_000.aff, file_001.aff and on, numbered by how many it already has.
 FORMAT_AFD = "AFD"
+# AFM: an AFF file holding only the metadata (its aff_file_type is "AFM") beside the
+# disk kept as plain raw files, named after it with the extension it records
+# (raw_image_file_extension, "000" by default) and counted up the way split raw files
+# are: 000 to 999, then A00 to ZZZ in base 36 (lib/vnode_afm.cpp and
+# split_raw_increment_fname in lib/vnode_split_raw.cpp). AFFLIB joins the files while
+# the next one exists, every one but the last the size of the first, and requires the
+# total to be the image size the metadata records.
+FORMAT_AFM = "AFM"
 # AFF4: see the AFF4 section above EwfImage.
 FORMAT_AFF4 = "AFF4"
 _AFD_MEMBER_NAME = re.compile(r"file_(\d+)\.aff", re.IGNORECASE)
@@ -1241,6 +1249,25 @@ def _private_key(given):
     except (ValueError, IndexError, TypeError) as exc:
         raise EwfFormatError(f"the private key could not be read as an RSA key ({exc}); "
                              f"give it unencrypted, as PEM or DER") from None
+
+
+def _afm_next_extension(ext):
+    """The extension after ``ext`` in AFFLIB's split raw naming, else None."""
+    if len(ext) != 3:
+        return None
+    if ext.isascii() and ext.isdigit():
+        return "A00" if ext == "999" else f"{int(ext) + 1:03d}"
+    lower = ext[0].islower()
+    chars = list(ext.upper())
+    for i in (2, 1, 0):
+        c = chars[i]
+        if c == "Z":
+            chars[i] = "0"                      # and carry
+            continue
+        chars[i] = "A" if c == "9" else chr(ord(c) + 1)
+        out = "".join(chars)
+        return out.lower() if lower else out
+    return None
 
 
 def _afd_directory(path):
@@ -3638,6 +3665,70 @@ class EwfImage:
             offset = tail + _AF_SEGTAIL.size
         return pages, small, sealed, end
 
+    def _index_afm(self, label, small, page_size, image_size):
+        """Find an AFM's raw files and check them against its metadata; its pages
+        are read from them, never from the metadata file."""
+        ext = small.get("raw_image_file_extension", (0, b""))[1].rstrip(b"\x00")
+        try:
+            ext = ext.decode("ascii")
+        except UnicodeDecodeError:
+            ext = ""
+        if len(ext) != 3 or not ext.isalnum():
+            raise EwfFormatError(f"{label} is an AFM whose raw file extension is "
+                                 f"{ext!r}, not three letters or digits")
+        stem, dot, own = self.paths[0].rpartition(".")
+        if not dot or len(own) != 3:
+            raise EwfFormatError(f"{label} is an AFM, and AFFLIB finds its raw files only "
+                                 f"from a name ending in a three-letter extension (.afm)")
+        raw = [f"{stem}.{ext}"]
+        if not os.path.isfile(raw[0]):
+            raise EwfIncompleteSetError(f"{label} is an AFM, and its disk is kept in "
+                                        f"{os.path.basename(raw[0])} and the files after "
+                                        f"it, which is not beside it")
+        while True:
+            nxt = _afm_next_extension(raw[-1][-3:])
+            if nxt is None or not os.path.isfile(f"{stem}.{nxt}"):
+                break
+            raw.append(f"{stem}.{nxt}")
+        sizes = [os.path.getsize(p) for p in raw]
+        if len(raw) > 1 and any(size != sizes[0] for size in sizes[1:-1]):
+            raise EwfFormatError(f"{label}: its raw files are not all the size of the "
+                                 f"first but the last, which AFFLIB requires")
+        per_file = _af_quad(small.get("pages_per_raw_image_file")) or 0
+        if len(raw) > 1 and per_file and sizes[0] != per_file * page_size:
+            raise EwfFormatError(
+                f"{label}: its raw files are {sizes[0]:,} bytes each, and it records "
+                f"{per_file:,} pages of {page_size:,} bytes per file")
+        if sum(sizes) != image_size:
+            error = EwfIncompleteSetError if sum(sizes) < image_size else EwfFormatError
+            raise error(f"{label} records an image of {image_size:,} bytes, and its raw "
+                        f"files ({os.path.basename(raw[0])} .. "
+                        f"{os.path.basename(raw[-1])}) hold {sum(sizes):,}")
+        self.format = FORMAT_AFM
+        self.paths = [self.paths[0]] + raw
+        self.sizes = self.sizes[:1] + sizes
+        self._aff_pages = {}
+        self._afm_starts = [0]
+        for size in sizes[:-1]:
+            self._afm_starts.append(self._afm_starts[-1] + size)
+
+    def _chunk_data_afm(self, n):
+        start = n * self.chunk_size
+        want = min(self.chunk_size, self.media_size - start)
+        out = []
+        i = bisect.bisect_right(self._afm_starts, start) - 1
+        at = start
+        while want > 0:
+            fh = self._handle(i + 1)
+            fh.seek(at - self._afm_starts[i])
+            piece = _read_exactly(fh, min(want, self.sizes[i + 1]
+                                          - (at - self._afm_starts[i])))
+            out.append(piece)
+            at += len(piece)
+            want -= len(piece)
+            i += 1
+        return b"".join(out)
+
     def _aff_unlock(self, label, keys):
         """The file key of an encrypted AFF, from the passphrase or the private key
         given, and what opened it recorded in ``encryption``."""
@@ -3756,6 +3847,8 @@ class EwfImage:
                 f"{label} records no image size, which AFFLIB writes{where} when an "
                 f"acquisition finishes; reading it would report missing data as empty")
         image_size = max(image_sizes)
+        if small.get("aff_file_type", (0, b""))[1] == b"AFM" and self.format == FORMAT_AFF:
+            self._index_afm(label, small, page_size, image_size)
         sector_arg = _af_number(small.get("sectorsize", (0, b"")))
         self._aff_badflag = small.get("badflag", (0, b""))[1]
         self.bad_sectors = _af_quad(small.get("badsectors"))
@@ -3789,6 +3882,9 @@ class EwfImage:
         self.compression_level = None
         needed = self._needed_chunks()
         self.chunk_count = needed
+        if self.format == FORMAT_AFM:           # every page is in the raw files
+            self._indexed_chunks = needed
+            return
         self._indexed_chunks = sum(1 for n in self._aff_pages if n < needed)
         # Built from the pages present, never by counting up to the image size: the
         # size is read from the file, and a damaged one can claim petabytes.
@@ -6526,6 +6622,8 @@ class EwfImage:
         if self.format in (FORMAT_AFF, FORMAT_AFD):
             data = self._chunk_data_aff(n)
             return self._keep(n, data, want)
+        if self.format == FORMAT_AFM:
+            return self._keep(n, self._chunk_data_afm(n), want)
         if self.format == FORMAT_UDIF:
             return self._keep(n, self._chunk_data_udif(n), want)
         if self.format == FORMAT_SPARSEIMAGE:
@@ -6783,7 +6881,8 @@ class EwfImage:
 
 def open_ewf(path, segments=None, password=None, private_key=None) -> EwfImage:
     """Open an acquisition ewfprobe reads: an EWF, EWF2 or L01 set from any path in
-    it, an AFF file, an AFD directory from the directory or any file in it, an AFF4
+    it, an AFF file, an AFM from its .afm with its raw files beside it, an AFD
+    directory from the directory or any file in it, an AFF4
     container (a striped one from any of its files), an Apple
     .dmg (a segmented one from its .dmg) or .sparseimage, or a sparse bundle from its
     folder, an AD1 set from any of its files, or an AD-encrypted E01, SMART or raw set

@@ -150,6 +150,10 @@ AFF_VARIANTS = [
     # each file, so the pages spread across them and the image size and hashes land
     # in the last one.
     ("aff-afd",    ["-s64k", "-M32k"]),
+    # Written as an AFM (see acquire_aff): the metadata in an .afm beside the disk as
+    # raw files, one file, or split at -M into .000, .001 and on.
+    ("aff-afm",       ["--afm", "-s64k"]),
+    ("aff-afm-split", ["--afm", "-s64k", "-M1m"]),
 ]
 
 # Encrypted AFF variants, by AFFLIB, from the same source: (name, affconvert options,
@@ -307,9 +311,16 @@ def acquire_aff(raw_path, out_dir, name, options, env=None):
     its command line in the image, so it runs in the output folder with relative
     names, keeping local paths out of the fixture. A variant with a file size cap
     (-M) is written to a name ending .afd, which makes affconvert write an AFD
-    directory, and its files are the .aff files inside it."""
-    afd = any(o.startswith("-M") for o in options)
-    target = name + (".afd" if afd else ".aff")
+    directory, and its files are the .aff files inside it. An --afm variant is
+    written to a name ending .afm, which makes affconvert write an AFM: that file,
+    and the disk as raw files beside it (.000, then .001 and on at the -M cap)."""
+    afm = "--afm" in options
+    options = [o for o in options if o != "--afm"]
+    afd = not afm and any(o.startswith("-M") for o in options)
+    target = name + (".afm" if afm else ".afd" if afd else ".aff")
+    for stale_raw in os.listdir(out_dir) if afm else []:
+        if stale_raw.startswith(name + ".") and stale_raw[len(name) + 1:].isdigit():
+            os.remove(os.path.join(out_dir, stale_raw))
     stale = os.path.join(out_dir, target)
     if os.path.isdir(stale):
         shutil.rmtree(stale)
@@ -320,8 +331,14 @@ def acquire_aff(raw_path, out_dir, name, options, env=None):
         cwd=out_dir, capture_output=True, text=True, check=False, env=env)
     if result.returncode != 0 or not os.path.exists(stale):
         raise SystemExit(f"affconvert failed for {name}:\n{result.stdout}\n{result.stderr}")
-    files = ([f"{target}/{f}" for f in sorted(os.listdir(stale)) if f.lower().endswith(".aff")]
-             if afd else [target])
+    if afm:
+        files = [target] + sorted(f for f in os.listdir(out_dir)
+                                  if f.startswith(name + ".") and f[len(name) + 1:].isdigit())
+    elif afd:
+        files = [f"{target}/{f}" for f in sorted(os.listdir(stale))
+                 if f.lower().endswith(".aff")]
+    else:
+        files = [target]
     for f in files:
         os.chmod(os.path.join(out_dir, f), 0o644)   # affconvert creates them 0777
     return target, files
@@ -768,12 +785,15 @@ def main(argv):
     for name, options in chosen_aff:
         image, made = acquire_aff(raw_path, out, name, options)
         manifest["variants"][name] = {
-            "format": "aff", "options": options, "files": made, "writer": aff_writer,
+            "format": "afm" if "--afm" in options else "aff",
+            "options": [o for o in options if o != "--afm"], "files": made,
+            "writer": aff_writer,
         }
         if image != made[0]:
             manifest["variants"][name]["image"] = image
         size = sum(os.path.getsize(os.path.join(out, f)) for f in made)
-        print(f"  {name:<20} aff       {' '.join(options):<14} {size:>10,} bytes")
+        print(f"  {name:<20} {manifest['variants'][name]['format']:<9} "
+              f"{' '.join(options):<14} {size:>10,} bytes")
 
     dmg_writer = hdiutil_version() if chosen_dmg else None
     for name, fmt in chosen_dmg:

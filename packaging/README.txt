@@ -12,7 +12,7 @@ ewfprobe, built as a standalone executable
                           ewfprobe --help
                       On Windows write ewfprobe.exe; on macOS and Linux write
                       ./ewfprobe from this folder. It reads .E01, .s01, .Ex01,
-                      .aff, .afd and .aff4 disk images, Apple .dmg,
+                      .aff, .afd, .afm and .aff4 disk images, Apple .dmg,
                       .sparseimage and .sparsebundle disk images, the
                       virtual machine disks .vhd, .vhdx, .vmdk, .qcow and
                       .qcow2 (a differencing disk, delta or overlay with its parent

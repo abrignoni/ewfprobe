@@ -318,6 +318,31 @@
       "writer": "hdiutil, macOS 26.6.2",
       "stores_no_hash": true,
       "hdiutil_segment_size": "40k"
+    },
+    "aff-afm": {
+      "format": "afm",
+      "options": [
+        "-s64k"
+      ],
+      "files": [
+        "aff-afm.afm",
+        "aff-afm.000"
+      ],
+      "writer": "affconvert 3.7.22"
+    },
+    "aff-afm-split": {
+      "format": "afm",
+      "options": [
+        "-s64k",
+        "-M1m"
+      ],
+      "files": [
+        "aff-afm-split.afm",
+        "aff-afm-split.000",
+        "aff-afm-split.001",
+        "aff-afm-split.002"
+      ],
+      "writer": "affconvert 3.7.22"
     }
   },
   "logical": {
