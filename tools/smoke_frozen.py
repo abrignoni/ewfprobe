@@ -229,6 +229,30 @@ def main(argv: list[str]) -> int:
                   f"verify and a {len(out['exe'][3]):,} byte export identical; the export "
                   f"matches the source, and without it both refuse the image")
 
+        certified = manifest.get("certificate_dmg", {"variants": {}})
+        for name, variant in sorted(certified["variants"].items()):
+            image = str(fixtures / variant.get("image", variant["files"][0]))
+            key = str(fixtures / certified["keys"][str(variant["key_bits"])]["key"])
+            out = {}
+            for who, cmd in (("py", py), ("exe", exe)):
+                raw = work / f"{name}-{who}.raw"
+                out[who] = (run(cmd + ["info", "--private-key", key, image], work).stdout,
+                            run(cmd + ["verify", "-q", "--private-key", key, image],
+                                work).stdout,
+                            run(cmd + ["export", "-q", "--private-key", key, image, "-o",
+                                       str(raw)], work).stdout,
+                            raw.read_bytes())
+            assert out["py"] == out["exe"], f"{name}: the executable's output differs"
+            disk = certified["disks"][variant["disk"]]
+            assert hashlib.sha256(out["exe"][3]).hexdigest() == disk["sha256"], name
+            a = run(py + ["info", image], work, want=2).stderr
+            b = run(exe + ["info", image], work, want=2).stderr
+            assert a.replace(b"\r\n", b"\n") == b.replace(b"\r\n", b"\n"), (a, b)
+            checks += 1
+            print(f"{name}: opened with its certificate's private key, info, verify and a "
+                  f"{len(out['exe'][3]):,} byte export identical; the export matches the "
+                  f"disk, and without the key both refuse the image")
+
         ad = manifest.get("ad_encrypted", {"variants": {}})
         for name, variant in sorted(ad["variants"].items()):
             image = str(fixtures / variant["files"][0])
@@ -329,6 +353,7 @@ def main(argv: list[str]) -> int:
                       + len(manifest.get("encrypted_dmg", {}).get("variants", {}))
                       + len(manifest.get("ad_encrypted", {}).get("variants", {}))
                       + len(manifest.get("encrypted_aff", {}).get("variants", {}))
+                      + len(manifest.get("certificate_dmg", {}).get("variants", {}))
                       + len(AFF4_KNOWN) + len(AD1_KNOWN) + 1 + len(VIRTUAL_KNOWN)), checks
     print(f"{checks} checks: the executable wrote the same bytes as the source")
     return 0

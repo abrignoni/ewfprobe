@@ -823,3 +823,111 @@ def test_a_page_that_runs_across_two_raw_files_is_joined(tmp_path):
     with ewfprobe.open_ewf(str(afm)) as img:
         assert len(img.paths) == 5
         assert _media_sha(img) == _manifest()["sha256"]
+
+
+# -- encrypted Apple disk images sealed to a certificate -----------------------------
+
+def _certificate_dmgs():
+    section = _manifest().get("certificate_dmg", {"variants": {}})
+    missing = (ewfprobe._AES is None or ewfprobe._RSA is None) and not _CRYPTO_REQUIRED  # pylint: disable=protected-access
+    marks = ([pytest.mark.skip(reason="an encrypted image needs the optional pycryptodome "
+                                      "package")] if missing else [])
+    return [pytest.param(name, v, marks=marks, id=name)
+            for name, v in sorted(section["variants"].items())]
+
+
+def test_the_certificate_images_are_all_there():
+    section = _manifest().get("certificate_dmg")
+    assert section, "the certificate images are missing from the manifest"
+    variants = section["variants"].values()
+    assert {v["hdiutil_format"] for v in variants} == {"UDZO", "UDSP", "UDSB"}
+    assert {v["key_bits"] for v in variants} == {2048, 4096}
+    assert {v["password"] is None for v in variants} == {True, False}
+
+
+@pytest.mark.parametrize("name,variant", _certificate_dmgs())
+def test_a_certificate_image_reads_as_its_disk_with_its_key_and_its_password(name, variant):
+    """hdiutil sealed each to a test certificate with -certificate, some with a password
+    as well. Opened with the certificate's private key, and with the password where
+    there is one, each must read as the disk it was made from; nlitsme's
+    readencrcdsa.py, run by hand, decrypted the 2048-bit UDZO ones to images hdiutil
+    read as the same disk."""
+    section = _manifest()["certificate_dmg"]
+    disk = section["disks"][variant["disk"]]
+    key = os.path.join(FIXTURES, section["keys"][str(variant["key_bits"])]["key"])
+    opens = [{"private_key": key}] + ([{"password": variant["password"]}]
+                                      if variant["password"] else [])
+    for given in opens:
+        with ewfprobe.open_ewf(_first(variant), **given) as img:
+            assert img.media_size == disk["size"], name
+            assert _media_sha(img) == disk["sha256"], (name, list(given))
+            if "private_key" in given:
+                assert img.encryption["opened_with"] == "private key of its certificate"
+                assert img.encryption["key_wrap"] == "RSA PKCS#1 v1.5"
+            else:
+                assert img.encryption["kdf"] == "PBKDF2-HMAC-SHA1"
+
+
+@pytest.mark.parametrize("name,variant", _certificate_dmgs())
+def test_a_certificate_image_without_its_key_or_with_another_is_refused(name, variant):
+    section = _manifest()["certificate_dmg"]
+    with pytest.raises(ewfprobe.EwfPasswordRequiredError) as caught:
+        ewfprobe.open_ewf(_first(variant))
+    assert caught.value.needs == ("password" if variant["password"] else "private key")
+    other_bits = 4096 if variant["key_bits"] == 2048 else 2048
+    other = os.path.join(FIXTURES, section["keys"][str(other_bits)]["key"])
+    with pytest.raises(ewfprobe.EwfWrongPasswordError, match="opens none"):
+        ewfprobe.open_ewf(_first(variant), private_key=other)
+    if variant["password"] is None:
+        # a password asks for the key, not for another password
+        with pytest.raises(ewfprobe.EwfPasswordRequiredError) as caught:
+            ewfprobe.open_ewf(_first(variant), password="any")
+        assert caught.value.needs == "private key"
+
+
+@pytest.mark.skipif((ewfprobe._AES is None or ewfprobe._RSA is None)  # pylint: disable=protected-access
+                    and not _CRYPTO_REQUIRED,
+                    reason="an encrypted image needs the optional pycryptodome package")
+def test_the_key_is_matched_to_its_item_by_the_public_key_hash(tmp_path):
+    """The item names its key by the SHA-1 of the RSA public key in PKCS#1 form; a key
+    whose hash is not that one is not tried, and the item's own hash is what makes it
+    found."""
+    section = _manifest()["certificate_dmg"]
+    variant = section["variants"]["dmg-cert-only-udzo-aes256"]
+    key = os.path.join(FIXTURES, section["keys"]["2048"]["key"])
+    data = bytearray(open(_first(variant), "rb").read())
+    count = struct.unpack_from(">I", data, 0x48)[0]
+    (_kind, offset, _size), = [struct.unpack_from(">IQQ", data, 0x4C + 20 * i)
+                               for i in range(count)]
+    rsa = ewfprobe._private_key(key)            # pylint: disable=protected-access
+    assert data[offset + 4:offset + 24] == ewfprobe._rsa_public_key_id(rsa)  # pylint: disable=protected-access
+    data[offset + 10] ^= 0xFF                    # the item now names another key
+    path = tmp_path / "renamed.dmg"
+    path.write_bytes(bytes(data))
+    with pytest.raises(ewfprobe.EwfWrongPasswordError, match="opens none"):
+        ewfprobe.open_ewf(str(path), private_key=key)
+
+
+@pytest.mark.skipif((ewfprobe._AES is None or ewfprobe._RSA is None)  # pylint: disable=protected-access
+                    and not _CRYPTO_REQUIRED,
+                    reason="an encrypted image needs the optional pycryptodome package")
+def test_a_certificate_item_whose_keys_lack_their_mark_is_not_used(tmp_path):
+    """The unwrapped keys end "CKIE\\0", as a password item's do; an item re-wrapped
+    with the same keys and another mark is refused rather than used."""
+    section = _manifest()["certificate_dmg"]
+    variant = section["variants"]["dmg-cert-only-udzo-aes256"]
+    key = os.path.join(FIXTURES, section["keys"]["2048"]["key"])
+    rsa = ewfprobe._private_key(key)            # pylint: disable=protected-access
+    data = bytearray(open(_first(variant), "rb").read())
+    (_kind, offset, _size), = [struct.unpack_from(">IQQ", data, 0x4C)]
+    wrapped_at = offset + ewfprobe._ENCRCDSA_CERT.size  # pylint: disable=protected-access
+    length = struct.unpack_from(">I", data, offset + 0x30)[0]
+    keys = ewfprobe._PKCS1.new(rsa).decrypt(bytes(data[wrapped_at:wrapped_at + length]),  # pylint: disable=protected-access
+                                            None)
+    assert keys.endswith(b"CKIE\x00")
+    rewrapped = ewfprobe._PKCS1.new(rsa.publickey()).encrypt(keys[:-5] + b"XKIE\x00")  # pylint: disable=protected-access
+    data[wrapped_at:wrapped_at + length] = rewrapped
+    path = tmp_path / "rewrapped.dmg"
+    path.write_bytes(bytes(data))
+    with pytest.raises(ewfprobe.EwfWrongPasswordError, match="opens none"):
+        ewfprobe.open_ewf(str(path), private_key=key)

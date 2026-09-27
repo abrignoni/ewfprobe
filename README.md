@@ -376,6 +376,16 @@ and `EwfFormatError`. The password is used while the image is opened and not kep
 the keys it unwraps stay in memory while the image is open, since every read needs
 them. `info` names the cipher, how the keys are wrapped and the PBKDF2 rounds.
 
+An image `hdiutil` sealed to a certificate (`-certificate`), with a password as well or
+without one, opens with that certificate's RSA private key (`--private-key FILE`, or
+`open_ewf(path, private_key=...)` with a path or the key's PEM or DER bytes; given
+unencrypted). The certificate's key item names the key by the SHA-1 of its RSA public
+key and holds the same AES and HMAC keys a password item does, wrapped with RSA
+PKCS#1 v1.5; on the images measured the key unwrapped from it and the key the
+password unwrapped were the same. Without either, `EwfPasswordRequiredError.needs`
+says whether the image asks for a password or a private key. An image opened by a
+keybag is refused.
+
 The container (`encrcdsa`, version 2) is read from the layout two published readers
 describe, credited below: a header at the start of the file, key items, and the data
 in 512-byte blocks, each decrypted with AES-CBC under an IV made from the block's
@@ -407,7 +417,7 @@ seen) of the password's UTF-8 bytes, over the header's salt and iteration count
 password; and the file key is decrypted from the header with AES-CTR from counter 0.
 `is_adcrypt()` tells whether a file begins with the header and `adcrypt_set()` lists
 the files of the set a path belongs to. An AD1 inside reads as described below, and
-an image protected by a certificate rather than a password is refused.
+an AD-encrypted image protected by a certificate rather than a password is refused.
 
 A sparse image longer than about a gigabyte of written bands carries more than one
 header. Measured on images `hdiutil` wrote, beyond what the format documentation
@@ -520,10 +530,10 @@ Refused with a message naming the reason rather than read wrongly:
   AFF4 map whose ranges overlap**, which none of the eleven maps measured has. AFF4 written by
   pyaff4 or Rekall before the standard has not been available to test; its Snappy
   name, which marks every chunk compressed, is read as pyaff4 reads it.
-- **An encrypted Apple disk image opened with a certificate or a keybag** rather than
-  a password, and **one in the older version 1 format** (`cdsaencr`, with its header at
-  the end of the file), which is recognised in order to be refused. No sample of either
-  has been available. So is **a header that asks for more than 50 million PBKDF2
+- **An encrypted Apple disk image opened with a keybag** rather than a password or a
+  certificate (nlitsme's reader leaves its layout undecoded too), and **one in the
+  older version 1 format** (`cdsaencr`, with its header at the end of the file), which
+  is recognised in order to be refused. No sample of either has been available. So is **a header that asks for more than 50 million PBKDF2
   rounds**; the images measured used 344,827 to 588,235.
 - **An older `.dmg` whose block tables are only in a resource fork**, **a sparse image
   of a version other than 3**, and **a sparse bundle of a backing-store version other
@@ -740,8 +750,17 @@ committed encrypted fixtures are each kept by `tools/make_fixtures.py` only afte
 `hdiutil attach` gives back the disk they were made from. One uses a password outside
 ASCII. In the sparse bundle, after `hdiutil` wrote it, its all-zero first band file was
 removed and its second cut after its data, which `hdiutil` reads as zeros as it does
-for the bands it never writes; `hdiutil attach` read the same disk. The 3DES key wrap,
-an image opened with a certificate or a keybag, the version 1 container and damaged
+for the bands it never writes; `hdiutil attach` read the same disk. Four more were
+sealed by `hdiutil` to test certificates (2048 and 4096-bit RSA keys; a UDZO with a
+password as well, a UDZO and a sparse bundle with no password, and a sparse image
+with a password): each reads as its disk with the certificate's private key and, where
+it has one, with its password. `hdiutil` is not run on them once made, because
+converting one with its password opened a password dialog on screen instead of
+reading the password given to it; nlitsme's `readencrcdsa.py`, run by hand, decrypted
+the two 2048-bit UDZOs to images `hdiutil` read as the same disk (it reads a
+fixed 256-byte wrapped key, so not the 4096-bit one). Nine deliberate breaks of the
+certificate code are each caught by the tests. The 3DES key wrap, an image
+opened with a keybag, a key item naming another key, the version 1 container and damaged
 files are tested on files the test suite writes from the published layout, with the
 cipher library's own CBC mode rather than ewfprobe's.
 
@@ -955,7 +974,9 @@ For encrypted Apple disk images: the `encrcdsa` layout and its key unwrapping in
 nlitsme/encrypteddmg, `readencrcdsa.py` (`PassphraseWrappedKey` and `EncrCdsaFile`,
 [lines 125 to 198](https://github.com/nlitsme/encrypteddmg/blob/626dac30710140ac488ea199cd14b5c450f2760b/readencrcdsa.py#L125-L198)
 and [283 to 417](https://github.com/nlitsme/encrypteddmg/blob/626dac30710140ac488ea199cd14b5c450f2760b/readencrcdsa.py#L283-L417)
-at `626dac3`, where
+at `626dac3`, and its certificate item, `CertificateWrappedKey`,
+[lines 200 to 252](https://github.com/nlitsme/encrypteddmg/blob/626dac30710140ac488ea199cd14b5c450f2760b/readencrcdsa.py#L200-L252),
+where
 [lines 465 to 472](https://github.com/nlitsme/encrypteddmg/blob/626dac30710140ac488ea199cd14b5c450f2760b/readencrcdsa.py#L465-L472)
 also give the version 1 signature), and kev365/xways-imageio-dmg, `encrypted_source.cpp`
 ([lines 30 to 98](https://github.com/kev365/xways-imageio-dmg/blob/406e738d1a43dfcb9d8f421d33a31d43078fb4b5/encrypted_source.cpp#L30-L98)

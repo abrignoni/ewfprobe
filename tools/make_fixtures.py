@@ -46,6 +46,13 @@ passphrase or key and must give the source; the ones encrypted in place are kept
 because AFFLIB 3.7.22 cannot open them (affcrypto -e writes its first segment over
 the file's header), and the manifest records that AFFLIB refused each.
 
+The manifest's ``certificate_dmg`` section describes encrypted images hdiutil
+sealed to a test certificate (``--add dmg-certificate`` rebuilds them), with a
+password as well or without one, and the RSA keys and certificates, made once with
+openssl and kept beside the fixtures. hdiutil is not run on them once made (see
+build_certificate_dmgs); ewfprobe must read each as its disk with the key and with
+the password.
+
 The manifest's ``ad_encrypted`` section describes sets FTK Imager wrote with AD
 encryption, from a small disk of their own that ``ad_source()`` regenerates
 (``--ad-source <file>`` writes it for FTK Imager to image), with the test
@@ -136,6 +143,16 @@ ENC_DMG_VARIANTS = [
     ("dmg-enc-udzo-non-ascii",      "UDZO",        "AES-128", ENC_PASSWORD_NON_ASCII,
      "small"),
     ("dmg-enc-sparsebundle-aes256", "UDSB",        "AES-256", ENC_PASSWORD, "banded"),
+]
+
+# Encrypted images hdiutil sealed to a test certificate with -certificate, with a
+# password as well or without one: name, format, encryption, password, RSA key bits,
+# disk. The keys are made once with openssl and kept beside the fixtures.
+CERT_DMG_VARIANTS = [
+    ("dmg-cert-udzo-aes128",              "UDZO", "AES-128", ENC_PASSWORD, 2048, "small"),
+    ("dmg-cert-only-udzo-aes256",         "UDZO", "AES-256", None,         2048, "small"),
+    ("dmg-cert4096-sparse-aes256",        "UDSP", "AES-256", ENC_PASSWORD, 4096, "small"),
+    ("dmg-cert-only-sparsebundle-aes128", "UDSB", "AES-128", None,         2048, "banded"),
 ]
 
 # AFF variants, written by affconvert from AFFLIB. A 64 KiB page (the default is
@@ -571,6 +588,103 @@ def _trim_encrypted_bundle(bundle):
         fh.truncate(32 << 10)
 
 
+def _cert_dmg_key(out_dir, bits):
+    """The test key and certificate for ``bits``, made once with openssl: (the PEM
+    key's name, the DER certificate's path)."""
+    key, cert = f"dmg-cert-test-key-{bits}.pem", f"dmg-cert-test-cert-{bits}.cer"
+    if not (os.path.exists(os.path.join(out_dir, key))
+            and os.path.exists(os.path.join(out_dir, cert))):
+        pem = os.path.join(out_dir, f"dmg-cert-test-cert-{bits}.pem")
+        for step in (["openssl", "req", "-x509", "-newkey", f"rsa:{bits}", "-nodes",
+                      "-keyout", os.path.join(out_dir, key), "-out", pem, "-days",
+                      "36500", "-subj", f"/CN=ewfprobe DMG test {bits}"],
+                     ["openssl", "x509", "-in", pem, "-outform", "DER", "-out",
+                      os.path.join(out_dir, cert)]):
+            result = subprocess.run(step, capture_output=True, text=True, check=False)
+            if result.returncode:
+                raise SystemExit(f"openssl could not make the test key:\n{result.stderr}")
+        os.remove(pem)
+        os.chmod(os.path.join(out_dir, key), 0o644)   # a test key, published
+    return key, os.path.join(out_dir, cert)
+
+
+def build_certificate_dmgs(out_dir):
+    """The images sealed to a test certificate, as the manifest section. hdiutil is
+    not run on them once they are made: converting one with its password opened a
+    password dialog on screen rather than reading the one piped to it, so each is
+    checked by ewfprobe opening it with its key and, where it has one, its password,
+    which must both give the disk. nlitsme's readencrcdsa.py was also run by hand on
+    the 2048-bit ones (README, validation)."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import ewfprobe                     # pylint: disable=import-outside-toplevel
+    work = os.path.join(out_dir, "cert-work")
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    disks = _encrypted_disks()
+    section = {"writer": hdiutil_version(), "disks": {}, "keys": {}, "variants": {}}
+    try:
+        for label, disk in disks.items():
+            with open(os.path.join(work, label + ".img"), "wb") as fh:
+                fh.write(disk)
+            section["disks"][label] = {"sha256": hashlib.sha256(disk).hexdigest(),
+                                       "size": len(disk)}
+        for name, fmt, cipher, password, bits, label in CERT_DMG_VARIANTS:
+            key, cert = _cert_dmg_key(out_dir, bits)
+            section["keys"][str(bits)] = {"key": key, "certificate": os.path.basename(cert)}
+            target = name + _DMG_SUFFIX.get(fmt, ".dmg")
+            stale = os.path.join(out_dir, target)
+            if os.path.isdir(stale):
+                shutil.rmtree(stale)
+            elif os.path.exists(stale):
+                os.remove(stale)
+            options = {"UDSB": ["-imagekey", "sparse-band-size=2048"],
+                       "UDSP": ["-imagekey", "sparse-band-size=128"]}.get(fmt, [])
+            options += ["-stdinpass"] if password is not None else []
+            result = subprocess.run(
+                [HDIUTIL, "convert", "-quiet", os.path.join(work, label + ".img"),
+                 "-format", fmt, *options, "-encryption", cipher, "-certificate", cert,
+                 "-o", stale], input=password if password is not None else "",
+                capture_output=True, text=True, timeout=300, check=False)
+            if result.returncode:
+                raise SystemExit(f"hdiutil failed for {name}:\n{result.stdout}"
+                                 f"{result.stderr}")
+            entry = {"format": {"UDSP": "sparseimage", "UDSB": "sparsebundle"}.get(
+                         fmt, "udif"),
+                     "hdiutil_format": fmt, "encryption": cipher, "password": password,
+                     "key_bits": bits, "disk": label}
+            if fmt == "UDSB":
+                _trim_encrypted_bundle(stale)
+                entry["trimmed"] = ("band file 0 (all zeros) removed and band file 1 "
+                                    "cut to 32 KiB after writing")
+                made = sorted(os.path.relpath(os.path.join(d, f), out_dir)
+                              for d, _dirs, files in os.walk(stale) for f in files)
+            else:
+                made = [target]
+            for f in made:
+                os.chmod(os.path.join(out_dir, f), 0o644)
+            opens = [{"private_key": os.path.join(out_dir, key)}]
+            if password is not None:
+                opens.append({"password": password})
+            for given in opens:
+                with ewfprobe.open_ewf(stale, **given) as img:
+                    img.seek(0)
+                    if (hashlib.sha256(img.read()).hexdigest()
+                            != section["disks"][label]["sha256"]):
+                        raise SystemExit(f"{name}: opened with its {list(given)[0]}, it "
+                                         f"does not read as its disk")
+            entry["checked_by"] = ("ewfprobe with the key" +
+                                   (" and with the password" if password else ""))
+            entry["files"] = [f.replace(os.sep, "/") for f in made]
+            if target != made[0]:
+                entry["image"] = target
+            section["variants"][name] = entry
+            size = sum(os.path.getsize(os.path.join(out_dir, f)) for f in made)
+            print(f"  {name:<36} {fmt:<5} {cipher} RSA-{bits} {size:>9,} bytes")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return section
+
+
 def build_encrypted_dmgs(out_dir):
     """The encrypted images and their disks, as the manifest section."""
     work = os.path.join(out_dir, "enc-work")
@@ -724,12 +838,14 @@ def main(argv):
     gpt_wanted = not add or "dmg-gpt" in args[1:]
     enc_wanted = not add or "dmg-encrypted" in args[1:]
     enc_aff_wanted = not add or "aff-encrypted" in args[1:]
-    args = ([a for a in args if a not in ("dmg-gpt", "dmg-encrypted", "aff-encrypted")]
+    cert_wanted = not add or "dmg-certificate" in args[1:]
+    args = ([a for a in args if a not in ("dmg-gpt", "dmg-encrypted", "aff-encrypted",
+                                          "dmg-certificate")]
             if add else args)
     ewf_wanted = not add or any(a not in aff_known and a not in dmg_known for a in args[1:])
     aff_wanted = not add or any(a in aff_known for a in args[1:])
     dmg_wanted = not add or any(a in dmg_known for a in args[1:])
-    if (dmg_wanted or gpt_wanted or enc_wanted) and not shutil.which(HDIUTIL):
+    if (dmg_wanted or gpt_wanted or enc_wanted or cert_wanted) and not shutil.which(HDIUTIL):
         raise SystemExit(f"{HDIUTIL} not found; the Apple disk image variants are written "
                          f"on macOS (test tool only)")
     if ewf_wanted and not shutil.which(EWFACQUIRE):
@@ -822,6 +938,11 @@ def main(argv):
     if enc_aff_wanted:
         manifest["encrypted_aff"] = build_encrypted_affs(out, raw_path, manifest["sha256"])
         print(f"  {len(manifest['encrypted_aff']['variants'])} encrypted AFF images")
+
+    if cert_wanted:
+        manifest["certificate_dmg"] = build_certificate_dmgs(out)
+        print(f"  {len(manifest['certificate_dmg']['variants'])} images sealed to a test "
+              f"certificate")
 
     if enc_wanted:
         manifest["encrypted_dmg"] = build_encrypted_dmgs(out)

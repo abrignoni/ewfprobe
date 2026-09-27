@@ -64,13 +64,14 @@ sparse bundle Apple disk images, encrypted with a password or not, AD-encrypted 
 SMART, raw and AD1 sets, AFF4 containers, standard and pre-standard, striped or
 not, and VHD, VHDX, VMDK and QCOW virtual disks. It does not read Lx01 logical evidence, encrypted AFF4 or AFF4-L, an AD1 other
 than version 4, an AD-encrypted image protected by a certificate, an Apple disk
-image unlocked by a certificate or a keybag rather than a password, or one in the
+image unlocked by a keybag rather than a password or a certificate, or one in the
 older version 1 encrypted format (cdsaencr), an encrypted QCOW, a VMDK SESPARSE
 extent, a VHD split into .v01 files, encrypted Ex01 images (the encryption
 is not publicly documented), or Ex01 images compressed with bzip2 (no sample exists to
 validate against), and it never writes.
 An encrypted AFF opens with its passphrase or with the private key of a certificate
-it is sealed to.
+it is sealed to, and an Apple disk image sealed to a certificate with that
+certificate's private key.
 
 An image whose content is encrypted at rest, by BitLocker or FileVault or an
 encrypted APFS volume, reads back as the ciphertext that was acquired: the
@@ -107,7 +108,7 @@ try:
 except ImportError:
     lzma = None
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 # ---------------------------------------------------------------- constants
 
@@ -364,6 +365,16 @@ _ENCRCDSA_PASSWORD = struct.Struct(">LQL32sL32s5L")  # a password item, to its k
 _ENCRCDSA_HEAD_READ = 1 << 16                    # key items sit in the first bytes
 _ENCRCDSA_UNLOCK = {1: "password", 2: "certificate", 3: "keybag"}
 _ENCRCDSA_KEY_END = b"CKIE\x00"
+# A certificate item (unlock type 2), as nlitsme's readencrcdsa.py reads it
+# (CertificateWrappedKey) and as measured on images hdiutil wrote with -certificate:
+# the length of a key id (20) and the id, the SHA-1 of the certificate's RSA public
+# key in its PKCS#1 form, in a 32-byte field; the wrapping algorithm (42, RSA) and
+# padding (10, PKCS#1), a zero, the wrapped key's length (256 bytes for a 2048-bit
+# key, 512 for a 4096-bit one), then the wrapped key in a 512-byte field. RSA PKCS#1
+# v1.5 unwraps it to the same AES and HMAC keys and "CKIE\0" a password item holds.
+_ENCRCDSA_CERT = struct.Struct(">L32sLLLL")
+_CSSM_RSA = 42
+_CSSM_PADDING_PKCS1 = 10
 # the CSSM identifiers the header and its items record
 _CSSM_AES = 0x80000001
 _CSSM_3DES_3KEY = 0x11
@@ -627,15 +638,17 @@ def _cbc_decrypt(ecb, iv, data, unit):
             ^ int.from_bytes(chain, "big")).to_bytes(len(data), "big")
 
 
-def _encrcdsa_unlock(fh, name, password):
+def _encrcdsa_unlock(fh, name, password, private_key=None):
     """The keys of the encrcdsa (version 2) file open in ``fh``, unwrapped with
-    ``password`` (a str, used as UTF-8, or bytes).
+    ``password`` (a str, used as UTF-8, or bytes) from a password item, or with
+    ``private_key`` (an RSA key: a path, or PEM or DER bytes) from a certificate item.
 
-    Raises EwfPasswordRequiredError when no password is given and
-    EwfWrongPasswordError when it opens none of the file's password items; a wrong
-    password is recognised by the padding and the "CKIE" mark the unwrapped keys end
-    with, which a wrong key does not produce. EwfFormatError for a layout that is not
-    read, and for an image that is opened with a certificate or a keybag.
+    Raises EwfPasswordRequiredError when neither that opens it is given (its
+    ``needs`` says which), and EwfWrongPasswordError when what is given opens none of
+    its items; a wrong password or key is recognised by the padding and the "CKIE"
+    mark the unwrapped keys end with, which a wrong key does not produce.
+    EwfFormatError for a layout that is not read, and for an image that is opened
+    only with a keybag.
     """
     fh.seek(0)
     head = fh.read(_ENCRCDSA_HEAD_READ)
@@ -666,19 +679,34 @@ def _encrcdsa_unlock(fh, name, password):
     items = [_ENCRCDSA_ITEM.unpack_from(head, _ENCRCDSA_HEADER.size + i * _ENCRCDSA_ITEM.size)
              for i in range(count)]
     passwords = [(offset, size) for kind, offset, size in items if kind == 1]
-    if not passwords:
+    certificates = [(offset, size) for kind, offset, size in items if kind == 2]
+    if not passwords and not certificates:
         kinds = " or ".join(sorted({_ENCRCDSA_UNLOCK.get(kind, f"key item of type {kind}")
                                     for kind, _offset, _size in items}))
         raise EwfFormatError(f"{name} is an encrypted Apple disk image opened with a "
-                             f"{kinds}, not a password; ewfprobe opens only one "
-                             f"encrypted with a password")
+                             f"{kinds}, not a password or a certificate; ewfprobe does "
+                             f"not read it")
     if _AES is None:
         raise EwfFormatError(f"{name} is an encrypted Apple disk image; reading one needs "
                              f"the optional pycryptodome package (pip install "
                              f"pycryptodome), which this Python does not have")
-    if password is None:
+    tried = []
+    if private_key is not None and certificates:
+        key = _encrcdsa_unlock_certificate(head, name, certificates, private_key,
+                                           key_bits, iv_bits, block, start, length)
+        if key is not None:
+            return key
+        tried.append("the private key opens none of its certificate items")
+    if password is None or not passwords:
+        if tried:
+            raise EwfWrongPasswordError(f"{name}: {tried[0]}")
+        # a password for an image sealed only to a certificate asks for the key, as an
+        # encrypted AFF does, rather than for another password
+        opens = (["its password"] if passwords else []) + (
+            ["the private key of the certificate it was made with"] if certificates else [])
         raise EwfPasswordRequiredError(f"{name} is an encrypted Apple disk image and "
-                                       f"opens only with its password")
+                                       f"opens only with {' or '.join(opens)}",
+                                       needs="password" if passwords else "private key")
     secret = password.encode("utf-8") if isinstance(password, str) else bytes(password)
     for offset, size in passwords:
         if size < _ENCRCDSA_PASSWORD.size or offset + size > len(head):
@@ -724,7 +752,61 @@ def _encrcdsa_unlock(fh, name, password):
                                  f"HMAC-SHA1 need {key_bits // 8 + iv_bits // 8}")
         return _EncrcdsaKey(keys[:key_bits // 8], keys[key_bits // 8:], block, start,
                             length, key_bits, wrap, rounds)
-    raise EwfWrongPasswordError(f"the password does not open {name}")
+    raise EwfWrongPasswordError("; ".join(tried + [f"the password does not open {name}"]))
+
+
+def _rsa_public_key_id(rsa):
+    """The SHA-1 of an RSA key's public half in its PKCS#1 form (SEQUENCE of the
+    modulus and exponent), as an encrcdsa certificate item names the key."""
+    def der_int(value):
+        raw = value.to_bytes(value.bit_length() // 8 + 1, "big")
+        return b"\x02" + der_length(len(raw)) + raw
+
+    def der_length(n):
+        if n < 128:
+            return bytes([n])
+        raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return bytes([0x80 | len(raw)]) + raw
+
+    body = der_int(rsa.n) + der_int(rsa.e)
+    return hashlib.sha1(b"\x30" + der_length(len(body)) + body).digest()
+
+
+def _encrcdsa_unlock_certificate(head, name, certificates, private_key, key_bits,
+                                 iv_bits, block, start, length):
+    """The keys a certificate item unwraps with ``private_key``, else None."""
+    rsa = _private_key(private_key)
+    own_id = _rsa_public_key_id(rsa)
+    for offset, size in certificates:
+        if size < _ENCRCDSA_CERT.size or offset + size > len(head):
+            raise EwfFormatError(f"{name}: a certificate key item of {size} bytes at "
+                                 f"offset {offset} lies outside the header")
+        item = head[offset:offset + size]
+        (id_length, key_id, algorithm, padding, _zero,
+         wrapped_length) = _ENCRCDSA_CERT.unpack_from(item)
+        if (algorithm, padding) != (_CSSM_RSA, _CSSM_PADDING_PKCS1) or id_length > 32 \
+                or not wrapped_length \
+                or _ENCRCDSA_CERT.size + wrapped_length > len(item):
+            raise EwfFormatError(f"{name}: a certificate key item is laid out in a way "
+                                 f"ewfprobe does not read (algorithm {algorithm}, "
+                                 f"padding {padding})")
+        if key_id[:id_length] != own_id:
+            continue                            # sealed to another certificate
+        wrapped = item[_ENCRCDSA_CERT.size:_ENCRCDSA_CERT.size + wrapped_length]
+        try:
+            keys = _PKCS1.new(rsa).decrypt(wrapped, None)
+        except (ValueError, TypeError):
+            keys = None
+        if not keys or not keys.endswith(_ENCRCDSA_KEY_END):
+            continue
+        keys = keys[:-len(_ENCRCDSA_KEY_END)]
+        if len(keys) != key_bits // 8 + iv_bits // 8:
+            raise EwfFormatError(f"{name}: the private key opens a key item holding "
+                                 f"{len(keys)} bytes of keys, where AES-{key_bits} and "
+                                 f"HMAC-SHA1 need {key_bits // 8 + iv_bits // 8}")
+        return _EncrcdsaKey(keys[:key_bits // 8], keys[key_bits // 8:], block, start,
+                            length, key_bits, "RSA PKCS#1 v1.5", None)
+    return None
 
 
 class _EncryptedFile:
@@ -991,7 +1073,7 @@ class _AdcryptFile:
         return False
 
 
-def _open_content(path, password=None, keys=None):
+def _open_content(path, password=None, keys=None, private_key=None):
     """``path``'s content as (a file object, its size): the file itself, or, for an
     encrypted Apple disk image, what it decrypts to. ``keys`` keeps each file's
     unwrapped keys by path, so a file is unlocked once."""
@@ -1000,7 +1082,7 @@ def _open_content(path, password=None, keys=None):
     if key is False:
         name = os.path.basename(path)
         with open(path, "rb") as fh:
-            key = (_encrcdsa_unlock(fh, name, password)
+            key = (_encrcdsa_unlock(fh, name, password, private_key)
                    if fh.read(8) == DMG_ENCRYPTED_SIGNATURE else None)
         if key is not None and os.path.getsize(path) < key.start + -(
                 -key.length // key.block) * key.block:
@@ -1051,11 +1133,11 @@ def apple_image_kind(path):
     return "ENCRYPTED" if _encrcdsa_v1(path) else None
 
 
-def _udif_trailer(path, password=None, keys=None):
+def _udif_trailer(path, password=None, keys=None, private_key=None):
     """The 512-byte trailer at the end of ``path``'s content (what it decrypts to,
     for an encrypted image), else None."""
     try:
-        fh, size = _open_content(path, password, keys)
+        fh, size = _open_content(path, password, keys, private_key)
     except OSError:
         return None
     with fh:
@@ -1066,7 +1148,7 @@ def _udif_trailer(path, password=None, keys=None):
     return trailer if trailer[:4] == UDIF_TRAILER_SIGNATURE else None
 
 
-def udif_segments(path, password=None, _keys=None) -> list[str]:
+def udif_segments(path, password=None, _keys=None, private_key=None) -> list[str]:
     """Every file of the UDIF image ``path`` names, in order: the one file, or for
     an image hdiutil segment split, the .dmg and the .dmgpart files beside it.
 
@@ -1081,7 +1163,7 @@ def udif_segments(path, password=None, _keys=None) -> list[str]:
     keys = {} if _keys is None else _keys
     first = os.path.abspath(path)
     name = os.path.basename(first)
-    trailer = _udif_trailer(first, password, keys)
+    trailer = _udif_trailer(first, password, keys, private_key)
     if trailer is None:
         raise EwfFormatError(f"{name} has no UDIF trailer")
     number, count = struct.unpack_from(">II", trailer, 56)
@@ -1100,7 +1182,7 @@ def udif_segments(path, password=None, _keys=None) -> list[str]:
         if not entry.lower().endswith(".dmgpart") or not os.path.isfile(part):
             continue
         try:
-            other = _udif_trailer(part, password, keys)
+            other = _udif_trailer(part, password, keys, private_key)
         except EwfPasswordError:
             unopened.append(entry)              # encrypted, and not with this password
             continue
@@ -3297,7 +3379,7 @@ class EwfImage:
     def _content(self, path):
         """``path``'s content as (a file object, its size), decrypted when the file is
         an encrypted Apple disk image; each file is unlocked once."""
-        return _open_content(path, self._password, self._keys)
+        return _open_content(path, self._password, self._keys, self._private_key)
 
     def _content_size(self, path):
         fh, size = self._content(path)
@@ -4203,7 +4285,8 @@ class EwfImage:
         name = os.path.basename(path)
         if os.path.isdir(path):
             with open(os.path.join(path, "token"), "rb") as fh:
-                self._band_key = _encrcdsa_unlock(fh, name, self._password)
+                self._band_key = _encrcdsa_unlock(fh, name, self._password,
+                                                  self._private_key)
             self._note_encryption(self._band_key)
             self._index_sparsebundle()
             return
@@ -4648,6 +4731,11 @@ class EwfImage:
         return ({a: h.hexdigest() for a, h in image.items()}, done, checked, mismatched)
 
     def _note_encryption(self, key):
+        if key.rounds is None:                  # opened with a certificate's private key
+            self.encryption = {"container": "encrcdsa version 2",
+                               "cipher": f"AES-{key.key_bits}", "key_wrap": key.wrap,
+                               "opened_with": "private key of its certificate"}
+            return
         self.encryption = {"container": "encrcdsa version 2",
                            "cipher": f"AES-{key.key_bits}", "key_wrap": key.wrap,
                            "kdf": "PBKDF2-HMAC-SHA1", "kdf_rounds": key.rounds}
@@ -4663,7 +4751,7 @@ class EwfImage:
         path = self.paths[0]
         name = os.path.basename(path)
         size = self._content_size(path)
-        trailer = _udif_trailer(path, self._password, self._keys)
+        trailer = _udif_trailer(path, self._password, self._keys, self._private_key)
         if trailer is None:
             raise EwfFormatError(f"{name} has no UDIF trailer")
         (_sig, version, header_size, flags, running, fork_offset, fork_size,
@@ -4673,7 +4761,8 @@ class EwfImage:
             raise EwfFormatError(f"{name}: the UDIF trailer says it is {header_size} "
                                  f"bytes, not {UDIF_TRAILER_SIZE}")
         if segment_number > 1:
-            udif_segments(path, self._password, self._keys)  # raises, naming the file
+            udif_segments(path, self._password, self._keys,  # raises, naming the file
+                          self._private_key)
         if fork_offset + fork_size > size - UDIF_TRAILER_SIZE:
             raise EwfIncompleteSetError(
                 f"{name}: the data the trailer describes runs past the end of the file; "
@@ -4692,13 +4781,13 @@ class EwfImage:
             if running:
                 raise EwfFormatError(f"{name}: the first segment says its data starts "
                                      f"at {running} in the image's data, not at 0")
-            self.paths = udif_segments(path, self._password, self._keys)
+            self.paths = udif_segments(path, self._password, self._keys, self._private_key)
             joined = 0
             for index, part in enumerate(self.paths):
                 part_name = os.path.basename(part)
                 part_size = self._content_size(part)
                 t = trailer if index == 0 else _udif_trailer(part, self._password,
-                                                             self._keys)
+                                                             self._keys, self._private_key)
                 (_s, _v, part_header, _f, part_running, part_offset, part_fork,
                  _ro, _rs, _n, _c) = _UDIF_TRAILER.unpack_from(t)
                 if part_header != UDIF_TRAILER_SIZE:
@@ -7367,8 +7456,9 @@ def main(argv=None):
                             "variable NAME. "
                             "Without either, ewfprobe asks for it at a terminal")
         s.add_argument("--private-key", metavar="FILE", default=None,
-                       help="for an encrypted AFF sealed to a certificate: the "
-                            "certificate's RSA private key, unencrypted, as PEM or DER")
+                       help="for an encrypted AFF or Apple disk image sealed to a "
+                            "certificate: the certificate's RSA private key, "
+                            "unencrypted, as PEM or DER")
     args = ap.parse_args(argv)
     try:
         status = args.func(args)
