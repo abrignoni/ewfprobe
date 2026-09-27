@@ -13,8 +13,11 @@ ewfprobe, built as a standalone executable
                       On Windows write ewfprobe.exe; on macOS and Linux write
                       ./ewfprobe from this folder. It reads .E01, .s01, .Ex01,
                       .aff, .afd and .aff4 disk images, Apple .dmg,
-                      .sparseimage and .sparsebundle disk images, and the
-                      files in an .L01 or an FTK Imager .ad1. For a split
+                      .sparseimage and .sparsebundle disk images, the
+                      virtual machine disks .vhd, .vhdx, .vmdk, .qcow and
+                      .qcow2 (a differencing disk, delta or overlay with its parent
+                      in the same folder), and the files in an .L01 or an
+                      FTK Imager .ad1. For a split
                       set, keep every segment (.E01, .E02, ..., .ad1, .ad2,
                       ..., a .dmg and its .dmgpart files, or the files of a
                       striped .aff4) in one folder and name the first. Name a .sparsebundle folder itself. An

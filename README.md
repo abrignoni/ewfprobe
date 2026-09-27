@@ -1,6 +1,6 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`), AFF (`.aff`, `.afd`) and AFF4 (`.aff4`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.sparsebundle`), and logical evidence, EnCase's (`.L01`) and FTK Imager's (`.ad1`). One file, pure
+A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`), AFF (`.aff`, `.afd`) and AFF4 (`.aff4`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.sparsebundle`), virtual machine disks (`.vhd`, `.vhdx`, `.vmdk`, `.qcow2`), and logical evidence, EnCase's (`.L01`) and FTK Imager's (`.ad1`). One file, pure
 Python, standard library only. No compiler, no network, nothing to install (an
 LZFSE-compressed `.dmg` needs the optional `pyliblzfse` package, and an encrypted Apple
 disk image or an acquisition FTK Imager encrypted with AD encryption the optional
@@ -391,9 +391,60 @@ slots from offset 56 and names the next one at offset 12. The disk's sector coun
 64-bit at offset 28; the 32-bit field at offset 16 holds only its low half, which is
 0 on a 2 TiB image.
 
+Reads the disks virtual machines keep: VHD and VHDX (Microsoft's, which Windows,
+Hyper-V and Virtual PC write), VMDK (VMware's) and QCOW (QEMU's). Each is opened from its
+own file, a VMDK from its descriptor or from any of its sparse extents, and a disk that is a
+difference over another (a differencing VHD or VHDX, a VMDK delta link, a QCOW overlay)
+is read through its parent, which has to be in the same folder or where it names.
+
+| Format | What is read | Parent found by, and checked against |
+| --- | --- | --- |
+| VHD | fixed, dynamic and differencing disks | its W2ru, W2ku or MacX locator or its recorded name; the parent's disk id |
+| VHDX | fixed, dynamic and differencing disks, the log replayed in memory | its relative path, then its volume and absolute paths; the parent's DataWriteGuid |
+| VMDK | descriptor files and extents: FLAT, VMFS, ZERO, SPARSE (including stream-optimized) and ESXi's VMFSSPARSE | parentFileNameHint; the parent's content id |
+| QCOW | versions 1, 2 and 3: deflate or zstd compressed clusters, extended L2 entries, an external data file | the backing file's name; QCOW records no identity for it |
+
+What each disk is made of is read from the formats' own documents, credited below, and
+these were measured on disks the programs themselves wrote:
+
+- **A VHD's size is the footer's Current Size, not its geometry.** Windows 11 recorded
+  128 MiB disks with a geometry of 963 x 16 x 17 sectors, which is 134,111,232 bytes, a
+  little short of the disk. qemu-img instead rounds the disk up to a whole geometry
+  (16,781,312 bytes for 16 MiB), so its VHDs are read with zeros past the data they were
+  made from.
+- **A differencing VHD's sector bitmap is read most significant bit first, a VHDX's least
+  significant bit first.** The VHD specification does not say; MS-VHDX does. On the
+  children Windows 11 wrote, each order reproduces the disk Windows presented, and the
+  other order does not.
+- **Windows 11 writes a differencing VHD's parent locators as UTF-16 little-endian text**
+  (the parent's name field is big-endian, like the rest of the format), and 0 in the
+  parent's time stamp field, which is shown as not recorded. It writes a VHDX's
+  parent_linkage2 as an all-zero GUID, which is taken to name no parent.
+- **A VHDX whose log holds entries is read as it would be after replay**, with the
+  replayed updates kept in memory; the file is not changed. A qemu-io killed after its
+  writes had returned left the log empty, so the replay is tested on a file built to
+  need one.
+- **VMware's own tools and qemu-img both store stream-optimized grains as zlib streams**,
+  although VMware's note names raw deflate; both are read. VMware's tools put the grain
+  directory in a footer and name the extent `generated-stream.vmdk` in the embedded
+  descriptor whatever the file is called, so a descriptor embedded in a sparse extent
+  that lists one extent is read as describing that file. qemu-img keeps the directory in
+  the header, and leaves the descriptor area of a twoGbMaxExtentSparse extent empty, so
+  an extent opened on its own is read through the descriptor file beside it.
+- **QCOW keeps no identity for its backing file**, so the file of that name is used and
+  `info` says only the name ties them. Internal snapshots are listed with their names
+  and times; the disk read is the active one.
+
+A differencing disk is only as right as its parent, so a parent that is not the one
+recorded is refused rather than read: a VHD whose disk id, a VHDX whose DataWriteGuid,
+or a VMDK whose content id is not the one the child names. A zstd-compressed QCOW needs
+Python 3.14's `compression.zstd`, or the optional `backports.zstd` or `zstandard` package;
+without one it is refused, naming them.
+
 `open_image()` is the same function as `open_ewf()`. `is_image()` is true for the
-disk images ewfprobe reads (EWF, EWF2, AFF, an AFD directory, AFF4, UDIF, sparse images
-and sparse bundle folders), `is_logical_evidence()` for an L01 or an AD1 (`is_ad1()` for
+disk images ewfprobe reads (EWF, EWF2, AFF, an AFD directory, AFF4, UDIF, sparse images,
+sparse bundle folders and the virtual disks above, which `virtual_disk_kind()` names as
+`VHD`, `VHDX`, `VMDK` or `QCOW` from their bytes), `is_logical_evidence()` for an L01 or an AD1 (`is_ad1()` for
 AD1 alone, `ad1_segments()` for the files of its set), `is_ewf()` for EWF alone,
 and `apple_image_kind()` names an Apple disk image as `UDIF`, `SPARSEIMAGE`,
 `SPARSEBUNDLE` or `ENCRYPTED` (any encrypted one, which `is_image()` leaves out
@@ -420,6 +471,17 @@ Refused with a message naming the reason rather than read wrongly:
   other than the one it names, or whose entry's chunk table does not fit its size. An
   entry whose chunk does not inflate fails when read, and `verify` reports it as a
   mismatch.
+- **A VHD of a version other than 1.0**, a VHDX of a version other than 1, **a VHD split
+  into `.v01` files** by Virtual PC 2004 or earlier (no sample has been available), a
+  VHD or VHDX cut short, a VHDX with no header or region table whose checksum matches,
+  a region or metadata item it marks required and this reader does not know, a log
+  holding entries that form no complete sequence, and a block in a reserved state.
+- **A VMDK extent of type SESPARSE**, which VMware has not documented, one marked
+  NOACCESS, and **a VMDK backed by a physical device** (fullDevice, partitionedDevice
+  and the raw device maps), which holds nothing to read.
+- **An encrypted QCOW** (AES or LUKS) and a QCOW setting an incompatible feature this
+  reader does not know.
+- **A difference disk whose parent is missing, or is not the parent it records.**
 - **Encrypted AFF**, and **AFF pages compressed with bzip2**, which AFFLIB itself
   never implemented.
 - **An AFF file with no image size.** AFF records the size when the acquisition
@@ -584,6 +646,27 @@ image](https://github.com/SecurityRonin/ad1-forensic/blob/afc3963659a13acf10082e
 Its log is not published, so its image hash is computed with nothing to compare it with.
 Twenty-one deliberate breaks of the AD1 code are each caught by the tests.
 
+**Virtual disks, against the programs that write them.** Windows 11 (10.0.26200) made
+fixed, expandable and differencing VHD and VHDX disks with diskpart, and each was read
+through `\\.\PhysicalDriveN` after a read-only attach; every one reads byte for byte as
+the disk Windows presented, and reading either child's sector bitmap in the other bit
+order does not. qemu-img 10.2.1 wrote every VHD, VHDX, VMDK and QCOW form it offers from
+a known 16 MiB disk, and each reads as that disk, or for its delta, overlay, snapshot and
+zeroed samples (a VMDK with zeroed-grain entries, a QCOW2 with zero-flagged clusters) as
+the disk plain file writes made. Three files were built from the formats' own documents
+where no writer was at hand: a VHDX whose log holds an update not yet applied, which
+qemu refuses to open read-only and whose replay by qemu reads as ewfprobe's does, an
+ESXi sparse extent, and a QCOW version 1 image with compressed clusters, which qemu-img
+10.2.1 refused to write; qemu reads the last two as ewfprobe does. The compact versions of
+all of these are committed under `tests/fixtures/virtual` with a manifest of the answers.
+A stream-optimized VMDK written by VMware's own tools, the one in VMware's Photon OS 2.0
+OVA (SHA-1 `b8c183785bbf582bcd1be7cde7c22e5758fb3f16`, as its project publishes), reads
+as the same 16 GiB disk qemu-img reads from it, SHA-256
+`9d2c2ad3a3ee5922a7749da1dde4c830b3d577848f1074640792285737c70668`; CI fetches it. No ESXi
+sparse extent, VMDK written by VMware Workstation or Fusion, or VHD from Virtual PC has
+been available. Thirty-six deliberate breaks of the virtual disk code are each caught by
+the tests.
+
 **Apple disk images, against Apple's own tools.** `hdiutil` wrote every format in
 the table above from the 3 MiB source the other fixtures use, and those images are
 committed under `tests/fixtures`: each reproduces the source byte for byte and
@@ -731,6 +814,16 @@ with `EWFPROBE_REQUIRE_AD1_REFERENCE=1` a missing one fails rather than skips:
 EWFPROBE_AD1_REFERENCE=/path/to/pyad1/test_data python -m pytest tests/test_ad1.py -q
 ```
 
+The virtual disks in `tests/fixtures/virtual` were written by Windows 11 and qemu-img,
+or built from the formats' documents, as described under validation, and are not
+regenerated; the scripts that made them sit with the full-size copies. VMware's Photon OS
+2.0 OVA is read from where it is saved; with `EWFPROBE_REQUIRE_VMDK_REFERENCE=1` a
+missing one fails rather than skips:
+
+```
+EWFPROBE_VMDK_REFERENCE=/path/to/photon-custom-hw11-2.0-304b817.ova python -m pytest tests/test_virtual_disks.py -q
+```
+
 That tool shells out to `ewfacquire`, `affconvert` and `hdiutil` and is for development only.
 libewf and AFFLIB are used there solely to produce test data. Nothing from them
 ships and `ewfprobe` imports nothing.
@@ -829,6 +922,31 @@ For FTK Imager's AD encryption: the "AD encryption" section of the EWF documenta
 above ([lines 3376 to 3465 at `d76fd0b`](https://github.com/libyal/libewf/blob/d76fd0bb21601e2969bc88ffdaeb861023f6a5b2/documentation/Expert%20Witness%20Compression%20Format%20(EWF).asciidoc?plain=1#L3376-L3465)),
 which it takes from AccessData's white paper. What that section leaves open was
 measured on sets FTK Imager wrote, as described above.
+
+For VHD: Microsoft's *Virtual Hard Disk Image Format Specification*, version 1.0 of
+October 2006 ([download](https://www.microsoft.com/en-us/download/details.aspx?id=23850)),
+for the footer and its checksum, the dynamic disk header, the block allocation table,
+the sector bitmap and the parent locators. It does not give the bitmap's bit order or the
+locators' byte order, which were measured on disks Windows 11 wrote, as described above.
+
+For VHDX: Microsoft's *[MS-VHDX]: Virtual Hard Disk v2 (VHDX) File Format*, revision 8.0
+of April 23, 2024
+([Open Specifications](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-vhdx/83e061f8-f6e2-4de1-91bd-5d518a43d477)),
+for the headers, region table, log and its replay, BAT, sector bitmap blocks, metadata
+items and parent locator.
+
+For VMDK: VMware's technical note *Virtual Disk Format 5.0* (2011), no longer on
+vmware.com; the copy read is the Internet Archive's of its former address
+([`vmdk_50_technote.pdf`, 1 January 2014](https://web.archive.org/web/20140101163557/https://www.vmware.com/support/developer/vddk/vmdk_50_technote.pdf)),
+for the descriptor, the hosted and ESXi sparse extents and the stream-optimized form.
+
+For QCOW: QEMU's own documents at commit `81ce3a8`,
+[`docs/interop/qcow2.rst`](https://github.com/qemu/qemu/blob/81ce3a87737aa50716c42db8886082d12783e0a1/docs/interop/qcow2.rst)
+for versions 2 and 3 (the header and its extensions, the L1 and L2 tables, compressed
+clusters, which have no zlib header, extended L2 entries and snapshots), and, as version
+1 has no document of its own, its driver
+[`block/qcow.c`, lines 48 to 70 and 599 to 611](https://github.com/qemu/qemu/blob/81ce3a87737aa50716c42db8886082d12783e0a1/block/qcow.c#L48-L70)
+for its header and how a compressed cluster records its size. No QEMU code is copied.
 
 ## License
 
