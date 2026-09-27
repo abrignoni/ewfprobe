@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import errno
 import hashlib
 import io
 import os
@@ -1895,8 +1896,13 @@ def main(argv=None):
     except EwfError as exc:
         print(f"ewfprobe: {exc}", file=sys.stderr)
         return 2
-    except BrokenPipeError:
+    except OSError as exc:
         # Whatever was reading the output (head, a pager) stopped; so does this.
+        # POSIX reports a broken pipe; Windows reports EINVAL on the write, which
+        # carries no file name, unlike an EINVAL from opening a bad path.
+        if not (isinstance(exc, BrokenPipeError) or (
+                os.name == "nt" and exc.errno == errno.EINVAL and exc.filename is None)):
+            raise
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 1
 

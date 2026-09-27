@@ -1452,6 +1452,19 @@ def test_files_piped_into_a_reader_that_stops_early_exits_quietly(tmp_path):
     assert b"Traceback" not in err and b"BrokenPipe" not in err, err
 
 
+def test_an_oserror_naming_a_file_is_not_taken_for_a_closed_pipe(monkeypatch):
+    """Windows reports a closed pipe as EINVAL with no file name; an EINVAL from a bad
+    path carries the path and must still surface."""
+    import errno
+
+    def refuse(_args):
+        raise OSError(errno.EINVAL, "Invalid argument", "C:\\bad:name")
+    monkeypatch.setattr(ewfprobe, "_cmd_info", refuse)
+    monkeypatch.setattr(ewfprobe.os, "name", "nt")
+    with pytest.raises(OSError, match="bad:name"):
+        ewfprobe.main(["info", "x.E01"])
+
+
 def test_the_files_listing_is_utf8_even_where_the_platform_default_is_not(tmp_path):
     """On Windows a pipe or a file gets the ANSI code page by default, which cannot
     hold a name such as this one."""
