@@ -4,7 +4,8 @@ One file, pure Python, standard library only. No compiler, no network, and
 nothing to install. It opens an EWF-E01 or SMART (.s01) acquisition, joins its
 segments, and presents the original disk as an ordinary seekable file object,
 so anything that can read a raw image can read an E01 without changing how it
-reads. It also reads Ex01 (EWF2), the format EnCase 7 introduced.
+reads. It also reads Ex01 (EWF2), the format EnCase 7 introduced, and AFF, the
+Advanced Forensic Format that AFFLIB and FTK Imager write.
 
     with ewfprobe.open_ewf("evidence.E01") as img:
         img.seek(0)
@@ -18,14 +19,18 @@ Written from the public format documentation: Joachim Metz, "Expert Witness
 Compression Format (EWF)" and "Expert Witness Compression Format 2 (EWF2)", in
 the libyal/libewf repository under ``documentation/``. No code is taken from
 libewf, which is LGPL, or from any other EWF implementation. This file is MIT,
-and reimplementing a documented format is what keeps it that way.
+and reimplementing a documented format is what keeps it that way. The AFF
+reader is written from AFFLIB's own documentation and the segment names and
+flag values in its public header, include/afflib/afflib.h (sshock/AFFLIBv3); no
+AFFLIB code is copied.
 
 Scope. This reads EWF-E01, the format EnCase 6 and 7 and FTK Imager write and
 by far the most common one in the field, EWF-S01, the variant ASR Data's SMART
-writes, and EWF2-Ex01, which EnCase 7 and later write. It does not read logical
-evidence (.L01, .Lx01), encrypted Ex01 images (the encryption is not publicly
-documented) or Ex01 images compressed with bzip2 (no sample exists to validate
-against), and it never writes.
+writes, EWF2-Ex01, which EnCase 7 and later write, and AFF. It does not read
+logical evidence (.L01, .Lx01), encrypted Ex01 images (the encryption is not
+publicly documented), Ex01 images compressed with bzip2 (no sample exists to
+validate against), encrypted AFF, or the split AFD and AFM forms of AFF, and it
+never writes.
 
 An image whose content is encrypted at rest, by BitLocker or FileVault or an
 encrypted APFS volume, reads back as the ciphertext that was acquired: the
@@ -38,6 +43,7 @@ import argparse
 import bisect
 import hashlib
 import os
+import re
 import struct
 import sys
 import zlib
@@ -126,12 +132,46 @@ _V2_FIELDS = {
     "lb": "drive_label",
 }
 
+# AFF (Advanced Forensic Format). A file header, then named segments one after
+# another, each "AFF\0", name length, data length and a 32-bit argument (all
+# big-endian), the name, the data, and a tail "ATT\0" plus the segment's length.
+# The disk is cut into equal pages held in segments named page0, page1 and on.
+# Names and flag values are AFFLIB's, from include/afflib/afflib.h.
+AF_HEADER = b"AFF10\r\n\x00"
+_AF_SEGHEAD = struct.Struct(">4sIII")            # "AFF\0", name len, data len, arg
+_AF_SEGTAIL = struct.Struct(">4sI")              # "ATT\0", segment length
+AF_PAGE_COMPRESSED = 0x0001
+AF_PAGE_COMP_ALG_MASK = 0x00F0
+AF_PAGE_COMP_ALG_ZLIB = 0x0000
+AF_PAGE_COMP_ALG_BZIP = 0x0010                   # AFFLIB never implemented it
+AF_PAGE_COMP_ALG_LZMA = 0x0020
+AF_PAGE_COMP_ALG_ZERO = 0x0030                   # data is a 4-byte count of NULs
+AF_AES256_SUFFIX = "/aes256"
+AF_SIG256_SUFFIX = "/sha256"
+_AF_PAGE_NAME = re.compile(r"(?:page|seg)(\d+)")
+_AF_PAGE_HASH_NAME = re.compile(r"(?:page|seg)\d+_(?:md5|sha1|sha256)")
+_AF_STRUCTURAL = {"pagesize", "segsize", "imagesize", "sectorsize", "badflag",
+                  "badsectors", "blanksectors", "md5", "sha1", "sha256", "image_gid",
+                  "devicesectors", "aff_file_type"}
+# AFF segments with the same meaning as an EWF header value are reported under that
+# value's name; every other text segment keeps the name it is stored under.
+_AFF_FIELDS = {
+    "case_num": "case_number",
+    "acquisition_notes": "notes",
+    "acquisition_tecnician": "examiner",   # AFFLIB's own spelling
+    "acquisition_date": "acquisition_date",
+}
+FORMAT_AFF = "AFF"
+_AFF_MAX_SMALL = 1 << 16                         # non-page segments read into memory
+
 # Logical evidence files share the section machinery but hold files, not a disk.
 LOGICAL_SIGNATURES = (b"LVF\x09\x0d\x0a\xff\x00", b"LEF2\r\n\x81\x00")
 
 # How many decompressed chunks and open segment handles to keep. A chunk is
 # normally 32 KiB, so the cache is a couple of megabytes at the default.
 CHUNK_CACHE = 64
+# The cache is bounded in bytes as well, because an AFF page is 16 MiB by default.
+CHUNK_CACHE_BYTES = CHUNK_CACHE * 32768
 MAX_OPEN = 8
 
 # The header sections name their fields with one or two letter identifiers.
@@ -204,6 +244,23 @@ def _family(ext):
     if len(ext) == 4 and low[:1] == "e" and low[1:2] in "xyz":
         return "Ex"
     return "s" if low[:1] == "s" else "E"
+
+
+def is_image(path) -> bool:
+    """True when the file begins with a signature ewfprobe reads: EWF, EWF2 or AFF."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(8) in (SIGNATURE, SIGNATURE_V2, AF_HEADER)
+    except OSError:
+        return False
+
+
+def _is_aff(path):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(8) == AF_HEADER
+    except OSError:
+        return False
 
 
 def is_ewf(path) -> bool:
@@ -429,7 +486,7 @@ class _Table:
 
 
 class EwfImage:
-    """An EWF-E01, EWF-S01 or EWF2-Ex01 acquisition, read as one seekable stream.
+    """An EWF-E01, EWF-S01, EWF2-Ex01 or AFF acquisition, read as one seekable stream.
 
     ``media_size`` is the size of the disk that was acquired, which is what
     ``seek`` and ``read`` address. The segment files themselves are an
@@ -437,7 +494,16 @@ class EwfImage:
     """
 
     def __init__(self, path, segments=None):
-        self.paths = list(segments) if segments else ewf_segments(path)
+        if segments:
+            self.paths = list(segments)
+        elif os.path.isdir(path) and str(path).lower().endswith(".afd"):
+            raise EwfFormatError(
+                f"{os.path.basename(path)} is an AFD directory, AFF split across "
+                f"several files; ewfprobe reads a single .aff file")
+        elif _is_aff(path):
+            self.paths = [os.path.abspath(path)]
+        else:
+            self.paths = ewf_segments(path)
         self._handles: OrderedDict[int, object] = OrderedDict()
         self._cache: OrderedDict[int, bytes] = OrderedDict()
         self._pos = 0
@@ -458,6 +524,11 @@ class EwfImage:
         self.size = 0
         self.sizes: list[int] = []
         self._indexed_chunks = 0
+        self.missing_page_ranges: list[tuple[int, int]] = []
+        self.missing_page_count = 0
+        self.bad_sectors = None
+        self._aff_pages: dict[int, tuple[int, int, int]] = {}
+        self._aff_badflag = b""
 
         self._tables: list[_Table] = []
         self._table_starts: list[int] = []
@@ -487,6 +558,9 @@ class EwfImage:
                 f"which holds files rather than a disk image; ewfprobe does not read it")
         if magic == SIGNATURE_V2:
             self._index_v2()
+            return
+        if magic == AF_HEADER:
+            self._index_aff()
             return
         chunks = 0
         volume_seen = False
@@ -632,6 +706,155 @@ class EwfImage:
         if not self._tables:
             raise EwfFormatError("the image carries no chunk table")
         self._finish_index(chunks)
+
+    def _index_aff(self):
+        """Walk an AFF file's segments once, keeping page locations and metadata."""
+        self.format = FORMAT_AFF
+        path = self.paths[0]
+        name_of_file = os.path.basename(path)
+        fh = self._handle(0)
+        end = os.path.getsize(path)
+        fh.seek(0)
+        if _read_exactly(fh, len(AF_HEADER)) != AF_HEADER:
+            raise EwfFormatError(f"{name_of_file} is not an AFF file")
+        small: dict[str, tuple[int, bytes]] = {}
+        offset = len(AF_HEADER)
+        while offset < end:
+            if offset + _AF_SEGHEAD.size > end:
+                raise EwfIncompleteSetError(
+                    f"{name_of_file} ends inside a segment header at {offset}; the file "
+                    f"is truncated")
+            fh.seek(offset)
+            magic, name_len, data_len, arg = _AF_SEGHEAD.unpack(
+                _read_exactly(fh, _AF_SEGHEAD.size))
+            if magic != b"AFF\x00":
+                raise EwfFormatError(f"{name_of_file} has no segment header at {offset}")
+            data_offset = offset + _AF_SEGHEAD.size + name_len
+            tail = data_offset + data_len
+            if tail + _AF_SEGTAIL.size > end:
+                raise EwfIncompleteSetError(
+                    f"{name_of_file} ends inside the segment at {offset}; the file is "
+                    f"truncated")
+            name = _read_exactly(fh, name_len).decode("utf-8", "replace")
+            fh.seek(tail)
+            tail_magic, seg_len = _AF_SEGTAIL.unpack(_read_exactly(fh, _AF_SEGTAIL.size))
+            if tail_magic != b"ATT\x00" or seg_len != tail + _AF_SEGTAIL.size - offset:
+                raise EwfFormatError(f"{name_of_file}: the segment at {offset} has no "
+                                     f"matching tail")
+            if name.endswith(AF_AES256_SUFFIX) or name.startswith("affkey"):
+                raise EwfFormatError(
+                    f"{name_of_file} is encrypted. ewfprobe does not read encrypted AFF")
+            page = _AF_PAGE_NAME.fullmatch(name)
+            if page:
+                self._aff_pages[int(page.group(1))] = (data_offset, data_len, arg)
+            elif name and data_len <= _AFF_MAX_SMALL:
+                fh.seek(data_offset)
+                small[name] = (arg, _read_exactly(fh, data_len))
+            offset = tail + _AF_SEGTAIL.size
+
+        def quad(entry):
+            if entry is None or len(entry[1]) != 8:
+                return None
+            low, high = struct.unpack(">II", entry[1])
+            return (high << 32) | low
+
+        page_size = (small.get("pagesize") or small.get("segsize") or (0, b""))[0]
+        if not page_size:
+            raise EwfFormatError(f"{name_of_file} records no page size")
+        image_size = quad(small.get("imagesize"))
+        if image_size is None:
+            raise EwfIncompleteSetError(
+                f"{name_of_file} records no image size, which an AFF file gains when "
+                f"its acquisition finishes; reading it would report missing data as empty")
+        sector_arg, sector_data = small.get("sectorsize", (0, b""))
+        if not sector_arg and sector_data.strip(b"\x00 ").isdigit():
+            sector_arg = int(sector_data.strip(b"\x00 "))  # FTK Imager writes it as text
+        self._aff_badflag = small.get("badflag", (0, b""))[1]
+        self.bad_sectors = quad(small.get("badsectors"))
+        for key, algo, width in (("md5", "MD5", 16), ("sha1", "SHA1", 20),
+                                 ("sha256", "SHA256", 32)):
+            digest = small.get(key, (0, b""))[1]
+            if len(digest) == width and any(digest):
+                self.stored_hashes[algo] = digest.hex()
+        gid = small.get("image_gid", (0, b""))[1]
+        if gid:
+            self.metadata["image_gid"] = gid.hex()
+        for key, (arg, data) in small.items():
+            if (key in _AF_STRUCTURAL or _AF_PAGE_HASH_NAME.fullmatch(key)
+                    or key.endswith(AF_SIG256_SUFFIX)):
+                continue
+            try:
+                value = data.decode("utf-8").strip("\x00").strip()
+            except UnicodeDecodeError:
+                continue
+            if not value and arg:
+                value = str(arg)
+            if value and value.isprintable():
+                self.metadata[_AFF_FIELDS.get(key, key)] = value
+
+        self.chunk_size = page_size
+        self.media_size = image_size
+        self.size = image_size
+        self.sector_size = sector_arg
+        self.sector_count = image_size // sector_arg if sector_arg else 0
+        self.sectors_per_chunk = page_size // sector_arg if sector_arg else 0
+        self.compression_level = None
+        self.sizes = [end]
+        needed = self._needed_chunks()
+        self.chunk_count = needed
+        self._indexed_chunks = sum(1 for n in self._aff_pages if n < needed)
+        # Built from the pages present, never by counting up to the image size: the
+        # size is read from the file, and a damaged one can claim petabytes.
+        expect = 0
+        for n in sorted(p for p in self._aff_pages if p < needed):
+            if n > expect:
+                self.missing_page_ranges.append((expect, n - 1))
+            expect = n + 1
+        if expect < needed:
+            self.missing_page_ranges.append((expect, needed - 1))
+        self.missing_page_count = sum(b - a + 1 for a, b in self.missing_page_ranges)
+
+    def _chunk_data_aff(self, n):
+        location = self._aff_pages.get(n)
+        if location is None:
+            # AFFLIB fills a page that is not in the file with the image's bad-sector
+            # marker (af_get_page in lib/afflib_pages.cpp); so does this reader, and
+            # the page is counted in missing_page_ranges.
+            if not self._aff_badflag:
+                raise EwfFormatError(f"page {n} is not in the file, and the image records "
+                                     f"no bad-sector marker to stand in for it")
+            flag = self._aff_badflag
+            return (flag * (self.chunk_size // len(flag) + 1))[:self.chunk_size]
+        offset, length, arg = location
+        fh = self._handle(0)
+        fh.seek(offset)
+        raw = _read_exactly(fh, length)
+        if not arg & AF_PAGE_COMPRESSED:
+            return raw
+        algorithm = arg & AF_PAGE_COMP_ALG_MASK
+        if algorithm == AF_PAGE_COMP_ALG_ZERO:
+            if length != 4:
+                raise EwfFormatError(f"page {n} is a zero page with {length} bytes, not 4")
+            return b"\x00" * min(struct.unpack(">I", raw)[0], self.chunk_size)
+        if algorithm == AF_PAGE_COMP_ALG_ZLIB:
+            try:
+                return zlib.decompressobj().decompress(raw, self.chunk_size)
+            except zlib.error as exc:
+                raise EwfFormatError(f"cannot inflate page {n}: {exc}") from exc
+        if algorithm == AF_PAGE_COMP_ALG_LZMA:
+            try:
+                import lzma  # pylint: disable=import-outside-toplevel
+            except ImportError as exc:
+                raise EwfFormatError(
+                    f"page {n} is LZMA-compressed and this Python has no lzma module"
+                ) from exc
+            try:
+                decoder = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
+                return decoder.decompress(raw, max_length=self.chunk_size)
+            except lzma.LZMAError as exc:
+                raise EwfFormatError(f"cannot decompress LZMA page {n}: {exc}") from exc
+        raise EwfFormatError(f"page {n} uses compression algorithm {algorithm:#06x}, "
+                             f"which ewfprobe does not read")
 
     def _parse_table_v2(self, fh, segment_index, offset, first_expected):
         fh.seek(offset)
@@ -794,6 +1017,9 @@ class EwfImage:
         if self.format == FORMAT_EX01:
             data = self._chunk_data_v2(n)
             return self._keep(n, data, want)
+        if self.format == FORMAT_AFF:
+            data = self._chunk_data_aff(n)
+            return self._keep(n, data, want)
 
         segment, start, end, compressed = self._chunk_location(n)
         fh = self._handle(segment)
@@ -819,7 +1045,8 @@ class EwfImage:
         elif len(data) > want:
             data = data[:want]
 
-        if len(self._cache) >= CHUNK_CACHE:
+        if len(self._cache) >= max(2, min(CHUNK_CACHE,
+                                          CHUNK_CACHE_BYTES // max(self.chunk_size, 1))):
             self._cache.popitem(last=False)
         self._cache[n] = data
         return data
@@ -907,6 +1134,7 @@ class EwfImage:
         """
         md5 = hashlib.md5()
         sha1 = hashlib.sha1()
+        sha256 = hashlib.sha256() if "SHA256" in self.stored_hashes else None
         self.seek(0)
         done = 0
         while True:
@@ -915,10 +1143,14 @@ class EwfImage:
                 break
             md5.update(data)
             sha1.update(data)
+            if sha256 is not None:
+                sha256.update(data)
             done += len(data)
             if progress:
                 progress(done, self.media_size)
         computed = {"MD5": md5.hexdigest(), "SHA1": sha1.hexdigest()}
+        if sha256 is not None:
+            computed["SHA256"] = sha256.hexdigest()
         match = None
         for name, value in self.stored_hashes.items():
             if name in computed:
@@ -929,6 +1161,8 @@ class EwfImage:
             "match": match,
             "bytes": done,
             "checksum_errors": list(self.checksum_errors),
+            "missing_page_count": self.missing_page_count,
+            "missing_page_ranges": list(self.missing_page_ranges),
         }
 
     def info(self):
@@ -947,13 +1181,20 @@ class EwfImage:
             "indexed_chunks": self._indexed_chunks,
             "compression_level": self.compression_level,
             "stored_hashes": dict(self.stored_hashes),
+            "missing_page_count": self.missing_page_count,
+            "missing_page_ranges": list(self.missing_page_ranges),
+            "bad_sectors": self.bad_sectors,
             "metadata": dict(self.metadata),
         }
 
 
 def open_ewf(path, segments=None) -> EwfImage:
-    """Open an EWF acquisition from any path in its segment set."""
+    """Open an acquisition ewfprobe reads: an EWF or EWF2 set from any path in it,
+    or an AFF file."""
     return EwfImage(path, segments=segments)
+
+
+open_image = open_ewf
 
 
 # --------------------------------------------------------------------- CLI
@@ -976,13 +1217,22 @@ def _cmd_info(args):
         print(f"format          {d['format']}")
         print(f"media type      {d['media_type'] or 'not recorded'}")
         print(f"media size      {d['media_size']:,} bytes ({_size(d['media_size'])})")
-        print(f"sector size     {d['sector_size']:,} bytes")
-        print(f"sectors         {d['sector_count']:,}")
-        print(f"chunk size      {d['chunk_size']:,} bytes "
+        if d["sector_size"]:
+            print(f"sector size     {d['sector_size']:,} bytes")
+            print(f"sectors         {d['sector_count']:,}")
+        else:
+            print("sector size     not recorded")
+        unit = "page size " if d["format"] == FORMAT_AFF else "chunk size"
+        print(f"{unit}      {d['chunk_size']:,} bytes "
               f"({d['sectors_per_chunk']} sectors)")
         print(f"chunks          {d['indexed_chunks']:,} indexed, "
               f"{d['chunk_count']:,} declared")
         print(f"compression     {d['compression_level'] or 'not recorded'}")
+        if d["bad_sectors"] is not None:
+            print(f"bad sectors     {d['bad_sectors']:,} recorded")
+        if d["missing_page_count"]:
+            print(f"missing pages   {d['missing_page_count']:,}, read as the "
+                  f"bad-sector marker")
         for name, value in d["stored_hashes"].items():
             print(f"stored {name:<9}{value}")
         if d["metadata"]:
@@ -1015,6 +1265,9 @@ def _cmd_verify(args):
                 print(f"{name:<6}{value}   DOES NOT MATCH stored {stored}")
         if result["checksum_errors"]:
             print(f"chunk checksum mismatches: {len(result['checksum_errors'])}")
+        if result["missing_page_count"]:
+            print(f"pages not in the file, read as the bad-sector marker: "
+                  f"{result['missing_page_count']:,}")
         if result["match"] is None:
             print("the acquisition recorded no hash, so nothing could be compared")
             return 0
@@ -1049,8 +1302,8 @@ def _cmd_export(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="ewfprobe",
-        description="Read an EnCase/EWF (.E01, .Ex01) or SMART (.s01) forensic "
-                    "image. Read only.")
+        description="Read an EnCase/EWF (.E01, .Ex01), SMART (.s01) or AFF (.aff) "
+                    "forensic image. Read only.")
     ap.add_argument("--version", action="version", version=f"ewfprobe {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

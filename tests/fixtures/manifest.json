@@ -147,6 +147,47 @@
         "ex01-none.Ex01"
       ],
       "writer": "ewfacquire 20260924"
+    },
+    "aff-zlib": {
+      "format": "aff",
+      "options": [
+        "-s64k"
+      ],
+      "files": [
+        "aff-zlib.aff"
+      ],
+      "writer": "affconvert 3.7.22"
+    },
+    "aff-lzma": {
+      "format": "aff",
+      "options": [
+        "-L",
+        "-s64k"
+      ],
+      "files": [
+        "aff-lzma.aff"
+      ],
+      "writer": "affconvert 3.7.22"
+    },
+    "aff-none": {
+      "format": "aff",
+      "options": [
+        "-x",
+        "-s64k"
+      ],
+      "files": [
+        "aff-none.aff"
+      ],
+      "writer": "affconvert 3.7.22"
+    },
+    "ftk-aff": {
+      "format": "aff",
+      "compression": "6",
+      "files": [
+        "ftk-aff.aff"
+      ],
+      "writer": "FTK Imager 4.7.3.61 (AFFLIB 3.7.18, per the image's afflib_version segment)",
+      "stores_no_hash": true
     }
   }
 }
