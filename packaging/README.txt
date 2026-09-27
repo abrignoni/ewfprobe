@@ -6,10 +6,14 @@ ewfprobe, built as a standalone executable
                           ewfprobe info   image.E01
                           ewfprobe verify image.E01
                           ewfprobe export image.E01 -o image.raw
+                          ewfprobe files  evidence.L01
+                          ewfprobe export evidence.L01 --entry "Folder/a.jpg" -o a.jpg
                           ewfprobe --help
                       On Windows write ewfprobe.exe; on macOS and Linux write
-                      ./ewfprobe from this folder. For a split set, keep every
-                      segment (.E01, .E02, ...) in one folder and name the .E01.
+                      ./ewfprobe from this folder. It reads .E01, .s01, .Ex01,
+                      .aff and .afd disk images, and the files in an .L01. For
+                      a split set, keep every segment (.E01, .E02, ...) in one
+                      folder and name the first.
 
   SHA256SUMS.txt      the hash of the executable as built. Check it with
                           certutil -hashfile ewfprobe.exe SHA256     (Windows)
