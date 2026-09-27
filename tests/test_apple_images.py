@@ -793,3 +793,59 @@ def test_copying_keeps_a_fixture_readable(tmp_path):
     shutil.copyfile(src, dst)
     with ewfprobe.open_ewf(str(dst)) as img:
         assert img.format == ewfprobe.FORMAT_UDIF
+
+
+# -------------------------------------- where the data fork and property list sit
+
+def _relayout(src, dst, *, prefix=b"", xml_extra=b"", shift_entries=0):
+    """Rewrite a one-file UDIF image: put ``prefix`` before its data fork (moving the
+    fork there), append ``xml_extra`` to its property list and count it in the
+    trailer's XML length, and add ``shift_entries`` to every block table's base."""
+    with open(src, "rb") as fh:
+        d = fh.read()
+    k = bytearray(d[-512:])
+    fork_offset, fork_size = struct.unpack_from(">QQ", k, 24)
+    xml_offset, xml_size = struct.unpack_from(">QQ", k, 216)
+    fork, xml = d[fork_offset:fork_offset + fork_size], d[xml_offset:xml_offset + xml_size]
+    if shift_entries:
+        plist = plistlib.loads(xml)
+        for table in plist["resource-fork"]["blkx"]:
+            data = bytearray(table["Data"])
+            struct.pack_into(">Q", data, 24, struct.unpack_from(">Q", data, 24)[0]
+                             + shift_entries)
+            table["Data"] = bytes(data)
+        xml = plistlib.dumps(plist)
+    xml += xml_extra
+    struct.pack_into(">Q", k, 24, len(prefix))
+    struct.pack_into(">QQ", k, 216, len(prefix) + len(fork), len(xml))
+    with open(dst, "wb") as fh:
+        fh.write(prefix + fork + xml + bytes(k))
+
+
+@pytest.mark.parametrize("extra", [b"\x00\x00", b"zz"])
+def test_bytes_counted_past_the_property_list_are_not_read(tmp_path, extra):
+    """Some images count a byte or two past </plist> (citruz/dmgwiz issue 19), and
+    hdiutil attach read the same image made from a real one both ways."""
+    data = _disk()
+    write_udif(tmp_path / "a.dmg", data)
+    _relayout(tmp_path / "a.dmg", tmp_path / "b.dmg", xml_extra=extra)
+    with ewfprobe.open_ewf(str(tmp_path / "b.dmg")) as img:
+        assert _read_all(img) == data
+
+
+def test_a_data_fork_that_does_not_start_the_file_is_read_from_where_it_starts(tmp_path):
+    """A chunk's position counts from the start of the data fork. hdiutil attach read
+    an image moved 512 bytes into its file with the positions left as they were, and
+    called it corrupt with them shifted by 512, so the second is refused here."""
+    data = _disk()
+    write_udif(tmp_path / "a.dmg", data)
+    _relayout(tmp_path / "a.dmg", tmp_path / "moved.dmg", prefix=bytes(512))
+    with ewfprobe.open_ewf(str(tmp_path / "moved.dmg")) as img:
+        assert img.udif["data_fork"][0] == 512
+        assert _read_all(img) == data
+        checks = img.verify()["container_checks"]
+        assert checks and all(c["match"] for c in checks)
+    _relayout(tmp_path / "a.dmg", tmp_path / "shifted.dmg", prefix=bytes(512),
+              shift_entries=512)
+    with pytest.raises(ewfprobe.EwfFormatError, match="points outside the image's data"):
+        ewfprobe.open_ewf(str(tmp_path / "shifted.dmg"))

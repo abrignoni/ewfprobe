@@ -485,3 +485,65 @@ def test_an_encrypted_segment_that_will_not_open_is_named(tmp_path, name, varian
     with pytest.raises(ewfprobe.EwfIncompleteSetError,
                        match="1 encrypted .dmgpart file beside it did not open"):
         ewfprobe.open_ewf(str(tmp_path / variant["files"][0]), password=variant["password"])
+
+
+# -- AD-encrypted sets FTK Imager wrote ---------------------------------------------
+
+def _ad_source():
+    """The disk the AD-encrypted sets were made from, rebuilt the way
+    tools/make_fixtures.py ad_source() writes it, so the known answer does not come
+    from ewfprobe."""
+    out, i = bytearray(), 0
+    while len(out) < 2457 * 512:
+        out += hashlib.sha256(b"ewfprobe AD encryption fixture %d" % i).digest()
+        i += 1
+    return bytes(out[:2457 * 512])
+
+
+def _ad_sets():
+    section = _manifest().get("ad_encrypted", {"variants": {}})
+    missing = ewfprobe._AES is None and not _CRYPTO_REQUIRED     # pylint: disable=protected-access
+    marks = ([pytest.mark.skip(reason="AD-encrypted images need the optional "
+                                      "pycryptodome package")] if missing else [])
+    return [pytest.param(name, v, marks=marks, id=name)
+            for name, v in sorted(section["variants"].items())]
+
+
+def test_the_ad_source_is_what_ftk_imager_recorded():
+    section = _manifest()["ad_encrypted"]
+    source = _ad_source()
+    assert section["writer"].startswith("FTK Imager")
+    assert {v["format"] for v in section["variants"].values()} == {"e01", "raw"}
+    assert len(source) == section["source"]["size"]
+    assert hashlib.md5(source).hexdigest() == section["ftk_recorded"]["MD5"]
+    assert hashlib.sha1(source).hexdigest() == section["ftk_recorded"]["SHA1"]
+    assert hashlib.sha256(source).hexdigest() == section["source"]["sha256"]
+
+
+@pytest.mark.parametrize("name,variant", _ad_sets())
+def test_ad_encrypted_sets_read_back_the_disk_ftk_imager_imaged(name, variant):
+    """FTK Imager wrote each set with a 1 MB fragment, so every one has two files and
+    the second decrypts under the second counter. The E01 also carries the hashes
+    FTK Imager stored in it."""
+    section = _manifest()["ad_encrypted"]
+    files = [os.path.join(FIXTURES, f) for f in variant["files"]]
+    assert len(files) == 2
+    assert ewfprobe.is_adcrypt(files[0]) and not ewfprobe.is_adcrypt(files[1])
+    for start in files:                         # a raw set opens from any member
+        if variant["format"] != "raw" and start != files[0]:
+            continue
+        with ewfprobe.open_ewf(start, password=section["password"]) as img:
+            assert img.format == {"e01": ewfprobe.FORMAT_E01,
+                                  "raw": ewfprobe.FORMAT_RAW}[variant["format"]]
+            assert [os.path.basename(p) for p in img.paths] == variant["files"]
+            assert img.media_size == section["source"]["size"]
+            assert _media_sha(img) == section["source"]["sha256"]
+            assert img.encryption["cipher"] == "AES-256-CTR"
+            assert img.encryption["kdf"] == "PBKDF2-HMAC-SHA1 of SHA512"
+            assert img.encryption["kdf_rounds"] == 4000
+            if variant["format"] == "e01":
+                assert img.stored_hashes == section["ftk_recorded"]
+    with pytest.raises(ewfprobe.EwfPasswordRequiredError):
+        ewfprobe.open_ewf(files[0])
+    with pytest.raises(ewfprobe.EwfWrongPasswordError):
+        ewfprobe.open_ewf(files[0], password=section["password"] + "x")
