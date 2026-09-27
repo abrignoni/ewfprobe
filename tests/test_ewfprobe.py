@@ -1445,11 +1445,26 @@ def test_files_piped_into_a_reader_that_stops_early_exits_quietly(tmp_path):
                           "ewfprobe.py")
     proc = subprocess.Popen([sys.executable, script, "files", paths[0]],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert proc.stdout.readline() == b"kind\tsize\tmd5\tpath\n"
+    assert proc.stdout.readline().rstrip(b"\r\n") == b"kind\tsize\tmd5\tpath"
     proc.stdout.close()                                   # as head does after its lines
     err = proc.stderr.read()
     proc.wait(timeout=30)
     assert b"Traceback" not in err and b"BrokenPipe" not in err, err
+
+
+def test_the_files_listing_is_utf8_even_where_the_platform_default_is_not(tmp_path):
+    """On Windows a pipe or a file gets the ANSI code page by default, which cannot
+    hold a name such as this one."""
+    import subprocess
+    paths, _ = write_l01(str(tmp_path), "ev", [l01_node("相片 \u00b7 photo.jpg", b"x")])
+    script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "ewfprobe.py")
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("PYTHONUTF8", "PYTHONIOENCODING")}
+    proc = subprocess.run([sys.executable, script, "files", paths[0]],
+                          capture_output=True, env=env, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert "相片 \u00b7 photo.jpg" in proc.stdout.decode("utf-8")
 
 
 def test_a_disk_image_has_no_entries(tmp_path, capsys):

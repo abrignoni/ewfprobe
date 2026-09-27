@@ -218,5 +218,32 @@
       "writer": "FTK Imager 4.7.3.61 (AFFLIB 3.7.18, per the image's afflib_version segment)",
       "stores_no_hash": true
     }
+  },
+  "logical": {
+    "tracy-phone-2012-07-05-1640": {
+      "files": [
+        "tracy-phone-2012-07-05-1640.L01"
+      ],
+      "writer": "EnCase 7.2.4.2, per the file's header section",
+      "source": "https://digitalcorpora.s3.amazonaws.com/corpora/scenarios/2012-ngdc/extra/tracy-phone-encase/tracy-phone-2012-07-05-1640.L01",
+      "source_etag": "554e9c48d99261201062834eb9baf35a",
+      "terms": "Digital Corpora: original scenario data is CC0; material inside an image that claims its own copyright is excluded (https://digitalcorpora.org/about-digitalcorpora/terms-of-use/)",
+      "file_sha256": "38a8f72561a236f155ee8a395d421310949a1b3e2cc938a0f3ded448e78088a4",
+      "known_answers_from": "libewf 20260924 ewfexport -f raw and -f files",
+      "media_size": 7710182,
+      "media_md5": "4a9c2aa394237c6a30dde30a0f7c320a",
+      "media_sha256": "fba3344ac80fa70d3d7fd9944c0b6e0e992448d4ce78d9c2e35877eeca4edf80",
+      "entries": 9951,
+      "entry_md5s": 108,
+      "entries_with_data_and_children": 123,
+      "exported_files": 9219,
+      "exported_files_digest": "5575ef2c4dd6e5652def7db9b0b704b728370019c117efec342df1017c805d50",
+      "exported_files_digest_is": "sha256 of the sorted lines 'path<TAB>sha256 of content<LF>', UTF-8, one per file ewfexport -f files wrote, path relative to LogicalEntries with its \\x24 written back as $",
+      "sparse_entry": {
+        "path": "Raw Data/AppDomain-com.facebook.Facebook/Library/WebKit/LocalStorage/https_s-static.ak.facebook.com_0.localstorage/https_s-static.ak.facebook.com_0.localstorage",
+        "size": 12288,
+        "sha256": "10bc405034c59e98b4cc1dddf9c69779800b78583577172197110575fcb59e6c"
+      }
+    }
   }
 }

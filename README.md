@@ -261,10 +261,14 @@ writes `$` in a name as `\x24`, which the comparison maps). Every entry with dat
 and no children appears in that export, and all 646 MD5s EnCase stored for entries
 match. A check that does not depend on libewf: the logical zip taken of the same
 phone a minute after the last L01 holds 30 photos, and all 30 are byte-identical to
-entries ewfprobe reads from that L01. No L01 from another writer has been
-available, and no real L01 is committed under `tests/fixtures`; in the suite, a
-writer built from the specification and from the layout of these files covers each
-behaviour above.
+entries ewfprobe reads from that L01. The smallest of the five,
+`tracy-phone-2012-07-05-1640.L01` (EnCase 7.2.4.2, 9,951 entries), is committed
+under `tests/fixtures` with known answers taken from `ewfexport`: its media data,
+and one digest over the 9,219 files `ewfexport -f files` writes. Digital Corpora
+publishes its scenario data under CC0, excluding any material inside an image that
+claims its own copyright. No L01 from another writer has been available; a writer
+in the suite built from the specification and from the layout of these files
+covers the behaviours that file does not exercise.
 
 ## Standalone executables
 
@@ -274,8 +278,9 @@ and arm64, beside `ewfprobe.py` itself. The workflow that builds them
 (`.github/workflows/build-executables.yml`) runs each executable on the reference images
 in `tests/fixtures`. It requires `info`, `verify` and `export` to write the same bytes as
 `python ewfprobe.py`, the export to match the source disk's SHA-256, and a set missing a
-segment to be refused, before it is packaged with `SHA256SUMS.txt` and a README. No L01 is
-among those images, so the L01 commands are tested from `ewfprobe.py` only. The
+segment to be refused, before it is packaged with `SHA256SUMS.txt` and a README. On the
+L01 it also requires `files` and `export --entry` to match, and the exports to match the
+known answers taken from libewf. The
 executables are not code signed; the README inside each archive says what Windows
 SmartScreen and macOS Gatekeeper will ask.
 

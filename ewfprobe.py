@@ -1800,6 +1800,10 @@ def _cmd_files(args):
         if img.format != FORMAT_L01:
             raise EwfFormatError(f"{os.path.basename(args.image)} is a disk image, not "
                                  f"logical evidence; it holds no entry list")
+        # The listing is data, so it is UTF-8 wherever it goes; on Windows a pipe or
+        # file would otherwise get the ANSI code page, which cannot hold every name.
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
         print("kind\tsize\tmd5\tpath")
         for entry in img.logical_entries:
             kind = "folder" if entry.is_folder else "file"
