@@ -1,6 +1,6 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`) and SMART (`.s01`) forensic images. One file, pure
+A read-only reader for EnCase/EWF (`.E01`, `.Ex01`) and SMART (`.s01`) forensic images. One file, pure
 Python, standard library only. No compiler, no network, nothing to install.
 
 It opens an acquisition, joins its segments, and presents the acquired disk as
@@ -54,8 +54,21 @@ A SMART image records less than an E01 does. Its volume section has no media
 type, so `info` says "not recorded" rather than guessing, and its compression
 level is read from the header section instead.
 
-It does not read the newer Ex01 (EWF2) or logical `.L01` evidence, and it never
-writes.
+Reads Ex01 (EWF2), the format EnCase 7 introduced: segments named `.Ex01`,
+`.Ex02` and on, chunks stored deflated, stored with a checksum, or as a repeated
+eight-byte pattern, and the MD5 and SHA-1 the acquisition recorded. Case and drive
+details are reported under the specification's own names; the two times it keeps,
+target time and actual time, are shown as stored, seconds since 1970 in UTC.
+
+Refused with a message naming the reason rather than read wrongly:
+
+- **Encrypted Ex01.** EnCase can encrypt an Ex01, and the encryption is not
+  publicly documented.
+- **Ex01 compressed with bzip2.** The format allows it, EnCase does not appear to
+  offer it, and no sample exists to check a reader against.
+- **Logical evidence** (`.L01`, `.Lx01`). These hold files, not a disk image.
+
+It never writes.
 
 Two behaviours worth knowing:
 
@@ -97,6 +110,14 @@ Imager records it inaccurately: its four-segment set was written at compression
 0, holds stored chunks, and its header still says "fast". FTK Imager's E01 errs
 the other way, as described below. Read that line as what the image
 claims, not as a measurement.
+
+Ex01 is covered by two fixtures written by `ewfacquire -f encase7-v2` (libewf
+20260924; the libewf 20140817 that Homebrew installs writes an ordinary E01 when
+asked for Ex01), which between them hold all three chunk forms, and by a
+multi-segment set built by the test suite's own writer. A nine-segment set from
+libewf was also checked by hand. No Ex01 written by EnCase itself has been
+available, so Ex01 support rests on the EWF2 documentation and on libewf's writer
+until one is.
 
 **Against real evidence.** Physical acquisitions written by FTK Imager, from
 28.6 GiB to 238 GiB, including 15-segment sets. Decoded ranges are byte
@@ -149,7 +170,8 @@ nothing.
 
 ## Format reference
 
-Joachim Metz, *Expert Witness Compression Format (EWF)*, in the
+Joachim Metz, *Expert Witness Compression Format (EWF)* and *Expert Witness
+Compression Format 2 (EWF2)*, in the
 [libyal/libewf](https://github.com/libyal/libewf) repository under
 `documentation/`. The format is publicly documented, which is what makes an
 independent implementation possible.

@@ -184,3 +184,22 @@ def test_ftk_imager_fixtures_are_read_like_the_libewf_ones():
             assert len(img.paths) == len(variants[name]["files"]), name
     with ewfprobe.open_ewf(_first(variants["ftk-e01"])) as img:
         assert img.format == ewfprobe.FORMAT_E01
+
+
+def test_libewf_ex01_fixtures_read_as_ex01():
+    """Written by ewfacquire -f encase7-v2 from libewf 20260924. Between them the
+    two carry deflated, checksummed-stored and pattern-filled chunks."""
+    variants = dict(_variants())
+    seen = set()
+    for name in ("ex01-fast", "ex01-none"):
+        assert name in variants, f"the {name} fixture is missing"
+        with open(_first(variants[name]), "rb") as fh:
+            assert fh.read(8) == ewfprobe.SIGNATURE_V2, name
+        with ewfprobe.open_ewf(_first(variants[name])) as img:
+            assert img.format == ewfprobe.FORMAT_EX01, name
+            assert set(img.stored_hashes) == {"MD5", "SHA1"}, name
+            assert img.metadata.get("case_number") == "FIXTURE", name
+            for table in img._tables:
+                for k in range(len(table.entries) // 16):
+                    seen.add(ewfprobe._TABLE_V2_ENTRY.unpack_from(table.entries, 16 * k)[2])
+    assert {0x01, 0x02, 0x05} <= seen, seen

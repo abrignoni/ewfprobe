@@ -464,3 +464,252 @@ def test_segment_extension_sequences():
     assert s[0] == "s01" and s[98] == "s99" and s[99] == "saa"
     # after szz the first letter advances, as the E sequence does after EZZ
     assert s[99 + 675] == "szz" and s[99 + 676] == "taa" and s[-1] == "zzz"
+
+
+# ------------------------------------------------- EWF2-Ex01, spec-written
+
+def _serialized(tags, values):
+    text = "1\nmain\n" + "\t".join(tags) + "\n" + "\t".join(values) + "\n\n"
+    return zlib.compress(("﻿" + text).encode("utf-16-le"))
+
+
+def _v2_section(out, stype, payload, previous, flags=0):
+    """Write a section's data, then its 64-byte descriptor, which follows it."""
+    pad = -len(payload) % 16
+    out.write(payload + b"\x00" * pad)
+    here = out.tell()
+    head = struct.pack("<IIQQII", stype, flags, previous, len(payload) + pad, 64, pad)
+    head += b"\x00" * 16 + b"\x00" * 12
+    out.write(head + struct.pack("<I", zlib.adler32(head) & 0xFFFFFFFF))
+    return here
+
+
+def write_ex01(folder, stem, data, *, chunk_size=1024, sector_size=512,
+               chunks_per_segment=None, kinds=None, method=1, set_ids=None,
+               encrypted_section=None, keys_section=False, case_values=None):
+    """Write ``data`` as an EWF2-Ex01 set from the EWF2 documentation.
+
+    ``kinds`` chooses each chunk's form: "z" deflate, "c" stored with an Adler-32,
+    "p" pattern fill, "r" stored raw. By default a chunk of one repeated eight-byte
+    pattern is pattern-filled, others alternate between deflate and stored.
+    """
+    data = sector_padded(data, sector_size)
+    chunks = [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
+    per = chunks_per_segment or len(chunks)
+    groups = [chunks[i:i + per] for i in range(0, len(chunks), per)]
+    paths, number = [], 0
+    for index, group in enumerate(groups):
+        path = os.path.join(folder, f"{stem}.Ex{index + 1:02d}")
+        paths.append(path)
+        set_id = (set_ids[index] if set_ids else b"\x11" * 16)
+        with open(path, "wb") as out:
+            out.write(struct.pack("<8sBBHI16s", ewfprobe.SIGNATURE_V2, 2, 1, method,
+                                  index + 1, set_id))
+            prev = 0
+            prev = _v2_section(out, 1, _serialized(
+                ["sn", "md", "lb", "ts", "dt", "bp", "ph"],
+                ["", "Test drive", "", str(len(data) // sector_size), "f",
+                 str(sector_size), "1"]), prev)
+            tags = ["nm", "cn", "en", "ex", "nt", "av", "os", "tt", "at", "tb", "cp",
+                    "sb", "gr"]
+            values = case_values or ["ex01 test", "CASE-2", "EV-2", "Examiner", "",
+                                     "1.0", "Test OS", "1767225600", "1767225600",
+                                     str(len(chunks)), "1",
+                                     str(chunk_size // sector_size), "64"]
+            prev = _v2_section(out, 2, _serialized(tags, values), prev,
+                               flags=2 if encrypted_section == 2 else 0)
+            blob_start = out.tell()
+            blob, entries = bytearray(), []
+            for chunk in group:
+                kind = kinds[number] if kinds else None
+                if kind is None:
+                    if chunk[:8] * (len(chunk) // 8) == chunk:
+                        kind = "p"
+                    else:
+                        kind = "z" if number % 2 == 0 else "c"
+                if kind == "p":
+                    entries.append((struct.unpack("<Q", chunk[:8])[0], 0, 0x05))
+                elif kind == "z":
+                    packed = zlib.compress(chunk, 6)
+                    entries.append((blob_start + len(blob), len(packed), 0x01))
+                    blob += packed + b"\x00" * (-len(packed) % 16)
+                elif kind == "c":
+                    stored = chunk + struct.pack("<I", zlib.adler32(chunk) & 0xFFFFFFFF)
+                    entries.append((blob_start + len(blob), len(stored), 0x02))
+                    blob += stored + b"\x00" * (-len(stored) % 16)
+                else:
+                    entries.append((blob_start + len(blob), len(chunk), 0x00))
+                    blob += chunk + b"\x00" * (-len(chunk) % 16)
+                number += 1
+            prev = _v2_section(out, 3, bytes(blob), prev)
+            head = struct.pack("<QII", number - len(group), len(group), 0)
+            head += struct.pack("<I", zlib.adler32(head) & 0xFFFFFFFF) + b"\x00" * 12
+            body = b"".join(struct.pack("<QII", *e) for e in entries)
+            table = head + body + struct.pack("<I", zlib.adler32(body) & 0xFFFFFFFF)
+            prev = _v2_section(out, 4, table, prev)
+            if index == len(groups) - 1:
+                md5 = hashlib.md5(data).digest()
+                sha1 = hashlib.sha1(data).digest()
+                prev = _v2_section(out, 8, md5 + struct.pack(
+                    "<I", zlib.adler32(md5) & 0xFFFFFFFF), prev)
+                prev = _v2_section(out, 9, sha1 + struct.pack(
+                    "<I", zlib.adler32(sha1) & 0xFFFFFFFF), prev)
+                if keys_section:
+                    prev = _v2_section(out, 0x0B, b"\x00" * 32, prev)
+                _v2_section(out, 0x0F, b"", prev)
+            else:
+                _v2_section(out, 0x0D, b"", prev)
+    return paths
+
+
+def ex01_sample(n_chunks=8, chunk_size=1024):
+    """Deflatable, random and single-pattern chunks, so every chunk form occurs."""
+    rnd = random.Random(21)
+    out = bytearray()
+    for i in range(n_chunks):
+        if i % 4 == 3:
+            out += b"ABCDEFGH" * (chunk_size // 8)            # pattern fill
+        elif i % 2 == 0:
+            out += bytes([48 + i]) * (chunk_size // 2) + bytes(rnd.randrange(256)
+                                                             for _ in range(chunk_size // 2))
+        else:
+            out += bytes(rnd.randrange(256) for _ in range(chunk_size))
+    return bytes(out)
+
+
+def test_ex01_round_trip_across_segments(tmp_path):
+    data = ex01_sample(n_chunks=12)
+    paths = write_ex01(str(tmp_path), "img", data, chunks_per_segment=3)
+    assert [os.path.basename(p) for p in paths][:2] == ["img.Ex01", "img.Ex02"]
+    with ewfprobe.open_ewf(paths[1]) as img:            # any member opens the set
+        assert img.format == ewfprobe.FORMAT_EX01
+        assert len(img.paths) == len(paths)
+        assert img.read(len(data)) == data
+        result = img.verify()
+    assert result["stored"] == {"MD5": hashlib.md5(data).hexdigest(),
+                                "SHA1": hashlib.sha1(data).hexdigest()}
+    assert result["match"] is True and result["checksum_errors"] == []
+
+
+def test_ex01_every_chunk_form_reads(tmp_path):
+    data = ex01_sample(n_chunks=4)
+    path = write_ex01(str(tmp_path), "img", data, kinds=["z", "c", "r", "p"])[0]
+    with ewfprobe.open_ewf(path) as img:
+        flags = [ewfprobe._TABLE_V2_ENTRY.unpack_from(img._tables[0].entries, 16 * k)[2]
+                 for k in range(4)]
+        assert flags == [0x01, 0x02, 0x00, 0x05]
+        assert img.read(len(data)) == data
+
+
+def test_ex01_pattern_fill_comes_from_the_offset_field(tmp_path):
+    """A pattern-filled chunk has no data: the offset field is the pattern. A reader
+    that seeked to it would read the file header or nothing at all."""
+    data = b"12345678" * 128
+    path = write_ex01(str(tmp_path), "img", data, kinds=["p"])[0]
+    with ewfprobe.open_ewf(path) as img:
+        assert img.read() == data
+
+
+def test_ex01_metadata_and_geometry(tmp_path):
+    values = ["line one\x01line two", "CASE-2", "EV-2", "Examiner", "tab\x03here",
+              "1.0", "Test OS", "1767225600", "1767225601", "4", "1", "2", "64"]
+    path = write_ex01(str(tmp_path), "img", ex01_sample(n_chunks=4),
+                      case_values=values)[0]
+    with ewfprobe.open_ewf(path) as img:
+        assert (img.sector_size, img.sectors_per_chunk, img.chunk_size) == (512, 2, 1024)
+        assert img.media_type == "fixed"
+        assert img.compression_level == "deflate"
+        meta = img.metadata
+    assert meta["description"] == "line one\nline two"
+    assert meta["notes"] == "tab\there"
+    assert meta["case_number"] == "CASE-2"
+    assert meta["target_time"] == "1767225600" and meta["actual_time"] == "1767225601"
+    assert meta["drive_model"] == "Test drive"
+
+
+def test_ex01_checksum_mismatch_is_recorded(tmp_path):
+    data = ex01_sample(n_chunks=2)
+    path = write_ex01(str(tmp_path), "img", data, kinds=["c", "c"])[0]
+    raw = bytearray(open(path, "rb").read())
+    with ewfprobe.open_ewf(path) as img:
+        offset = ewfprobe._TABLE_V2_ENTRY.unpack_from(img._tables[0].entries, 0)[0]
+    raw[offset + 3] ^= 0xFF
+    open(path, "wb").write(bytes(raw))
+    with ewfprobe.open_ewf(path) as img:
+        img.read()
+        assert img.checksum_errors == [0]
+
+
+def test_an_incomplete_ex01_set_is_refused(tmp_path):
+    paths = write_ex01(str(tmp_path), "img", ex01_sample(n_chunks=9),
+                       chunks_per_segment=2)
+    os.remove(paths[-1])
+    with pytest.raises(ewfprobe.EwfIncompleteSetError, match="'next' section"):
+        ewfprobe.open_ewf(paths[0])
+
+
+def test_an_ex01_chunk_claiming_more_than_a_chunk_can_hold_is_refused(tmp_path):
+    """A table whose checksum is intact can still name an absurd size, and reading
+    it would pull that many bytes. The claim is refused instead."""
+    path = write_ex01(str(tmp_path), "img", ex01_sample(n_chunks=2), kinds=["z", "z"])[0]
+    with ewfprobe.open_ewf(path) as img:
+        entries = img._tables[0].entries
+    raw = bytearray(open(path, "rb").read())
+    at = bytes(raw).find(entries)
+    offset, _size, flags = ewfprobe._TABLE_V2_ENTRY.unpack_from(entries, 0)
+    forged = ewfprobe._TABLE_V2_ENTRY.pack(offset, 1 << 30, flags) + entries[16:]
+    raw[at:at + len(entries)] = forged
+    struct.pack_into("<I", raw, at + len(entries), zlib.adler32(forged) & 0xFFFFFFFF)
+    open(path, "wb").write(bytes(raw))
+    with ewfprobe.open_ewf(path) as img:
+        with pytest.raises(ewfprobe.EwfFormatError, match="more than a chunk"):
+            img.read(16)
+
+
+def test_ex01_segments_from_another_acquisition_are_refused(tmp_path):
+    paths = write_ex01(str(tmp_path), "img", ex01_sample(n_chunks=4),
+                       chunks_per_segment=2, set_ids=[b"\x11" * 16, b"\x22" * 16])
+    with pytest.raises(ewfprobe.EwfFormatError, match="different acquisition"):
+        ewfprobe.open_ewf(paths[0])
+
+
+@pytest.mark.parametrize("kwargs", [{"encrypted_section": 2}, {"keys_section": True}])
+def test_encrypted_ex01_is_refused(tmp_path, kwargs):
+    path = write_ex01(str(tmp_path), "img", ex01_sample(n_chunks=2), **kwargs)[0]
+    with pytest.raises(ewfprobe.EwfFormatError, match="encrypted"):
+        ewfprobe.open_ewf(path)
+
+
+def test_bzip2_ex01_is_refused(tmp_path):
+    path = write_ex01(str(tmp_path), "img", ex01_sample(n_chunks=2), method=2)[0]
+    with pytest.raises(ewfprobe.EwfFormatError, match="bzip2"):
+        ewfprobe.open_ewf(path)
+
+
+def test_a_corrupt_ex01_chunk_table_is_refused(tmp_path):
+    path = write_ex01(str(tmp_path), "img", ex01_sample(n_chunks=4))[0]
+    with ewfprobe.open_ewf(path) as img:
+        entries = img._tables[0].entries
+    raw = bytearray(open(path, "rb").read())
+    at = bytes(raw).find(entries)
+    raw[at + 9] ^= 0x40                                  # a chunk size byte
+    open(path, "wb").write(bytes(raw))
+    with pytest.raises(ewfprobe.EwfFormatError, match="checksum"):
+        ewfprobe.open_ewf(path)
+
+
+def test_logical_evidence_is_named_not_misread(tmp_path):
+    for name, magic in (("x.L01", b"LVF\x09\x0d\x0a\xff\x00"),
+                        ("y.Lx01", b"LEF2\r\n\x81\x00")):
+        (tmp_path / name).write_bytes(magic + b"\x00" * 120)
+        with pytest.raises(ewfprobe.EwfFormatError, match="logical evidence"):
+            ewfprobe.open_ewf(str(tmp_path / name), segments=[str(tmp_path / name)])
+
+
+def test_ex01_extension_sequence_and_detection(tmp_path):
+    seq = list(ewfprobe._extension_sequence_v2())
+    assert seq[0] == "Ex01" and seq[98] == "Ex99" and seq[99] == "ExAA"
+    assert seq[99 + 676] == "EyAA" and seq[-1] == "EzZZ"
+    assert ewfprobe._family("Ex01") == "Ex" and ewfprobe._family("EXA") == "E"
+    path = write_ex01(str(tmp_path), "img", ex01_sample(n_chunks=2))[0]
+    assert ewfprobe.is_ewf(path) is True

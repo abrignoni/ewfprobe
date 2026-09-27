@@ -127,6 +127,26 @@
         "ftk-e01.E01"
       ],
       "writer": "FTK Imager 4.7.3.61"
+    },
+    "ex01-fast": {
+      "format": "encase7-v2",
+      "compression": "fast",
+      "sectors_per_chunk": 64,
+      "segment_size": null,
+      "files": [
+        "ex01-fast.Ex01"
+      ],
+      "writer": "ewfacquire 20260924"
+    },
+    "ex01-none": {
+      "format": "encase7-v2",
+      "compression": "none",
+      "sectors_per_chunk": 64,
+      "segment_size": null,
+      "files": [
+        "ex01-none.Ex01"
+      ],
+      "writer": "ewfacquire 20260924"
     }
   }
 }
