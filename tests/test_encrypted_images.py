@@ -184,14 +184,27 @@ def test_keys_that_unwrap_without_their_end_mark_are_a_wrong_password(tmp_path):
         ewfprobe.open_ewf(path, password=PASSWORD)
 
 
-def test_an_image_opened_by_a_certificate_or_keybag_is_refused_by_name(tmp_path):
-    for kind, word in ((2, "certificate"), (3, "keybag")):
-        path = tmp_path / f"k{kind}.dmg"
-        head = HEADER.pack(b"encrcdsa", 2, 16, 5, 0x80000001, 128, 0x5B, 160, bytes(16),
-                           512, 512, 4096, 1) + ITEM.pack(kind, 96, 64) + bytes(64)
-        path.write_bytes(head.ljust(4096, b"\0") + bytes(512))
-        with pytest.raises(ewfprobe.EwfFormatError, match=f"{word}, not a password"):
-            ewfprobe.open_ewf(str(path), password=PASSWORD)
+def _unreadable_item_image(tmp_path, kind):
+    path = tmp_path / f"k{kind}.dmg"
+    head = HEADER.pack(b"encrcdsa", 2, 16, 5, 0x80000001, 128, 0x5B, 160, bytes(16),
+                       512, 512, 4096, 1) + ITEM.pack(kind, 96, 564) + bytes(564)
+    path.write_bytes(head.ljust(4096, b"\0") + bytes(512))
+    return str(path)
+
+
+def test_a_keybag_image_is_refused(tmp_path):
+    with pytest.raises(ewfprobe.EwfFormatError,
+                       match="keybag, not a password or a certificate"):
+        ewfprobe.open_ewf(_unreadable_item_image(tmp_path, 3), password=PASSWORD)
+
+
+@needs_crypto
+def test_a_certificate_image_asks_for_its_private_key_not_a_password(tmp_path):
+    # a password does not open an image sealed only to a certificate: it asks for
+    # the certificate's private key instead of another password
+    with pytest.raises(ewfprobe.EwfPasswordRequiredError) as caught:
+        ewfprobe.open_ewf(_unreadable_item_image(tmp_path, 2), password=PASSWORD)
+    assert caught.value.needs == "private key"
 
 
 def test_a_header_ewfprobe_does_not_read_is_refused(tmp_path):

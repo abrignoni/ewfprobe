@@ -30,9 +30,10 @@ ewfprobe, built as a standalone executable
                       with --password-file FILE (the first line of FILE)
                       or --password-env NAME (an environment variable).
                       An encrypted AFF opens with its passphrase the same
-                      way, or, when it is sealed to a certificate, with
-                      --private-key FILE (the certificate's RSA private
-                      key, unencrypted, as PEM or DER).
+                      way. An encrypted AFF or Apple disk image sealed to a
+                      certificate opens with --private-key FILE (the
+                      certificate's RSA private key, unencrypted, as PEM
+                      or DER).
 
   SHA256SUMS.txt      the hash of the executable as built. Check it with
                           certutil -hashfile ewfprobe.exe SHA256     (Windows)

@@ -629,5 +629,85 @@
         "header_lost": true
       }
     }
+  },
+  "certificate_dmg": {
+    "writer": "hdiutil, macOS 26.6.2",
+    "disks": {
+      "small": {
+        "sha256": "2d0eae247eef9f48fa16666ee549724f54ef6538933b0eb2828cc6d3e95a8a17",
+        "size": 196608
+      },
+      "banded": {
+        "sha256": "34da288883b19cd673922b2674d8a25faf1d07e7dbd4335240718c1c7044ea3a",
+        "size": 2129920
+      }
+    },
+    "keys": {
+      "2048": {
+        "key": "dmg-cert-test-key-2048.pem",
+        "certificate": "dmg-cert-test-cert-2048.cer"
+      },
+      "4096": {
+        "key": "dmg-cert-test-key-4096.pem",
+        "certificate": "dmg-cert-test-cert-4096.cer"
+      }
+    },
+    "variants": {
+      "dmg-cert-udzo-aes128": {
+        "format": "udif",
+        "hdiutil_format": "UDZO",
+        "encryption": "AES-128",
+        "password": "ewfprobe-test-password",
+        "key_bits": 2048,
+        "disk": "small",
+        "checked_by": "ewfprobe with the key and with the password",
+        "files": [
+          "dmg-cert-udzo-aes128.dmg"
+        ]
+      },
+      "dmg-cert-only-udzo-aes256": {
+        "format": "udif",
+        "hdiutil_format": "UDZO",
+        "encryption": "AES-256",
+        "password": null,
+        "key_bits": 2048,
+        "disk": "small",
+        "checked_by": "ewfprobe with the key",
+        "files": [
+          "dmg-cert-only-udzo-aes256.dmg"
+        ]
+      },
+      "dmg-cert4096-sparse-aes256": {
+        "format": "sparseimage",
+        "hdiutil_format": "UDSP",
+        "encryption": "AES-256",
+        "password": "ewfprobe-test-password",
+        "key_bits": 4096,
+        "disk": "small",
+        "checked_by": "ewfprobe with the key and with the password",
+        "files": [
+          "dmg-cert4096-sparse-aes256.sparseimage"
+        ]
+      },
+      "dmg-cert-only-sparsebundle-aes128": {
+        "format": "sparsebundle",
+        "hdiutil_format": "UDSB",
+        "encryption": "AES-128",
+        "password": null,
+        "key_bits": 2048,
+        "disk": "banded",
+        "trimmed": "band file 0 (all zeros) removed and band file 1 cut to 32 KiB after writing",
+        "checked_by": "ewfprobe with the key",
+        "files": [
+          "dmg-cert-only-sparsebundle-aes128.sparsebundle/Info.bckup",
+          "dmg-cert-only-sparsebundle-aes128.sparsebundle/Info.plist",
+          "dmg-cert-only-sparsebundle-aes128.sparsebundle/bands/1",
+          "dmg-cert-only-sparsebundle-aes128.sparsebundle/bands/2",
+          "dmg-cert-only-sparsebundle-aes128.sparsebundle/lock",
+          "dmg-cert-only-sparsebundle-aes128.sparsebundle/token"
+        ],
+        "image": "dmg-cert-only-sparsebundle-aes128.sparsebundle"
+      }
+    }
   }
 }
