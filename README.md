@@ -1,6 +1,6 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`, `.afd`) forensic images, Apple disk images (`.dmg`, `.sparseimage`), and EnCase logical evidence (`.L01`). One file, pure
+A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`, `.afd`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.sparsebundle`), and EnCase logical evidence (`.L01`). One file, pure
 Python, standard library only. No compiler, no network, nothing to install (an
 LZFSE-compressed `.dmg` alone needs the optional `pyliblzfse` package).
 
@@ -144,7 +144,8 @@ specification describes. None of the tested files sets them, so that part rests 
 the specification alone.
 
 Reads Apple disk images: UDIF (`.dmg`), the format `hdiutil` writes and macOS
-acquisition tools deliver, and sparse images (`.sparseimage`). Fuji, the open-source
+acquisition tools deliver, including one `hdiutil segment` split into `.dmgpart`
+files, sparse images (`.sparseimage`) and sparse bundles (`.sparsebundle`). Fuji, the open-source
 macOS acquisition tool, copies the files into a sparse image and then converts it
 with `hdiutil convert -format UDZO` (`acquisition/abstract.py`, line 405 at
 [`d9cf00f`](https://github.com/Lazza/Fuji/blob/d9cf00f913970204fd75b94440206f9e6f09906d/acquisition/abstract.py#L405)),
@@ -160,6 +161,8 @@ method writes a zip instead.
 | ULFO | LZFSE | the optional `pyliblzfse` package; without it the image is refused, saying so |
 | UDRO, UFBI | stored, not compressed | this file |
 | UDSP (`.sparseimage`) | 1 MiB bands, stored in the order they were written | this file |
+| UDSB (`.sparsebundle`) | a folder of band files, 8 MiB by default | this file |
+| any of the UDIF formats, split by `hdiutil segment` | a `.dmg` and `.dmgpart` files | this file |
 
 A UDIF image is recognised by the 512-byte `koly` trailer at the end of the file, not
 by its name. An uncompressed read-write image (UDRW) and a `.cdr` have no trailer:
@@ -174,6 +177,34 @@ stores. None of them is a hash of the disk as a whole, since runs that were neve
 written are left out, so `verify` prints the disk's MD5 and SHA-1 with "none stored"
 beside them.
 
+A chunk sits at its block table's data offset plus the offset its entry records.
+`hdiutil convert` writes a data offset of 0 and full offsets in the entries, while
+`hdiutil segment` writes each table's own base there and entry offsets relative to
+it, even when the image stays in one file. ewfprobe 0.3.0 read the entry offset
+alone. It refused the images `hdiutil segment` wrote, with a decompression error, and
+on a constructed image whose chunks all decompress to the same length it returned the
+wrong chunks' bytes for 24 of its 32 sectors without an error.
+
+A segmented image is opened from its `.dmg`. Measured on images `hdiutil segment`
+wrote: every segment ends in its own trailer, which records one identifier shared by
+the whole set, the number of segments, the segment's own number, and where its data
+starts in the data of the whole set. Only the first segment holds the block tables,
+and the segments' data laid end to end is byte for byte the data of the same image
+kept in one file, so a chunk can run from one segment into the next. ewfprobe finds
+the other segments among the `.dmgpart` files in the same folder by that identifier
+and number, not by their names, and `verify` checks each segment's own data checksum.
+
+A sparse bundle is a folder, opened as the folder: `Info.plist` gives the band size
+and the disk's size in bytes, and `bands/` holds the bands, each named by its number
+in lowercase hexadecimal. Measured on bundles `hdiutil` wrote: a band with no file
+reads as zeros, a band file shorter than a band reads as zeros past its end (a
+bundle that grew keeps its old last band short in the middle of the disk), and a band
+size need not be a whole number of MiB. `hdiutil attach` reads only a band's first
+band-size bytes and ignores band files numbered past the disk's end; ewfprobe does
+the same, and `info` lists any such files and anything else in `bands/`. A sparse
+bundle records no checksum, so `verify` prints the disk's hashes with nothing to
+compare.
+
 A sparse image longer than about a gigabyte of written bands carries more than one
 header. Measured on images `hdiutil` wrote, beyond what the format documentation
 covers: the first header holds 1,008 band slots, and once they are used it names a
@@ -183,10 +214,10 @@ slots from offset 56 and names the next one at offset 12. The disk's sector coun
 0 on a 2 TiB image.
 
 `open_image()` is the same function as `open_ewf()`. `is_image()` is true for the
-disk images ewfprobe reads (EWF, EWF2, AFF, an AFD directory, UDIF and sparse
-images), `is_logical_evidence()` for an L01, `is_ewf()` for EWF alone, and
-`apple_image_kind()` names an Apple disk image as `UDIF`, `SPARSEIMAGE` or
-`ENCRYPTED`.
+disk images ewfprobe reads (EWF, EWF2, AFF, an AFD directory, UDIF, sparse images and
+sparse bundle folders), `is_logical_evidence()` for an L01, `is_ewf()` for EWF alone,
+and `apple_image_kind()` names an Apple disk image as `UDIF`, `SPARSEIMAGE`,
+`SPARSEBUNDLE` or `ENCRYPTED`.
 
 Refused with a message naming the reason rather than read wrongly:
 
@@ -208,14 +239,18 @@ Refused with a message naming the reason rather than read wrongly:
   a hash, the page size, the sector size or the bad-sector marker.
 - **AFM**, AFF metadata kept beside the image as split raw files (`.000`, `.001`
   and on).
-- **An encrypted Apple disk image** (`encrcdsa`): it needs its password.
-- **A segmented `.dmg`** (with `.dmgpart` files), **a sparse bundle**
-  (`.sparsebundle`, a folder of bands), **an older `.dmg` whose block tables are only
-  in a resource fork**, and **a sparse image of a version other than 3**. Join a
-  segmented image with `hdiutil convert` first.
+- **An encrypted Apple disk image** (`encrcdsa`), and **an encrypted sparse bundle**
+  (its `token` file holds the same header): they need their password.
+- **An older `.dmg` whose block tables are only in a resource fork**, **a sparse image
+  of a version other than 3**, and **a sparse bundle of a backing-store version other
+  than 1**.
 - **A `.dmg` whose block tables leave a gap or overlap, name a chunk type other
   than the ones above, or point outside the stored data**, and **a `.dmg` or sparse
   image cut short**.
+- **A segmented `.dmg` with a segment missing**, two files claiming the same segment,
+  or segments that disagree about the set, and **a `.dmgpart` opened on its own**,
+  which names the `.dmg` to open instead. **A sparse bundle without its `bands`
+  folder**, which would otherwise read as an empty disk.
 
 It never writes.
 
@@ -333,6 +368,20 @@ records, 512 sampled windows across the disk matched its raw device the same way
 a walk of its APFS container through qnxprobe listed the same paths and file sizes as
 macOS's own read-only mount of the image.
 
+**Segmented images and sparse bundles, against `hdiutil attach`.** 36 images `hdiutil`
+wrote from HFS+ and APFS test disks read byte for byte the same as the same image
+attached read-only and read from its raw device: each of UDZO, UDBZ, ULMO, ULFO, UDCO
+and UDRO split by `hdiutil segment` at 700k and 3m (9 to 58 files) and left in one file
+with the base offsets `segment` writes, the plain conversions, and nine sparse bundles,
+among them bands of 1,536,000 bytes, a bundle grown after it was written, an APFS one
+shrunk, and one given both a band file longer than a band and a band file numbered past
+the disk's end. Every checksum the `.dmg` images record verified. The
+committed fixtures cover a segmented UDZO image and a sparse bundle of the shared
+source, and segmented images of a small GPT disk whose block tables carry base
+offsets. The private sample above, converted by `hdiutil` into a sparse bundle and
+split by `hdiutil segment` into 2 GB parts, read to the same SHA-256 across the whole
+disk in both forms as the original `.dmg` does.
+
 ## Standalone executables
 
 Each release carries `ewfprobe` built as a single executable with PyInstaller on
@@ -370,6 +419,8 @@ EWFACQUIRE=/path/to/ewfacquire python tools/make_fixtures.py tests/fixtures --ad
 ```
 
 The Apple disk image variants (`dmg-*`) are written by `hdiutil`, so on macOS only.
+`--add dmg-gpt` rebuilds the segmented images of a small GPT disk, which carry the
+block-table base offsets the unpartitioned source cannot.
 The LZFSE one is skipped where `pyliblzfse` is not installed; set
 `EWFPROBE_REQUIRE_LZFSE=1` to make that a failure instead, as the CI jobs that
 install it do.
@@ -399,14 +450,25 @@ No AFFLIB code is copied.
 For Apple disk images: Joachim Metz, *Mac OS disk image types*, in the
 [libyal/libmodi](https://github.com/libyal/libmodi) repository under `documentation/`,
 and the block-table rules libmodi's own code applies (contiguous tables and entries,
-compressed chunks of at most 2048 sectors, chunk data offsets counted from the start of
-the file, unknown chunk types refused), in `libmodi/libmodi_handle.c`, both at commit
+compressed chunks of at most 2048 sectors, unknown chunk types refused), in
+`libmodi/libmodi_handle.c`, both at commit
 [`8fc5088`](https://github.com/libyal/libmodi/blob/8fc5088e51cd606d9f2b8ce000bfdf5a78042f84/libmodi/libmodi_handle.c).
+libmodi reads a block table's data offset only to print it. The chunk position, that
+offset plus the entry's, follows libdmg-hfsplus, which seeks to `dataStart + compOffset`
+([`dmg/io.c`, line 166 at `7ac55ec`](https://github.com/planetbeing/libdmg-hfsplus/blob/7ac55ec64c96f7800d9818ce64c79670e7f02b67/dmg/io.c#L166)),
+and 7-Zip, which reads the same offset as `StartPackPos`
+([`DmgHandler.cpp`, line 658 at `0766b73`](https://github.com/ip7z/7zip/blob/0766b733fe3e06dd2a7f9a3cfbf2108ac73abd17/CPP/7zip/Archive/DmgHandler.cpp#L658))
+and adds it at
+[line 1909](https://github.com/ip7z/7zip/blob/0766b733fe3e06dd2a7f9a3cfbf2108ac73abd17/CPP/7zip/Archive/DmgHandler.cpp#L1909).
+7-Zip also adds the trailer's data fork offset; every image measured had 0 there, so
+that difference is not exercised. No code from either is copied.
 ADC follows Joachim Metz, *ADC compressed data format*, in
 [libyal/libfmos](https://github.com/libyal/libfmos) at commit
 [`3396edf`](https://github.com/libyal/libfmos/blob/3396edfc19d172795971c00a2e848d8146cf7523/documentation/ADC%20compressed%20data%20format.asciidoc).
-The checksum rules and the sparse image's continuation headers and 64-bit sector count
-were measured on images `hdiutil` wrote, as described above. No libmodi code is copied.
+The sparse bundle layout follows the same libmodi documentation. The checksum rules,
+the sparse image's continuation headers and 64-bit sector count, the layout of a
+segmented image, and how `hdiutil attach` treats short, long and extra band files were
+measured on images `hdiutil` wrote, as described above. No libmodi code is copied.
 
 ## License
 

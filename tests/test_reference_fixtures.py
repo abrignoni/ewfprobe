@@ -16,7 +16,9 @@ The content is generated, not evidence.
 import hashlib
 import json
 import os
+import plistlib
 import shutil
+import struct
 import sys
 
 import pytest
@@ -353,20 +355,48 @@ def test_apple_disk_images_read_as_hdiutil_wrote_them():
             continue
         seen.add(fmt)
         with ewfprobe.open_ewf(_first(variant)) as img:
-            if fmt == "UDSP":
-                assert img.format == ewfprobe.FORMAT_SPARSEIMAGE, name
+            if fmt in ("UDSP", "UDSB"):
+                assert img.format == {"UDSP": ewfprobe.FORMAT_SPARSEIMAGE,
+                                      "UDSB": ewfprobe.FORMAT_SPARSEBUNDLE}[fmt], name
                 assert img.verify()["container_checks"] == [], name
                 continue
             assert img.format == ewfprobe.FORMAT_UDIF, name
             assert img.compression_level == codecs[fmt], name
+            files = [os.path.basename(p) for p in img.paths]
             checks = img.verify()["container_checks"]
+        assert files == variant["files"], name
         kinds = [c["what"] for c in checks]
-        assert kinds[0] == "data" and kinds[-1] == "master", name
+        data = ["data"] if len(files) == 1 else [f"data of {f}" for f in files]
+        assert kinds[:len(data)] == data and kinds[-1] == "master", name
         assert len(kinds) >= 3, name
         assert all(c["match"] for c in checks), (name, [c for c in checks if not c["match"]])
         expected = "MD5" if fmt == "UFBI" else "CRC32"
         assert {c["algorithm"] for c in checks} == {expected}, name
-    expected_formats = set(codecs) | {"UDSP"}
+    expected_formats = set(codecs) | {"UDSP", "UDSB"}
     if ewfprobe.liblzfse is None and not _LZFSE_REQUIRED:
         expected_formats.discard("ULFO")
     assert seen == expected_formats
+
+
+def test_segmented_images_hdiutil_wrote_from_a_gpt_disk():
+    """hdiutil segment wrote these from a small GPT disk, whose SHA-256 the manifest
+    records. That disk gives the image several block tables, and segment writes
+    each table's own base as its data offset with entry offsets relative to it, so
+    these are the images that fail when that offset is ignored."""
+    gpt = _manifest().get("gpt_dmg")
+    assert gpt, "the GPT disk images are missing from the manifest"
+    for name, variant in sorted(gpt["variants"].items()):
+        first = os.path.join(FIXTURES, variant["files"][0])
+        with open(first, "rb") as fh:
+            raw = fh.read()
+        xml_offset, xml_size = struct.unpack_from(">QQ", raw[-512:], 216)
+        tables = plistlib.loads(raw[xml_offset:xml_offset + xml_size])
+        bases = [struct.unpack_from(">Q", t["Data"], 24)[0]
+                 for t in tables["resource-fork"]["blkx"]]
+        assert len(bases) > 1 and any(bases), (name, bases)
+        with ewfprobe.open_ewf(first) as img:
+            assert [os.path.basename(p) for p in img.paths] == variant["files"], name
+            assert img.media_size == gpt["size"], name
+            assert _media_sha(img) == gpt["sha256"], name
+            checks = img.verify()["container_checks"]
+        assert checks and all(c["match"] for c in checks), name

@@ -26,6 +26,10 @@ hand in another tool (FTK Imager, from the same source image) and copied in.
 ``--add`` leaves them alone; ``--small`` rebuilds the manifest from scratch and
 would drop them, so re-add them afterwards from the tool that wrote them.
 
+The manifest's ``gpt_dmg`` section describes images hdiutil segment wrote from
+a small GPT disk of their own (``--add dmg-gpt`` rebuilds them); its known answer
+is that disk's SHA-256.
+
 The manifest's ``logical`` section describes an L01 EnCase wrote, copied from
 Digital Corpora with known answers taken from libewf's ewfexport. It has its own
 source rather than this tool's, so both modes keep that section as it is.
@@ -58,19 +62,34 @@ HDIUTIL = os.environ.get("HDIUTIL", "hdiutil")
 
 # Apple disk image variants, written by hdiutil (so macOS only) from the same
 # source. Between them they cover every chunk codec a UDIF image can use, stored
-# chunks with and without compression, and a sparse image. ULFO needs the optional
+# chunks with and without compression, a sparse image, a sparse bundle, and the
+# UDZO image split by hdiutil segment into .dmgpart files. ULFO needs the optional
 # pyliblzfse package to read, and the tests skip it where that is absent.
 DMG_VARIANTS = [
-    # name,         hdiutil format
-    ("dmg-udzo",    "UDZO"),        # zlib
-    ("dmg-udbz",    "UDBZ"),        # bzip2
-    ("dmg-ulmo",    "ULMO"),        # LZMA
-    ("dmg-ulfo",    "ULFO"),        # LZFSE
-    ("dmg-udco",    "UDCO"),        # ADC
-    ("dmg-udro",    "UDRO"),        # stored, with unstored runs left out
-    ("dmg-ufbi",    "UFBI"),        # stored whole, MD5 checksums
-    ("dmg-sparse",  "UDSP"),        # a .sparseimage
+    # name,              hdiutil format
+    ("dmg-udzo",         "UDZO"),        # zlib
+    ("dmg-udbz",         "UDBZ"),        # bzip2
+    ("dmg-ulmo",         "ULMO"),        # LZMA
+    ("dmg-ulfo",         "ULFO"),        # LZFSE
+    ("dmg-udco",         "UDCO"),        # ADC
+    ("dmg-udro",         "UDRO"),        # stored, with unstored runs left out
+    ("dmg-ufbi",         "UFBI"),        # stored whole, MD5 checksums
+    ("dmg-sparse",       "UDSP"),        # a .sparseimage
+    ("dmg-sparsebundle", "UDSB"),        # a .sparsebundle of 1 MiB bands
+    ("dmg-segmented",    "UDZO/40k"),    # hdiutil segment: three files
 ]
+
+# The shared source has no partition map, so hdiutil gives each of those images
+# one block table. hdiutil segment writes each table's own base as its data offset
+# and entry offsets relative to it, which only shows with several tables, so these
+# come from a small GPT disk of their own. Their known answer is that disk's
+# SHA-256: a UDRW image is the disk's bytes with nothing added.
+GPT_DMG_VARIANTS = [
+    # name,                 segment size
+    ("dmg-gpt-segmented",   "40k"),      # several .dmgpart files
+    ("dmg-gpt-segment-one", "100m"),     # hdiutil segment, still one file
+]
+_DMG_SUFFIX = {"UDSP": ".sparseimage", "UDSB": ".sparsebundle"}
 
 # AFF variants, written by affconvert from AFFLIB. A 64 KiB page (the default is
 # 16 MiB) gives the 3 MiB source 48 pages, so zero pages, deflated pages, LZMA
@@ -247,26 +266,94 @@ def acquire_aff(raw_path, out_dir, name, options):
     return target, files
 
 
-def acquire_dmg(raw_path, out_dir, name, fmt):
-    """One Apple disk image variant, as the list of files written. hdiutil takes a
-    raw disk image only under a name it recognises, so the source is copied to a
-    .img beside it first and removed afterwards."""
-    target = name + (".sparseimage" if fmt == "UDSP" else ".dmg")
-    stale = os.path.join(out_dir, target)
-    if os.path.exists(stale):
-        os.remove(stale)
-    source = os.path.join(out_dir, name + "-source.img")
-    shutil.copyfile(raw_path, source)
-    try:
-        result = subprocess.run(
-            [HDIUTIL, "convert", "-quiet", os.path.basename(source), "-format", fmt,
-             "-o", target], cwd=out_dir, capture_output=True, text=True, check=False)
-    finally:
-        os.remove(source)
-    if result.returncode != 0 or not os.path.exists(stale):
+def _hdiutil(out_dir, name, *args):
+    result = subprocess.run([HDIUTIL, *args], cwd=out_dir, capture_output=True,
+                            text=True, check=False)
+    if result.returncode != 0:
         raise SystemExit(f"hdiutil failed for {name}:\n{result.stdout}\n{result.stderr}")
-    os.chmod(stale, 0o644)
-    return [target]
+
+
+def acquire_dmg(raw_path, out_dir, name, fmt):
+    """One Apple disk image variant, as (the path to open, the files written).
+    hdiutil takes a raw disk image only under a name it recognises, so the source is
+    copied to a .img beside it first and removed afterwards. A "FORMAT/SIZE" variant
+    is converted to FORMAT and then passed through hdiutil segment with that segment
+    size."""
+    fmt, _slash, segment = fmt.partition("/")
+    target = name + _DMG_SUFFIX.get(fmt, ".dmg")
+    stem = os.path.join(out_dir, name)
+    for stale in [os.path.join(out_dir, target)] + [
+            os.path.join(out_dir, f) for f in os.listdir(out_dir)
+            if f.startswith(name + ".") and f.endswith(".dmgpart")]:
+        if os.path.isdir(stale):
+            shutil.rmtree(stale)
+        elif os.path.exists(stale):
+            os.remove(stale)
+    source = stem + "-source.img"
+    shutil.copyfile(raw_path, source)
+    whole = stem + "-whole.dmg"
+    try:
+        options = ["-imagekey", "sparse-band-size=2048"] if fmt == "UDSB" else []
+        _hdiutil(out_dir, name, "convert", "-quiet", os.path.basename(source), "-format",
+                 fmt, *options, "-o", os.path.basename(whole) if segment else target)
+        if segment:
+            _hdiutil(out_dir, name, "segment", "-quiet", "-segmentSize", segment, "-o",
+                     name, os.path.basename(whole))
+    finally:
+        for temp in (source, whole):
+            if os.path.exists(temp):
+                os.remove(temp)
+    if fmt == "UDSB":
+        base = os.path.join(out_dir, target)
+        made = sorted(os.path.relpath(os.path.join(d, f), out_dir)
+                      for d, _dirs, files in os.walk(base) for f in files)
+    else:
+        made = [target] + sorted(
+            (f for f in os.listdir(out_dir)
+             if f.startswith(name + ".") and f.endswith(".dmgpart")),
+            key=lambda f: int(f.split(".")[-2]))
+    for f in made:
+        os.chmod(os.path.join(out_dir, f), 0o644)
+    return target, [f.replace(os.sep, "/") for f in made]
+
+
+def build_gpt_dmgs(out_dir):
+    """The GPT disk and its hdiutil segment images, as the manifest section."""
+    work = os.path.join(out_dir, "gpt-work")
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(os.path.join(work, "files"))
+    r = random.Random(20260927)
+    for i in range(6):                  # generated content, some of it incompressible
+        with open(os.path.join(work, "files", f"file-{i}.bin"), "wb") as fh:
+            fh.write(r.randbytes(30000) + bytes(20000))
+    try:
+        _hdiutil(work, "gpt", "create", "-quiet", "-srcfolder", "files", "-fs", "HFS+",
+                 "-layout", "GPTSPUD", "-volname", "GPTFIX", "-format", "UDRW",
+                 "disk.dmg")
+        with open(os.path.join(work, "disk.dmg"), "rb") as fh:
+            disk = fh.read()
+        _hdiutil(work, "gpt", "convert", "-quiet", "disk.dmg", "-format", "UDZO", "-o",
+                 "whole.dmg")
+        section = {"sha256": hashlib.sha256(disk).hexdigest(), "size": len(disk),
+                   "writer": hdiutil_version(), "variants": {}}
+        for name, size in GPT_DMG_VARIANTS:
+            for stale in os.listdir(out_dir):
+                if stale == name + ".dmg" or (stale.startswith(name + ".")
+                                              and stale.endswith(".dmgpart")):
+                    os.remove(os.path.join(out_dir, stale))
+            _hdiutil(out_dir, name, "segment", "-quiet", "-segmentSize", size, "-o", name,
+                     os.path.join(work, "whole.dmg"))
+            made = [name + ".dmg"] + sorted(
+                (f for f in os.listdir(out_dir)
+                 if f.startswith(name + ".") and f.endswith(".dmgpart")),
+                key=lambda f: int(f.split(".")[-2]))
+            for f in made:
+                os.chmod(os.path.join(out_dir, f), 0o644)
+            section["variants"][name] = {"files": made, "hdiutil_format": "UDZO",
+                                         "hdiutil_segment_size": size}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return section
 
 
 def hdiutil_version():
@@ -326,10 +413,12 @@ def main(argv):
     os.makedirs(out, exist_ok=True)
     aff_known = dict(AFF_VARIANTS)
     dmg_known = dict(DMG_VARIANTS)
+    gpt_wanted = not add or "dmg-gpt" in args[1:]
+    args = [a for a in args if a != "dmg-gpt"] if add else args
     ewf_wanted = not add or any(a not in aff_known and a not in dmg_known for a in args[1:])
     aff_wanted = not add or any(a in aff_known for a in args[1:])
     dmg_wanted = not add or any(a in dmg_known for a in args[1:])
-    if dmg_wanted and not shutil.which(HDIUTIL):
+    if (dmg_wanted or gpt_wanted) and not shutil.which(HDIUTIL):
         raise SystemExit(f"{HDIUTIL} not found; the Apple disk image variants are written "
                          f"on macOS (test tool only)")
     if ewf_wanted and not shutil.which(EWFACQUIRE):
@@ -391,17 +480,27 @@ def main(argv):
 
     dmg_writer = hdiutil_version() if chosen_dmg else None
     for name, fmt in chosen_dmg:
-        made = acquire_dmg(raw_path, out, name, fmt)
+        image, made = acquire_dmg(raw_path, out, name, fmt)
+        base_fmt, _slash, segment = fmt.partition("/")
         manifest["variants"][name] = {
-            "format": "sparseimage" if fmt == "UDSP" else "udif", "hdiutil_format": fmt,
-            "files": made, "writer": dmg_writer,
+            "format": {"UDSP": "sparseimage", "UDSB": "sparsebundle"}.get(base_fmt, "udif"),
+            "hdiutil_format": base_fmt, "files": made, "writer": dmg_writer,
             # UDIF records checksums of its own data, not a hash of the disk
             "stores_no_hash": True,
         }
+        if segment:
+            manifest["variants"][name]["hdiutil_segment_size"] = segment
+        if image != made[0]:
+            manifest["variants"][name]["image"] = image
         if fmt == "ULFO":
             manifest["variants"][name]["needs"] = "liblzfse"
         size = sum(os.path.getsize(os.path.join(out, f)) for f in made)
         print(f"  {name:<20} {fmt:<9} {size:>10,} bytes")
+
+    if gpt_wanted:
+        manifest["gpt_dmg"] = build_gpt_dmgs(out)
+        print(f"  gpt disk             {manifest['gpt_dmg']['size']:,} bytes, "
+              f"{len(manifest['gpt_dmg']['variants'])} segmented images")
 
     if add:
         os.remove(raw_path)

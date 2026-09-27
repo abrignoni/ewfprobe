@@ -11,12 +11,14 @@ ewfprobe, built as a standalone executable
                           ewfprobe --help
                       On Windows write ewfprobe.exe; on macOS and Linux write
                       ./ewfprobe from this folder. It reads .E01, .s01, .Ex01,
-                      .aff and .afd disk images, Apple .dmg and .sparseimage
-                      disk images, and the files in an .L01. For a split set,
-                      keep every segment (.E01, .E02, ...) in one folder and
-                      name the first. An LZFSE-compressed .dmg needs the
-                      Python package pyliblzfse, which this executable does
-                      not include; run python3 ewfprobe.py with it installed.
+                      .aff and .afd disk images, Apple .dmg, .sparseimage and
+                      .sparsebundle disk images, and the files in an .L01. For
+                      a split set, keep every segment (.E01, .E02, ..., or a
+                      .dmg and its .dmgpart files) in one folder and name the
+                      first. Name a .sparsebundle folder itself. An
+                      LZFSE-compressed .dmg needs the Python package
+                      pyliblzfse, which this executable does not include;
+                      run python3 ewfprobe.py with it installed.
 
   SHA256SUMS.txt      the hash of the executable as built. Check it with
                           certutil -hashfile ewfprobe.exe SHA256     (Windows)

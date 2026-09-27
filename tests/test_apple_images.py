@@ -36,10 +36,17 @@ def _checksum(value):
 
 
 def write_udif(path, data, *, chunks=None, tables=None, segment=(1, 1), xml=True,
-               trailer_sectors=None, mutate=None):
+               trailer_sectors=None, mutate=None, relative=False, part_size=None,
+               ident=b"\x11" * 16, part_mutate=None):
     """Write data as a UDIF image. ``tables`` is a list of block tables, each a
     list of (kind, sector count) chunks; the default is one table of zlib chunks of
-    8 sectors. ``mutate`` may edit the list of entries before they are packed."""
+    8 sectors. ``mutate`` may edit the list of entries before they are packed.
+
+    ``relative`` writes each table's own base at the table's data offset and entry
+    offsets relative to it, as hdiutil segment does. ``part_size`` splits the data
+    fork into segments of that many bytes, the first in ``path`` and the rest in
+    .dmgpart files beside it named as hdiutil names them; ``part_mutate(number,
+    trailer)`` may edit a segment's trailer (a bytearray) before it is written."""
     sectors = len(data) // 512
     if tables is None:
         per = chunks or 8
@@ -49,6 +56,7 @@ def write_udif(path, data, *, chunks=None, tables=None, segment=(1, 1), xml=True
     at = 0
     for number, table in enumerate(tables):
         start = at
+        base = len(fork) if relative else 0
         entries, stored = [], bytearray()
         for kind, count in table:
             piece = data[at * 512:(at + count) * 512]
@@ -60,34 +68,46 @@ def write_udif(path, data, *, chunks=None, tables=None, segment=(1, 1), xml=True
                 blob = b""
             if blob:
                 stored += piece
-            entries.append([kind, 0, at - start, count, len(fork), len(blob)])
+            entries.append([kind, 0, at - start, count, len(fork) - base, len(blob)])
             fork += blob
             at += count
-        entries.append([END, 0, at - start, 0, len(fork), 0])
+        entries.append([END, 0, at - start, 0, len(fork) - base, 0])
         if mutate:
             mutate(number, entries)
         crc = zlib.crc32(stored)
         part_crcs.append(crc)
         span = max(e[2] + e[3] for e in entries)
-        mish = struct.pack(">4sIQQQII24x", b"mish", 1, start, span, 0, 0, len(entries))
+        mish = struct.pack(">4sIQQQII24x", b"mish", 1, start, span, base, 0, len(entries))
         mish += _checksum(crc) + struct.pack(">I", len(entries))
         mish += b"".join(struct.pack(">IIQQQQ", *e) for e in entries)
         blkx.append({"Name": f"table {number}", "ID": str(number), "Data": mish})
     body = plistlib.dumps({"resource-fork": {"blkx": blkx}}) if xml else b""
-    with open(path, "wb") as fh:
-        fh.write(fork)
-        xml_offset = fh.tell()
-        fh.write(body)
-        master = zlib.crc32(b"".join(struct.pack(">I", c) for c in part_crcs))
-        trailer = struct.pack(">4sIIIQQQQQII", b"koly", 4, 512, 1, 0, 0, len(fork), 0, 0,
-                              segment[0], segment[1])
-        trailer += bytes(16) + _checksum(zlib.crc32(fork))
-        trailer += struct.pack(">QQ", xml_offset, len(body)) + bytes(120)
-        trailer += _checksum(master)
-        trailer += struct.pack(">IQ", 1, sectors if trailer_sectors is None
-                               else trailer_sectors) + bytes(12)
-        assert len(trailer) == 512
-        fh.write(trailer)
+    master = zlib.crc32(b"".join(struct.pack(">I", c) for c in part_crcs))
+    pieces = ([bytes(fork)] if part_size is None else
+              [bytes(fork[i:i + part_size]) for i in range(0, len(fork), part_size)])
+    count = len(pieces) if part_size is not None else segment[1]
+    stem = str(path)[:-4] if str(path).lower().endswith(".dmg") else str(path)
+    running = 0
+    for n, piece in enumerate(pieces, 1):
+        target = str(path) if n == 1 else f"{stem}.{n:03d}.dmgpart"
+        own = body if n == 1 else plistlib.dumps({"resource-fork": {}})
+        number = n if part_size is not None else segment[0]
+        with open(target, "wb") as fh:
+            fh.write(piece)
+            xml_offset = fh.tell()
+            fh.write(own)
+            trailer = bytearray(struct.pack(">4sIIIQQQQQII", b"koly", 4, 512, 1, running,
+                                            0, len(piece), 0, 0, number, count))
+            trailer += ident + _checksum(zlib.crc32(piece))
+            trailer += struct.pack(">QQ", xml_offset, len(own)) + bytes(120)
+            trailer += _checksum(master)
+            trailer += struct.pack(">IQ", 1, sectors if trailer_sectors is None
+                                   else trailer_sectors) + bytes(12)
+            assert len(trailer) == 512
+            if part_mutate:
+                part_mutate(n, trailer)
+            fh.write(bytes(trailer))
+        running += len(piece)
     return str(path)
 
 
@@ -186,7 +206,7 @@ def test_a_chunk_that_decompresses_to_the_wrong_size_is_refused(tmp_path):
 
 
 @pytest.mark.parametrize("case,match", [
-    ("segmented", "segmented Apple disk image"),
+    ("segmented", "is segment 2 of 2 of a segmented Apple disk image; open its first"),
     ("no_xml", "carries no XML property list"),
     ("gap", "where the previous entry ended"),
     ("table_gap", "block table 1 starts at sector 9 where the one before it ended at 8"),
@@ -200,7 +220,7 @@ def test_malformed_udif_images_are_refused(tmp_path, case, match):
     data = _disk(16)
     kwargs = {}
     if case == "segmented":
-        kwargs["segment"] = (1, 2)
+        kwargs["segment"] = (2, 2)
     elif case == "no_xml":
         kwargs["xml"] = False
     elif case == "gap":
@@ -282,6 +302,332 @@ def test_the_cli_describes_a_udif_image(tmp_path, capsys):
     assert ewfprobe.main(["verify", "-q", path]) == 0
     out = capsys.readouterr().out
     assert "all match" in out
+
+
+# ------------------------------------------- table data offsets and segments
+
+def _distinct_disk(sectors, seed=5):
+    """Random sectors with no zero ones, so every chunk of equal length decodes to
+    something different: a chunk read from the wrong place cannot pass for it."""
+    r = random.Random(seed)
+    return bytes(r.randrange(256) for _ in range(sectors * 512))
+
+
+@pytest.mark.parametrize("tables", [
+    # every chunk is 4 incompressible sectors, so each one compresses to the same
+    # length and a chunk read from the wrong table decodes without an error: a reader
+    # that ignores the table's data offset returns wrong bytes silently
+    [[(ZLIB, 4), (ZLIB, 4)]] * 4,
+    [[(ZLIB, 4), (ZLIB, 4)], [(ZLIB, 4), (ZLIB, 4)], [(RAW, 4), (ZLIB, 4)],
+     [(ZLIB, 4), (RAW, 4)]],
+], ids=["same-length", "mixed"])
+def test_block_tables_with_their_own_base_offset_read_correctly(tmp_path, tables):
+    # Every table's first chunk sits at relative offset 0, where a reader that ignores
+    # the table's data offset finds the first table's chunk.
+    data = _distinct_disk(32)
+    path = write_udif(tmp_path / "based.dmg", data, tables=tables, relative=True)
+    with ewfprobe.open_ewf(path) as img:
+        assert len(img.paths) == 1
+        assert _read_all(img) == data
+        assert all(c["match"] for c in img.verify()["container_checks"])
+
+
+def _segmented(tmp_path, name="a.dmg", sectors=96, part_size=3000, **kwargs):
+    data = _distinct_disk(sectors, seed=kwargs.pop("seed", 5))
+    kwargs.setdefault("relative", True)
+    path = write_udif(tmp_path / name, data, part_size=part_size, **kwargs)
+    return path, data
+
+
+def test_a_segmented_image_reads_across_its_segments(tmp_path):
+    path, data = _segmented(tmp_path)
+    parts = sorted(os.listdir(tmp_path))
+    assert parts[0] == "a.002.dmgpart" and parts[-1] == "a.dmg" and len(parts) > 4
+    with ewfprobe.open_ewf(path) as img:
+        assert img.format == ewfprobe.FORMAT_UDIF
+        assert [os.path.basename(p) for p in img.paths] == \
+            ["a.dmg"] + [f"a.{n:03d}.dmgpart" for n in range(2, len(parts) + 1)]
+        assert _read_all(img) == data
+        for start, length in ((0, 1), (2999, 2), (8191, 9000), (len(data) - 700, 700)):
+            img.seek(start)
+            assert img.read(length) == data[start:start + length]
+        info = img.info()
+        assert [s["file"] for s in info["udif"]["segments"]] == \
+            [os.path.basename(p) for p in img.paths]
+        checks = img.verify()["container_checks"]
+    names = [c["what"] for c in checks]
+    assert names[:len(parts)] == [f"data of {os.path.basename(p)}" for p in img.paths]
+    assert names[-1] == "master" and all(c["match"] for c in checks)
+
+
+def test_udif_segments_lists_a_set_without_reading_it(tmp_path):
+    path, _data = _segmented(tmp_path)
+    count = len(os.listdir(tmp_path))
+    files = ewfprobe.udif_segments(path)
+    assert [os.path.basename(f) for f in files] == \
+        ["a.dmg"] + [f"a.{n:03d}.dmgpart" for n in range(2, count + 1)]
+    single = write_udif(tmp_path / "one.dmg", _disk(16))
+    assert ewfprobe.udif_segments(single) == [os.path.abspath(single)]
+    with pytest.raises(ewfprobe.EwfFormatError, match="open its first segment"):
+        ewfprobe.udif_segments(str(tmp_path / "a.003.dmgpart"))
+    os.remove(tmp_path / "a.002.dmgpart")
+    with pytest.raises(ewfprobe.EwfIncompleteSetError, match="segment 2 is not beside it"):
+        ewfprobe.udif_segments(path)
+
+
+def test_a_chunk_can_run_from_one_segment_into_the_next(tmp_path):
+    path, data = _segmented(tmp_path, tables=[[(RAW, 16)], [(ZLIB, 8)] * 2],
+                            sectors=32, part_size=5000)
+    with ewfprobe.open_ewf(path) as img:
+        assert len(img.paths) >= 3
+        assert _read_all(img) == data
+
+
+def test_a_later_segment_points_at_the_first(tmp_path):
+    _segmented(tmp_path)
+    with pytest.raises(ewfprobe.EwfFormatError,
+                       match="a.002.dmgpart is segment 2 of .* open its first segment"):
+        ewfprobe.open_ewf(str(tmp_path / "a.002.dmgpart"))
+
+
+def test_a_missing_segment_is_reported_not_read_as_empty(tmp_path):
+    path, _data = _segmented(tmp_path)
+    os.remove(tmp_path / "a.003.dmgpart")
+    with pytest.raises(ewfprobe.EwfIncompleteSetError,
+                       match=r"segment 3 is not beside it \(hdiutil names them like "
+                             r"a\.002\.dmgpart\)"):
+        ewfprobe.open_ewf(path)
+
+
+def test_segments_are_found_by_what_they_record_not_by_name(tmp_path):
+    path, data = _segmented(tmp_path)
+    os.rename(tmp_path / "a.002.dmgpart", tmp_path / "renamed.dmgpart")
+    # another segmented image in the same folder is not taken for this one's
+    _segmented(tmp_path, name="b.dmg", ident=b"\x22" * 16, seed=6)
+    with ewfprobe.open_ewf(path) as img:
+        assert os.path.basename(img.paths[1]) == "renamed.dmgpart"
+        assert _read_all(img) == data
+
+
+def test_two_files_claiming_one_segment_are_refused(tmp_path):
+    path, _data = _segmented(tmp_path)
+    shutil.copyfile(tmp_path / "a.002.dmgpart", tmp_path / "a copy.002.dmgpart")
+    with pytest.raises(ewfprobe.EwfFormatError, match="both say they are segment 2"):
+        ewfprobe.open_ewf(path)
+
+
+def _poke(fmt, at, value, only=2):
+    def mutate(number, trailer):
+        if number == only:
+            struct.pack_into(fmt, trailer, at, value)
+    return mutate
+
+
+@pytest.mark.parametrize("mutate,match", [
+    (_poke(">Q", 16, 1), "a.002.dmgpart says its data starts at 1 in the image's data, "
+                         "where the segments before it end at 3000"),
+    (_poke(">Q", 492, 7), "a.002.dmgpart gives a different disk size"),
+    (_poke(">I", 60, 9), "a.002.dmgpart says it is segment 2 of 9"),
+    (_poke(">I", 56, 1), "both say they are segment 1"),
+    (_poke(">Q", 16, 5, only=1), "the first segment says its data starts at 5"),
+])
+def test_malformed_segments_are_refused(tmp_path, mutate, match):
+    path, _data = _segmented(tmp_path, part_mutate=mutate)
+    with pytest.raises(ewfprobe.EwfFormatError, match=match):
+        ewfprobe.open_ewf(path)
+
+
+def test_a_segment_cut_short_is_refused(tmp_path):
+    path, _data = _segmented(tmp_path)
+    part = tmp_path / "a.002.dmgpart"
+    blob = part.read_bytes()
+    part.write_bytes(blob[:100] + blob[-512:])
+    with pytest.raises(ewfprobe.EwfIncompleteSetError, match="a.002.dmgpart: the data"):
+        ewfprobe.open_ewf(path)
+
+
+def test_verify_names_the_damaged_segment(tmp_path):
+    path, _data = _segmented(tmp_path, tables=[[(RAW, 8)] * 12])
+    part = tmp_path / "a.002.dmgpart"
+    blob = bytearray(part.read_bytes())
+    blob[100] ^= 0xFF
+    part.write_bytes(bytes(blob))
+    with ewfprobe.open_ewf(path) as img:
+        checks = img.verify()["container_checks"]
+    failed = [c["what"] for c in checks if not c["match"]]
+    assert failed == ["data of a.002.dmgpart", "block table table 0"]
+
+
+def test_the_cli_describes_a_segmented_image(tmp_path, capsys):
+    path, _data = _segmented(tmp_path)
+    count = len(os.listdir(tmp_path))
+    assert ewfprobe.main(["info", path]) == 0
+    out = capsys.readouterr().out
+    assert f"segments        {count} (a.dmg .. a.{count:03d}.dmgpart)" in out
+    assert out.count("data checksum   CRC32") == count
+    assert "(a.002.dmgpart)" in out
+
+
+# ------------------------------------------------------------- sparse bundles
+
+def write_bundle(folder, data, band, *, version=1, size=None, token=b"", backup=None,
+                 bands=None, extra=None):
+    """Write data as a sparse bundle with bands of ``band`` bytes, as hdiutil lays
+    one out: a band that is all zeros has no file, and a band's file stops after its
+    last nonzero byte rounded up to a sector. ``bands`` may give some band files'
+    contents outright (name to bytes); ``extra`` adds other entries to bands/."""
+    folder = str(folder)
+    os.makedirs(os.path.join(folder, "bands"))
+    info = {"CFBundleInfoDictionaryVersion": "6.0", "band-size": band,
+            "bundle-backingstore-version": version,
+            "diskimage-bundle-type": "com.apple.diskimage.sparsebundle",
+            "size": len(data) if size is None else size}
+    body = plistlib.dumps(info)
+    for name, content in (("Info.plist", body), ("Info.bckup", backup or body),
+                          ("token", token), ("lock", b"")):
+        with open(os.path.join(folder, name), "wb") as fh:
+            fh.write(content)
+    for n in range(0, -(-len(data) // band)):
+        piece = data[n * band:(n + 1) * band].rstrip(b"\0")
+        if piece:
+            piece += bytes(-len(piece) % 512)
+            with open(os.path.join(folder, "bands", format(n, "x")), "wb") as fh:
+                fh.write(piece)
+    for name, content in (bands or {}).items():
+        with open(os.path.join(folder, "bands", name), "wb") as fh:
+            fh.write(content)
+    for name, content in (extra or {}).items():
+        with open(os.path.join(folder, "bands", name), "wb") as fh:
+            fh.write(content)
+    return folder
+
+
+def _zeroed_disk(sectors=64, seed=4):
+    """A disk with whole bands of zeros and zeros at band ends, the shapes that
+    leave a band without a file or with a short one."""
+    r = random.Random(seed)
+    out = bytearray()
+    for s in range(sectors):
+        zero = s % 7 in (3, 4) or 20 <= s < 32
+        out += bytes(512) if zero else bytes(r.randrange(1, 256) for _ in range(512))
+    return bytes(out)
+
+
+@pytest.mark.parametrize("band", [1536, 2048, 4096, 1 << 20])
+def test_a_sparse_bundle_reads_back_its_disk(tmp_path, band):
+    data = _zeroed_disk()
+    path = write_bundle(tmp_path / "a.sparsebundle", data, band)
+    assert ewfprobe.is_image(path)
+    assert ewfprobe.apple_image_kind(path) == "SPARSEBUNDLE"
+    with ewfprobe.open_ewf(path) as img:
+        assert img.format == ewfprobe.FORMAT_SPARSEBUNDLE
+        assert img.media_size == len(data)
+        assert _read_all(img) == data
+        for start, length in ((0, 1), (band - 1, 2), (1500, 9000), (len(data) - 5, 5)):
+            img.seek(start)
+            assert img.read(length) == data[start:start + length]
+        info = img.info()["sparsebundle"]
+    stored = len(os.listdir(os.path.join(path, "bands")))
+    assert info["band_size"] == band and info["bands_stored"] == stored
+    if band == 1536:
+        assert stored < info["band_count"]      # the all-zero bands have no file
+
+
+def test_a_large_sparse_bundle_names_its_bands_in_hexadecimal(tmp_path):
+    band, size = 8 << 20, 6 << 30               # 768 bands, the last is 2ff
+    folder = tmp_path / "big.sparsebundle"
+    marks = {"0": b"\x01" * 512, "1a0": b"\x02" * 4096, "2ff": b"\x03" * 1024}
+    write_bundle(folder, b"", band, size=size, bands=marks)
+    with ewfprobe.open_ewf(str(folder)) as img:
+        assert img.media_size == size
+        img.seek(0x1A0 * band)
+        assert img.read(4097) == b"\x02" * 4096 + b"\0"
+        img.seek(size - band)
+        assert img.read(1025) == b"\x03" * 1024 + b"\0"
+        img.seek(size - 1)
+        assert img.read(10) == b"\0"
+        img.seek(0x1A0 * band - 1)
+        assert img.read(2) == b"\0\x02"
+
+
+def test_band_files_hdiutil_would_ignore_are_ignored_and_listed(tmp_path, capsys):
+    data = _zeroed_disk(16, seed=8)
+    band = 2048
+    path = write_bundle(tmp_path / "odd.sparsebundle", data, band,
+                        bands={"1": data[band:2 * band] + b"\xAA" * 512},
+                        extra={"40": b"\xBB" * 512, "0A": b"\xCC" * 512,
+                               "01": b"\xDD" * 512, ".DS_Store": b"x"})
+    with ewfprobe.open_ewf(path) as img:
+        assert _read_all(img) == data
+        info = img.info()["sparsebundle"]
+    assert info["bands_past_end"] == ["40"]
+    assert info["bands_longer_than_a_band"] == ["1"]
+    assert sorted(info["other_entries"]) == [".DS_Store", "01", "0A"]
+    assert ewfprobe.main(["info", path]) == 0
+    out = capsys.readouterr().out
+    assert "1 band file numbered past the disk's end, not read: 40" in out
+    assert "1 band file longer than a band, read to the band's end only: 1" in out
+    assert "3 other entries in bands, not read" in out
+
+
+def test_an_encrypted_sparse_bundle_is_recognised_and_refused(tmp_path):
+    path = write_bundle(tmp_path / "enc.sparsebundle", _zeroed_disk(8), 2048,
+                        token=b"encrcdsa" + bytes(1000))
+    assert ewfprobe.apple_image_kind(path) == "ENCRYPTED"
+    assert not ewfprobe.is_image(path)
+    with pytest.raises(ewfprobe.EwfFormatError, match="encrypted sparse bundle"):
+        ewfprobe.open_ewf(path)
+
+
+def test_a_folder_is_a_sparse_bundle_only_by_its_info_plist(tmp_path):
+    plain = tmp_path / "plain.sparsebundle"
+    plain.mkdir()
+    assert ewfprobe.apple_image_kind(str(plain)) is None
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "Info.plist").write_bytes(plistlib.dumps({"diskimage-bundle-type": "x"}))
+    assert ewfprobe.apple_image_kind(str(other)) is None and not ewfprobe.is_image(str(other))
+    named = write_bundle(tmp_path / "no-suffix", _zeroed_disk(8), 2048)
+    assert ewfprobe.apple_image_kind(named) == "SPARSEBUNDLE"
+
+
+@pytest.mark.parametrize("kwargs,match", [
+    ({"version": 2}, "version 2 sparse bundle; only version 1"),
+    ({"size": 4097}, "not a whole number of 512-byte sectors"),
+    ({"band": 0}, "band size of 0"),
+    ({"band": "8388608"}, "gives band-size as '8388608'"),
+])
+def test_malformed_sparse_bundles_are_refused(tmp_path, kwargs, match):
+    band = kwargs.pop("band", 2048)
+    folder = tmp_path / "bad.sparsebundle"
+    write_bundle(folder, _zeroed_disk(8), band if isinstance(band, int) and band else 2048,
+                 **kwargs)
+    if not isinstance(band, int) or not band:
+        info = plistlib.loads((folder / "Info.plist").read_bytes())
+        info["band-size"] = band
+        (folder / "Info.plist").write_bytes(plistlib.dumps(info))
+    with pytest.raises(ewfprobe.EwfFormatError, match=match):
+        ewfprobe.open_ewf(str(folder))
+
+
+def test_a_sparse_bundle_without_its_bands_folder_is_refused(tmp_path):
+    path = write_bundle(tmp_path / "gone.sparsebundle", _zeroed_disk(8), 2048)
+    shutil.rmtree(os.path.join(path, "bands"))
+    with pytest.raises(ewfprobe.EwfIncompleteSetError, match="has no bands folder"):
+        ewfprobe.open_ewf(path)
+
+
+def test_a_sparse_bundle_reports_a_backup_that_differs(tmp_path, capsys):
+    path = write_bundle(tmp_path / "b.sparsebundle", _zeroed_disk(8), 2048,
+                        backup=b"<plist/>")
+    with ewfprobe.open_ewf(path) as img:
+        assert img.info()["sparsebundle"]["backup_matches"] is False
+        result = img.verify()
+    assert result["match"] is None and result["container_checks"] == []
+    assert ewfprobe.main(["info", path]) == 0
+    assert "Info.bckup      differs from Info.plist" in capsys.readouterr().out
+    assert ewfprobe.main(["verify", "-q", path]) == 0
+    assert "recorded no hash" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------- ADC
