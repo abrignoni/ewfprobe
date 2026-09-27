@@ -73,8 +73,11 @@ nothing to compare against on one.
 Reads AFD, the form of AFF split across files: a directory named `.afd` holding
 ordinary AFF files, which AFFLIB names `file_000.aff`, `file_001.aff` and on.
 `affconvert` writes one when its output name ends `.afd`, splitting at the size
-given with `-M`, and FTK Imager 4.7.3.61 wrote one when given a 1 MB fragment
-size for AFF output (its dialog notes that 0 means do not fragment). Open the
+given with `-M`. FTK Imager 4.7.3.61 wrote one in each of two runs where the
+source was larger than the AFF fragment size: a 3 MiB source with 1 MB
+fragments, and a 1,600 MiB source with the 1500 MB its dialog pre-fills, which
+came out as an AFD holding a single file. A 3 MiB source with that 1500 MB came
+out as one `.aff`, and the dialog notes that 0 means do not fragment. Open the
 directory or any `.aff` file in it: one file can hold only some of the pages, so
 the whole directory is read either way. Given one file, AFFLIB's own `affcat`
 reads that file alone, and on FTK Imager's AFD it wrote nothing for the first

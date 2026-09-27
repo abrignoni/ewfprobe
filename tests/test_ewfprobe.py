@@ -952,6 +952,16 @@ def test_an_afd_reads_as_one_image_with_its_pages_spread_across_files(tmp_path):
     assert result["match"] is True and set(result["stored"]) == {"MD5", "SHA1", "SHA256"}
 
 
+def test_an_afd_holding_one_file_reads_as_an_afd(tmp_path):
+    """FTK Imager 4.7.3.61 wrote a 1,600 MiB source larger than its 1500 MB fragment
+    size as an AFD, and the zeros compressed into one file."""
+    data = aff_sample(3)
+    afd = write_afd(tmp_path / "one.afd", data, [[0, 1, 2]], sizes_in="all")
+    with ewfprobe.open_ewf(afd) as img:
+        assert img.format == ewfprobe.FORMAT_AFD and len(img.paths) == 1
+        assert img.read() == data
+
+
 def test_any_file_of_an_afd_opens_the_whole_directory(tmp_path):
     """One file alone holds only some of the pages. AFFLIB's affcat, given one, reads
     that file as an image of its own; this reader opens the directory it is in."""
