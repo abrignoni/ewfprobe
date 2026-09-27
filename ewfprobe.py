@@ -1,9 +1,10 @@
 """ewfprobe: a read-only reader for EnCase/EWF (.E01) forensic images.
 
 One file, pure Python, standard library only. No compiler, no network, and
-nothing to install. It opens an EWF-E01 acquisition, joins its segments, and
-presents the original disk as an ordinary seekable file object, so anything
-that can read a raw image can read an E01 without changing how it reads.
+nothing to install. It opens an EWF-E01 or SMART (.s01) acquisition, joins its
+segments, and presents the original disk as an ordinary seekable file object,
+so anything that can read a raw image can read an E01 without changing how it
+reads.
 
     with ewfprobe.open_ewf("evidence.E01") as img:
         img.seek(0)
@@ -20,8 +21,9 @@ other EWF implementation. This file is MIT, and reimplementing a documented
 format is what keeps it that way.
 
 Scope. This reads EWF-E01, the format EnCase 6 and 7 and FTK Imager write and
-by far the most common one in the field. It does not read the newer Ex01
-(EWF2), the SMART .s01 variant, or logical .L01 evidence, and it never writes.
+by far the most common one in the field, and EWF-S01, the variant ASR Data's
+SMART writes. It does not read the newer Ex01 (EWF2) or logical .L01
+evidence, and it never writes.
 An image whose content is encrypted at rest, by BitLocker or FileVault or an
 encrypted APFS volume, reads back as the ciphertext that was acquired: the
 reader is working, there is simply nothing plain in there to find.
@@ -59,6 +61,17 @@ _OFFSET_MASK = 0x7FFFFFFF
 MEDIA_TYPES = {0x00: "removable", 0x01: "fixed", 0x03: "optical", 0x0E: "logical"}
 COMPRESSION_LEVELS = {0x00: "none", 0x01: "good", 0x02: "best"}
 
+# SMART (EWF-S01) writes the same EVF segment files as EnCase, with lowercase
+# segment names and the original 94-byte volume section, which carries this
+# string at offset 85 where EnCase's longer volume section has other fields.
+# That volume section records neither the media type nor the compression level;
+# the level is in the header section's "r" value instead.
+SMART_SIGNATURE = b"SMART"
+SMART_COMPRESSION = {"n": "none", "f": "fast", "b": "best"}
+
+FORMAT_E01 = "EWF-E01"
+FORMAT_S01 = "EWF-S01"
+
 # How many decompressed chunks and open segment handles to keep. A chunk is
 # normally 32 KiB, so the cache is a couple of megabytes at the default.
 CHUNK_CACHE = 64
@@ -88,7 +101,7 @@ class EwfError(Exception):
 
 
 class EwfFormatError(EwfError):
-    """The bytes are not a valid EWF-E01 image, or carry something unsupported."""
+    """The bytes are not a valid EWF image, or carry something unsupported."""
 
 
 class EwfIncompleteSetError(EwfError):
@@ -101,14 +114,26 @@ class EwfIncompleteSetError(EwfError):
 
 # ------------------------------------------------------------- segment names
 
-def _extension_sequence():
-    """The EWF segment extensions in order: E01 to E99, then EAA to ZZZ."""
+def _extension_sequence(first="E"):
+    """The segment extensions of one family, in order.
+
+    EnCase sets run E01 to E99, then EAA to ZZZ. SMART sets run s01 to s99, then
+    saa to zzz. The specification lists saa to szz and then gives faa, which reads
+    as a slip: taa onward is what the E sequence does after EZZ, and it is what
+    libewf's SMART writer produces.
+    """
+    last, low = ("z", "a") if first.islower() else ("Z", "A")
     for i in range(1, 100):
-        yield f"E{i:02d}"
-    for first in range(ord("E"), ord("Z") + 1):
-        for second in range(ord("A"), ord("Z") + 1):
-            for third in range(ord("A"), ord("Z") + 1):
-                yield chr(first) + chr(second) + chr(third)
+        yield f"{first}{i:02d}"
+    for lead in range(ord(first), ord(last) + 1):
+        for second in range(ord(low), ord(last) + 1):
+            for third in range(ord(low), ord(last) + 1):
+                yield chr(lead) + chr(second) + chr(third)
+
+
+def _family(ext):
+    """The first letter of the segment family an extension belongs to."""
+    return "s" if ext[:1].lower() == "s" else "E"
 
 
 def is_ewf(path) -> bool:
@@ -137,15 +162,15 @@ def ewf_segments(path) -> list[str]:
     case-sensitive volume can arrive as .e01. The returned paths are the names
     as they actually sit on disk.
     """
-    folder, stem, _ext = _stem_and_dir(path)
+    folder, stem, ext = _stem_and_dir(path)
     try:
         present = {e.lower(): e for e in os.listdir(folder)}
     except OSError as exc:
         raise EwfFormatError(f"cannot list the folder holding the image: {exc}") from exc
 
     segments = []
-    for ext in _extension_sequence():
-        want = f"{stem}.{ext}".lower()
+    for seg_ext in _extension_sequence(_family(ext)):
+        want = f"{stem}.{seg_ext}".lower()
         actual = present.get(want)
         if actual is None:
             break
@@ -153,7 +178,7 @@ def ewf_segments(path) -> list[str]:
     if not segments:
         raise EwfFormatError(
             f"{os.path.basename(path)} is not the first segment of an EWF set; "
-            f"the set is opened from its .E01")
+            f"the set is opened from its .E01, or its .s01 for SMART")
     return segments
 
 
@@ -267,7 +292,7 @@ class _Table:
 
 
 class EwfImage:
-    """An EWF-E01 acquisition, read as one seekable stream of the acquired disk.
+    """An EWF-E01 or EWF-S01 acquisition, read as one seekable stream of the disk.
 
     ``media_size`` is the size of the disk that was acquired, which is what
     ``seek`` and ``read`` address. The segment files themselves are an
@@ -285,6 +310,7 @@ class EwfImage:
         self.sectors_per_chunk = 0
         self.sector_count = 0
         self.chunk_count = 0
+        self.format = FORMAT_E01
         self.media_type = None
         self.compression_level = None
         self.metadata: dict[str, str] = {}
@@ -352,6 +378,10 @@ class EwfImage:
 
         if not volume_seen:
             raise EwfFormatError("the image carries no volume section")
+        if self.format == FORMAT_S01:
+            level = self.metadata.get("compression_level")
+            if level is not None:
+                self.compression_level = SMART_COMPRESSION.get(level, f"unknown ({level})")
         if not self._tables:
             raise EwfFormatError("the image carries no chunk table")
 
@@ -380,12 +410,21 @@ class EwfImage:
     def _parse_volume(self, data):
         if len(data) < 24:
             raise EwfFormatError("the volume section is too short")
-        self.media_type = MEDIA_TYPES.get(data[0], f"unknown ({data[0]:#04x})")
-        (chunk_count, sectors_per_chunk, bytes_per_sector) = struct.unpack_from("<III", data, 4)
-        sector_count = struct.unpack_from("<Q", data, 16)[0]
-        if len(data) >= 56:
-            level = data[52]
-            self.compression_level = COMPRESSION_LEVELS.get(level, f"unknown ({level:#04x})")
+        if data[85:85 + len(SMART_SIGNATURE)] == SMART_SIGNATURE:
+            # The original layout: byte 0 is a reserved 1, not a media type, and
+            # the sector count is 32 bits followed by 20 reserved bytes.
+            self.format = FORMAT_S01
+            (chunk_count, sectors_per_chunk, bytes_per_sector,
+             sector_count) = struct.unpack_from("<IIII", data, 4)
+        else:
+            self.media_type = MEDIA_TYPES.get(data[0], f"unknown ({data[0]:#04x})")
+            (chunk_count, sectors_per_chunk,
+             bytes_per_sector) = struct.unpack_from("<III", data, 4)
+            sector_count = struct.unpack_from("<Q", data, 16)[0]
+            if len(data) >= 56:
+                level = data[52]
+                self.compression_level = COMPRESSION_LEVELS.get(
+                    level, f"unknown ({level:#04x})")
         if not bytes_per_sector or not sectors_per_chunk or not sector_count:
             raise EwfFormatError(
                 "the volume section gives a zero sector size, chunk size or sector count")
@@ -398,6 +437,10 @@ class EwfImage:
         fh.seek(offset)
         header = _read_exactly(fh, TABLE_HEADER_SIZE)
         count, _pad1, base, _pad2, _checksum = _TABLE_HEADER.unpack(header)
+        if self.format == FORMAT_S01:
+            # The original table header is a count and 16 bytes of padding, with
+            # no base offset: the entries count from the start of the file.
+            base = 0
         if count == 0:
             return 0
         raw = _read_exactly(fh, count * 4)
@@ -595,6 +638,7 @@ class EwfImage:
         return {
             "segments": [os.path.basename(p) for p in self.paths],
             "segment_count": len(self.paths),
+            "format": self.format,
             "media_type": self.media_type,
             "media_size": self.media_size,
             "sector_size": self.sector_size,
@@ -631,7 +675,8 @@ def _cmd_info(args):
         print(f"image           {os.path.basename(args.image)}")
         print(f"segments        {d['segment_count']} ({d['segments'][0]}"
               f"{' .. ' + d['segments'][-1] if d['segment_count'] > 1 else ''})")
-        print(f"media type      {d['media_type']}")
+        print(f"format          {d['format']}")
+        print(f"media type      {d['media_type'] or 'not recorded'}")
         print(f"media size      {d['media_size']:,} bytes ({_size(d['media_size'])})")
         print(f"sector size     {d['sector_size']:,} bytes")
         print(f"sectors         {d['sector_count']:,}")
@@ -639,7 +684,7 @@ def _cmd_info(args):
               f"({d['sectors_per_chunk']} sectors)")
         print(f"chunks          {d['indexed_chunks']:,} indexed, "
               f"{d['chunk_count']:,} declared")
-        print(f"compression     {d['compression_level']}")
+        print(f"compression     {d['compression_level'] or 'not recorded'}")
         for name, value in d["stored_hashes"].items():
             print(f"stored {name:<9}{value}")
         if d["metadata"]:
@@ -706,7 +751,8 @@ def _cmd_export(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="ewfprobe",
-        description="Read an EnCase/EWF (.E01) forensic image. Read only.")
+        description="Read an EnCase/EWF (.E01) or SMART (.s01) forensic image. "
+                    "Read only.")
     ap.add_argument("--version", action="version", version=f"ewfprobe {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

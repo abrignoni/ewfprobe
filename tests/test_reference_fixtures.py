@@ -143,3 +143,27 @@ def test_metadata_written_by_ewfacquire_is_read_back():
         meta = img.metadata
     assert meta.get("case_number") == "FIXTURE"
     assert "ewfprobe fixture" in meta.get("description", "")
+
+
+def test_libewf_smart_fixtures_read_as_smart():
+    """Written by ewfacquire -f smart: lowercase segment names, the 94-byte volume
+    section and a table header with no base offset."""
+    variants = dict(_variants())
+    for name in ("smart-fast", "smart-split"):
+        assert name in variants, f"the {name} fixture is missing"
+        with ewfprobe.open_ewf(_first(variants[name])) as img:
+            assert img.format == ewfprobe.FORMAT_S01, name
+            assert img.media_type is None, name
+            assert {t.base for t in img._tables} == {0}, name
+    with ewfprobe.open_ewf(_first(variants["smart-fast"])) as img:
+        assert img.compression_level == "fast"
+
+
+def test_the_smart_split_fixture_opens_from_any_member():
+    variants = dict(_variants())
+    files = variants["smart-split"]["files"]
+    assert len(files) >= 3, "the SMART split fixture did not actually split"
+    assert all(f.rsplit(".", 1)[1].startswith("s") for f in files)
+    with ewfprobe.open_ewf(os.path.join(FIXTURES, files[-1])) as img:
+        assert [os.path.basename(p) for p in img.paths] == files
+        assert _media_sha(img) == _manifest()["sha256"]

@@ -4,8 +4,9 @@
 
 <source folder> is a checkout holding ewfprobe.py and tests/fixtures (the build workflow
 checks out the tag being released there). The fixtures were written by libewf's
-ewfacquire, not by ewfprobe. For each one (EnCase 5, EnCase 6, and a four-segment EnCase 6
-set) `info`, `verify` and a full `export` are run once through `python ewfprobe.py` and once
+ewfacquire, not by ewfprobe. For each one (EnCase 5, EnCase 6, a four-segment EnCase 6
+set, SMART, and a four-segment SMART set) `info`, `verify` and a full `export` are run once
+through `python ewfprobe.py` and once
 through the executable. Their output must be byte-identical, verify must report the stored
 hashes as matching, and the export must hash to the source disk the manifest records. A
 byte range exported to stdout must equal the manifest's media item at that offset, and a

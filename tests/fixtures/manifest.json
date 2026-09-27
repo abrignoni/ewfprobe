@@ -71,6 +71,29 @@
         "encase6-split.E03",
         "encase6-split.E04"
       ]
+    },
+    "smart-fast": {
+      "format": "smart",
+      "compression": "fast",
+      "sectors_per_chunk": 64,
+      "segment_size": null,
+      "files": [
+        "smart-fast.s01"
+      ],
+      "writer": "ewfacquire 20260924"
+    },
+    "smart-split": {
+      "format": "smart",
+      "compression": "none",
+      "sectors_per_chunk": 64,
+      "segment_size": "1M",
+      "files": [
+        "smart-split.s01",
+        "smart-split.s02",
+        "smart-split.s03",
+        "smart-split.s04"
+      ],
+      "writer": "ewfacquire 20260924"
     }
   }
 }
