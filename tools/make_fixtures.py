@@ -59,6 +59,10 @@ AFF_VARIANTS = [
     ("aff-zlib",   ["-s64k"]),
     ("aff-lzma",   ["-L", "-s64k"]),
     ("aff-none",   ["-x", "-s64k"]),
+    # Written as an AFD (see acquire_aff): a directory of AFF files, with -M capping
+    # each file, so the pages spread across them and the image size and hashes land
+    # in the last one.
+    ("aff-afd",    ["-s64k", "-M32k"]),
 ]
 
 # Acquisition variants. Between them these cover the older table layout with no
@@ -198,18 +202,28 @@ def acquire(raw_path, out_dir, name, fmt, compression, sectors_per_chunk, segmen
 
 
 def acquire_aff(raw_path, out_dir, name, options):
-    """One AFF variant. affconvert records its command line in the image, so it runs
-    in the output folder with relative names, keeping local paths out of the fixture."""
-    target = name + ".aff"
+    """One AFF variant, as (the path to open, the files written). affconvert records
+    its command line in the image, so it runs in the output folder with relative
+    names, keeping local paths out of the fixture. A variant with a file size cap
+    (-M) is written to a name ending .afd, which makes affconvert write an AFD
+    directory, and its files are the .aff files inside it."""
+    afd = any(o.startswith("-M") for o in options)
+    target = name + (".afd" if afd else ".aff")
     stale = os.path.join(out_dir, target)
-    if os.path.exists(stale):
+    if os.path.isdir(stale):
+        shutil.rmtree(stale)
+    elif os.path.exists(stale):
         os.remove(stale)
     result = subprocess.run(
         [AFFCONVERT, "-q", *options, "-o", target, os.path.basename(raw_path)],
         cwd=out_dir, capture_output=True, text=True, check=False)
     if result.returncode != 0 or not os.path.exists(stale):
         raise SystemExit(f"affconvert failed for {name}:\n{result.stdout}\n{result.stderr}")
-    return [target]
+    files = ([f"{target}/{f}" for f in sorted(os.listdir(stale)) if f.lower().endswith(".aff")]
+             if afd else [target])
+    for f in files:
+        os.chmod(os.path.join(out_dir, f), 0o644)   # affconvert creates them 0777
+    return target, files
 
 
 def writer_version(tool=None):
@@ -222,7 +236,8 @@ def rebuild_source(out, manifest):
     """The raw source, read back from a fixture and checked against the manifest."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     import ewfprobe
-    first = next(os.path.join(out, v["files"][0]) for v in manifest["variants"].values())
+    first = next(os.path.join(out, v.get("image", v["files"][0]))
+                 for v in manifest["variants"].values())
     raw_path = os.path.join(out, manifest["raw"])
     digest = hashlib.sha256()
     with ewfprobe.open_ewf(first) as img, open(raw_path, "wb") as fh:
@@ -302,11 +317,13 @@ def main(argv):
     aff_writer = ("affconvert " + writer_version(AFFCONVERT).split()[-1]
                   if chosen_aff else None)
     for name, options in chosen_aff:
-        made = acquire_aff(raw_path, out, name, options)
+        image, made = acquire_aff(raw_path, out, name, options)
         manifest["variants"][name] = {
             "format": "aff", "options": options, "files": made, "writer": aff_writer,
         }
-        size = os.path.getsize(os.path.join(out, made[0]))
+        if image != made[0]:
+            manifest["variants"][name]["image"] = image
+        size = sum(os.path.getsize(os.path.join(out, f)) for f in made)
         print(f"  {name:<20} aff       {' '.join(options):<14} {size:>10,} bytes")
 
     if add:

@@ -5,13 +5,13 @@
 <source folder> is a checkout holding ewfprobe.py and tests/fixtures (the build workflow
 checks out the tag being released there). The fixtures were written by libewf's ewfacquire,
 affconvert or FTK Imager, not by ewfprobe. For each one (EnCase 5 and 6, SMART, Ex01 and
-AFF, single files and multi-segment sets) `info`, `verify` and a full `export` are run once
-through `python ewfprobe.py` and once through the executable. Their output must be
-byte-identical, verify must report the stored hashes as matching (or, for an image that
-stores none, say so), and the export must hash to the source disk the manifest records. A
-byte range exported to stdout must equal the manifest's media item at that offset, and a
-split set with a segment missing must be refused the same way by both. The executable's
---version must name the source's __version__.
+AFF, single files, multi-segment sets and AFD directories) `info`, `verify` and a full
+`export` are run once through `python ewfprobe.py` and once through the executable. Their
+output must be byte-identical, verify must report the stored hashes as matching (or, for an
+image that stores none, say so), and the export must hash to the source disk the manifest
+records. A byte range exported to stdout must equal the manifest's media item at that
+offset, and a split set with a segment missing must be refused the same way by both. The
+executable's --version must name the source's __version__.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ def main(argv: list[str]) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         for name, variant in sorted(manifest["variants"].items()):
-            image = str(fixtures / variant["files"][0])
+            image = str(fixtures / variant.get("image", variant["files"][0]))
             out = {}
             for who, cmd in (("py", py), ("exe", exe)):
                 raw = work / f"{name}-{who}.raw"

@@ -44,7 +44,8 @@ def _variants():
 
 
 def _first(variant):
-    return os.path.join(FIXTURES, variant["files"][0])
+    """The path to open: an AFD's directory, else the first file."""
+    return os.path.join(FIXTURES, variant.get("image", variant["files"][0]))
 
 
 def _media_sha(img):
@@ -219,10 +220,53 @@ def test_aff_fixtures_cover_every_page_form_and_read_as_aff():
         with ewfprobe.open_ewf(_first(variants[name])) as img:
             assert img.format == ewfprobe.FORMAT_AFF, name
             assert img.missing_page_count == 0, name
-            forms |= {arg for _off, _len, arg in img._aff_pages.values()}
+            forms |= {arg for _i, _off, _len, arg in img._aff_pages.values()}
     assert {0x00, 0x01, 0x21, 0x33} <= forms, sorted(forms)
     with ewfprobe.open_ewf(_first(variants["ftk-aff"])) as img:
         assert img.metadata["case_number"] == "FIXTURE"
         assert img.metadata["examiner"] == "ewfprobe"
         assert img.sector_size == 512          # FTK Imager stores it as text
         assert img.chunk_size == 16 << 20
+
+
+def test_afd_fixtures_read_as_one_image_from_the_directory_or_any_file():
+    """Two AFD directories from two writers. affconvert's (-M32k) spreads 48 pages over
+    five files, with none in the first and the image size and hashes only in the
+    last. FTK Imager's (1 MB fragments, compression 0) keeps its one 16 MiB page in
+    the middle file and the image size in every file, and writes the sector size as
+    text in the first file and as a segment argument in the others."""
+    man = _manifest()
+    variants = dict(_variants())
+    for name, members in (("aff-afd", 5), ("ftk-aff-split", 3)):
+        assert name in variants, f"the {name} fixture is missing"
+        files = variants[name]["files"]
+        assert len(files) == members, name
+        for path in [_first(variants[name])] + [os.path.join(FIXTURES, f) for f in files]:
+            with ewfprobe.open_ewf(path) as img:
+                assert img.format == ewfprobe.FORMAT_AFD, path
+                assert [os.path.basename(p) for p in img.paths] == [
+                    os.path.basename(f) for f in files], path
+                assert img.missing_page_count == 0, path
+                assert _media_sha(img) == man["sha256"], path
+    with ewfprobe.open_ewf(_first(variants["aff-afd"])) as img:
+        holders = {i for i, _o, _l, _a in img._aff_pages.values()}
+        assert 0 not in holders and len(holders) >= 3, holders
+        assert set(img.stored_hashes) == {"MD5", "SHA1"}
+    with ewfprobe.open_ewf(_first(variants["ftk-aff-split"])) as img:
+        assert {i for i, _o, _l, _a in img._aff_pages.values()} == {1}
+        assert img.sector_size == 512 and img.chunk_size == 16 << 20
+        assert img.metadata["case_number"] == "FIXTURE"
+        assert img.metadata["ad_unique_desc"] == "ewfprobe fixture ftk-aff-split"
+
+
+def test_a_missing_file_of_a_real_afd_is_refused(tmp_path):
+    """The middle file of FTK Imager's AFD holds the only page, and the last file of
+    affconvert's holds the image size."""
+    variants = dict(_variants())
+    for name, gone, words in (("ftk-aff-split", "file_001.aff", "file_001.aff"),
+                              ("aff-afd", "file_004.aff", "image size")):
+        folder = tmp_path / os.path.basename(variants[name]["image"])
+        shutil.copytree(_first(variants[name]), folder)
+        os.remove(folder / gone)
+        with pytest.raises(ewfprobe.EwfIncompleteSetError, match=words):
+            ewfprobe.open_ewf(str(folder))

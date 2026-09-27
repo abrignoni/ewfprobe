@@ -1,6 +1,6 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`) forensic images. One file, pure
+A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`, `.afd`) forensic images. One file, pure
 Python, standard library only. No compiler, no network, nothing to install.
 
 It opens an acquisition, joins its segments, and presents the acquired disk as
@@ -70,8 +70,30 @@ bad-sector marker, and `info` and `verify` count it. FTK Imager's AFF stores no
 hash of the disk (FTK Imager keeps its hashes in its text log), so `verify` has
 nothing to compare against on one.
 
+Reads AFD, the form of AFF split across files: a directory named `.afd` holding
+ordinary AFF files, which AFFLIB names `file_000.aff`, `file_001.aff` and on.
+`affconvert` writes one when its output name ends `.afd`, splitting at the size
+given with `-M`, and FTK Imager 4.7.3.61 wrote one when given a 1 MB fragment
+size for AFF output (its dialog notes that 0 means do not fragment). Open the
+directory or any `.aff` file in it: one file can hold only some of the pages, so
+the whole directory is read either way. Given one file, AFFLIB's own `affcat`
+reads that file alone, and on FTK Imager's AFD it wrote nothing for the first
+and last files and reported no error.
+
+The files are joined the way AFFLIB joins them (`lib/vnode_afd.cpp`): a segment
+is read from the first file that holds it, and the image size is the largest any
+file records. AFFLIB takes the files in the order the directory lists them,
+which differs between filesystems, so a page, a hash, the page size, the sector
+size or the bad-sector marker that two files record differently is refused
+rather than settled by that order. When the files carry AFFLIB's names, a gap in
+the numbering is refused as a missing file. A missing last file cannot be seen
+from the numbering: when it held the image size, as it does in an AFD from
+`affconvert`, the image is refused; otherwise its pages are counted as missing
+pages by `info` and `verify`.
+
 `open_image()` is the same function as `open_ewf()`, and `is_image()` is true for
-every signature ewfprobe reads, where `is_ewf()` stays true for EWF alone.
+every signature ewfprobe reads and for an AFD directory, where `is_ewf()` stays
+true for EWF alone.
 
 Refused with a message naming the reason rather than read wrongly:
 
@@ -84,7 +106,10 @@ Refused with a message naming the reason rather than read wrongly:
   never implemented.
 - **An AFF file with no image size.** AFF records the size when the acquisition
   finishes, so its absence means the file may be incomplete.
-- **AFD and AFM**, the forms of AFF split across several files.
+- **An AFD with a gap in its file numbering**, or whose files disagree on a page,
+  a hash, the page size, the sector size or the bad-sector marker.
+- **AFM**, AFF metadata kept beside the image as split raw files (`.000`, `.001`
+  and on).
 
 It never writes.
 
@@ -146,6 +171,19 @@ match the MD5 and SHA-1 they recorded. A writer in the test suite covers the
 cases the fixtures cannot: a missing page, encrypted segments, a truncated file,
 the older `seg` page names, and an image size above 4 GiB.
 
+AFD is covered by two fixtures. One is written by `affconvert -s64k -M32k`, which
+spreads the 48 pages over five files, with none in the first and the image size
+and hashes only in the last. The other is written by FTK Imager 4.7.3.61 with 1 MB
+fragments and compression 0: three files, its only page in the middle one, the
+image size in all three, and the sector size stored as text in the first and
+as a number in the others. Both reproduce the source when opened from the
+directory and from every file in it, and AFFLIB's `affcat` reads both back to the
+same SHA-256. The one from `affconvert` matches the MD5 and SHA-1 it recorded;
+FTK Imager's matches the MD5 and SHA-1 in FTK Imager's own log, checked by hand,
+since the image stores none. The test writer covers pages spread over files, a
+page stored twice, files that disagree, gaps in the numbering and a lost last
+file.
+
 **Against real evidence.** Physical acquisitions written by FTK Imager, from
 28.6 GiB to 238 GiB, including 15-segment sets. Decoded ranges are byte
 identical to `ewfexport`'s output for the same ranges, including ranges that
@@ -205,8 +243,10 @@ independent implementation possible.
 
 For AFF: AFFLIB's own documentation (`doc/affdoc.doc`) and the segment names and
 flag values in its public header, `include/afflib/afflib.h`, in the
-[sshock/AFFLIBv3](https://github.com/sshock/AFFLIBv3) repository. No AFFLIB code
-is copied.
+[sshock/AFFLIBv3](https://github.com/sshock/AFFLIBv3) repository, and for AFD how
+AFFLIB finds, names and joins the files of one, in `lib/vnode_afd.cpp` at commit
+[`f35df6c`](https://github.com/sshock/AFFLIBv3/blob/f35df6c1d2610e3233c30d50054c00e29d7d5a23/lib/vnode_afd.cpp).
+No AFFLIB code is copied.
 
 ## License
 
