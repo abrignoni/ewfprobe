@@ -290,6 +290,34 @@
       ],
       "writer": "hdiutil, macOS 26.6.2",
       "stores_no_hash": true
+    },
+    "dmg-sparsebundle": {
+      "format": "sparsebundle",
+      "hdiutil_format": "UDSB",
+      "files": [
+        "dmg-sparsebundle.sparsebundle/Info.bckup",
+        "dmg-sparsebundle.sparsebundle/Info.plist",
+        "dmg-sparsebundle.sparsebundle/bands/0",
+        "dmg-sparsebundle.sparsebundle/bands/1",
+        "dmg-sparsebundle.sparsebundle/bands/2",
+        "dmg-sparsebundle.sparsebundle/lock",
+        "dmg-sparsebundle.sparsebundle/token"
+      ],
+      "writer": "hdiutil, macOS 26.6.2",
+      "stores_no_hash": true,
+      "image": "dmg-sparsebundle.sparsebundle"
+    },
+    "dmg-segmented": {
+      "format": "udif",
+      "hdiutil_format": "UDZO",
+      "files": [
+        "dmg-segmented.dmg",
+        "dmg-segmented.002.dmgpart",
+        "dmg-segmented.003.dmgpart"
+      ],
+      "writer": "hdiutil, macOS 26.6.2",
+      "stores_no_hash": true,
+      "hdiutil_segment_size": "40k"
     }
   },
   "logical": {
@@ -316,6 +344,31 @@
         "path": "Raw Data/AppDomain-com.facebook.Facebook/Library/WebKit/LocalStorage/https_s-static.ak.facebook.com_0.localstorage/https_s-static.ak.facebook.com_0.localstorage",
         "size": 12288,
         "sha256": "10bc405034c59e98b4cc1dddf9c69779800b78583577172197110575fcb59e6c"
+      }
+    }
+  },
+  "gpt_dmg": {
+    "sha256": "7094494ccc3edb30e8a242761e8d9048e1c3e59a0fc1a87579b7b88f352df9f8",
+    "size": 2254848,
+    "writer": "hdiutil, macOS 26.6.2",
+    "variants": {
+      "dmg-gpt-segmented": {
+        "files": [
+          "dmg-gpt-segmented.dmg",
+          "dmg-gpt-segmented.002.dmgpart",
+          "dmg-gpt-segmented.003.dmgpart",
+          "dmg-gpt-segmented.004.dmgpart",
+          "dmg-gpt-segmented.005.dmgpart"
+        ],
+        "hdiutil_format": "UDZO",
+        "hdiutil_segment_size": "40k"
+      },
+      "dmg-gpt-segment-one": {
+        "files": [
+          "dmg-gpt-segment-one.dmg"
+        ],
+        "hdiutil_format": "UDZO",
+        "hdiutil_segment_size": "100m"
       }
     }
   }
