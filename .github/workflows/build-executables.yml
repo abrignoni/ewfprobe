@@ -1,0 +1,164 @@
+name: Build executables
+
+# A pushed v* tag builds that tag and publishes a release. A manual run with a tag
+# does the same for a tag that already exists (the build tooling comes from the branch
+# the run starts from, the source from the tag). A manual run without a tag, and every
+# pull request, builds and checks the executables without publishing anything.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing v* tag to build and release. Leave empty for a test build."
+        required: false
+        default: ""
+  pull_request:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+          - os: windows-11-arm
+            label: windows-arm64
+          - os: macos-latest
+            label: macos-arm64
+          - os: macos-15-intel
+            label: macos-x64
+          - os: ubuntu-22.04
+            label: linux-x64
+          - os: ubuntu-22.04-arm
+            label: linux-arm64
+    steps:
+      - name: Check out the build tooling
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Check out the source to build
+        uses: actions/checkout@v4
+        with:
+          path: src
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Read the version, and check it matches the tag
+        id: version
+        shell: python
+        env:
+          RELEASE_TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name || '') }}
+        run: |
+          import os, re
+          src = open("src/ewfprobe.py", encoding="utf-8").read()
+          version = "v" + re.search(r'^__version__ = "([^"]+)"', src, re.M).group(1)
+          tag = os.environ["RELEASE_TAG"]
+          if tag:
+              assert tag == version, f"tag {tag} does not match __version__ {version}"
+              print("tag", tag, "matches __version__")
+          else:
+              print("test build of", version)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"version={version}\n")
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: Build the command line executable
+        working-directory: src
+        run: pyinstaller --noconfirm --clean --onefile --console --name ewfprobe ewfprobe.py
+
+      - name: Check the executable writes what the source writes
+        shell: bash
+        run: |
+          ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          python ci/tools/smoke_frozen.py src "src/dist/ewfprobe$ext"
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          name="ewfprobe-${VERSION}-${{ matrix.label }}"
+          mkdir -p "pkg/$name"
+          cp ci/packaging/README.txt src/LICENSE "pkg/$name/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp src/dist/ewfprobe.exe "pkg/$name/"
+            (cd "pkg/$name" && sha256sum ewfprobe.exe > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            (cd pkg && 7z a -bd "../$name.zip" "$name" > /dev/null)
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            cp src/dist/ewfprobe "pkg/$name/"
+            (cd "pkg/$name" && shasum -a 256 ewfprobe > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            (cd pkg && ditto -c -k --keepParent "$name" "../$name.zip")
+          else
+            cp src/dist/ewfprobe "pkg/$name/"
+            (cd "pkg/$name" && sha256sum ewfprobe > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            (cd pkg && tar -czf "../$name.tar.gz" "$name")
+          fi
+          ls -la "$name".*
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ewfprobe-${{ matrix.label }}
+          path: |
+            ewfprobe-*.zip
+            ewfprobe-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the build tooling
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: Check out the source that was built
+        uses: actions/checkout@v4
+        with:
+          path: src
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums of the archives and the source file
+        run: |
+          cp src/ewfprobe.py artifacts/
+          cd artifacts && sha256sum ewfprobe-* ewfprobe.py > SHA256SUMS.txt && cat SHA256SUMS.txt
+          test "$(wc -l < SHA256SUMS.txt)" -eq 7
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          sed "s/{{VERSION}}/${TAG}/g" ci/packaging/release-notes.md > notes.md
+          gh release create "$TAG" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "ewfprobe ${TAG}" \
+            --notes-file notes.md

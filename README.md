@@ -91,6 +91,18 @@ volume header while still writing compressed chunks. A reader that decides
 compression from the header rather than from each chunk's own flag produces
 garbage on such an image.
 
+## Standalone executables
+
+Each release carries `ewfprobe` built as a single executable with PyInstaller on
+Python 3.14, for Windows x64 and arm64, macOS on Apple silicon and Intel, and Linux x64
+and arm64, beside `ewfprobe.py` itself. The workflow that builds them
+(`.github/workflows/build-executables.yml`) runs each executable on the reference images
+in `tests/fixtures`. It requires `info`, `verify` and `export` to write the same bytes as
+`python ewfprobe.py`, the export to match the source disk's SHA-256, and a set missing a
+segment to be refused, before it is packaged with `SHA256SUMS.txt` and a README. The
+executables are not code signed; the README inside each archive says what Windows
+SmartScreen and macOS Gatekeeper will ask.
+
 ## Tests
 
 ```
