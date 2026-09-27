@@ -16,16 +16,17 @@ needs.
 
 Written from the public format documentation: Joachim Metz, "Expert Witness
 Compression Format (EWF)" and "Expert Witness Compression Format 2 (EWF2)", in
-the libyal/libewf repository under ``documentation/``. No code is taken from libewf, which is LGPL, or from any
-other EWF implementation. This file is MIT, and reimplementing a documented
-format is what keeps it that way.
+the libyal/libewf repository under ``documentation/``. No code is taken from
+libewf, which is LGPL, or from any other EWF implementation. This file is MIT,
+and reimplementing a documented format is what keeps it that way.
 
 Scope. This reads EWF-E01, the format EnCase 6 and 7 and FTK Imager write and
-by far the most common one in the field, and EWF-S01, the variant ASR Data's
-SMART writes, and EWF2-Ex01, which EnCase 7 and later write. It does not read
-logical evidence (.L01, .Lx01), encrypted Ex01 images (the encryption is not
-publicly documented) or Ex01 images compressed with bzip2 (no sample exists to
-validate against), and it never writes.
+by far the most common one in the field, EWF-S01, the variant ASR Data's SMART
+writes, and EWF2-Ex01, which EnCase 7 and later write. It does not read logical
+evidence (.L01, .Lx01), encrypted Ex01 images (the encryption is not publicly
+documented) or Ex01 images compressed with bzip2 (no sample exists to validate
+against), and it never writes.
+
 An image whose content is encrypted at rest, by BitLocker or FileVault or an
 encrypted APFS volume, reads back as the ciphertext that was acquired: the
 reader is working, there is simply nothing plain in there to find.
