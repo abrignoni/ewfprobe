@@ -6,7 +6,9 @@ ewfprobe {{VERSION}}: standalone executables of `ewfprobe.py`, built by this rep
 - `ewfprobe-{{VERSION}}-linux-x64.tar.gz` and `ewfprobe-{{VERSION}}-linux-arm64.tar.gz`, built on Ubuntu 22.04 so they run on distributions with a glibc at least that old.
 - `ewfprobe.py`, the tagged source file itself.
 
-Each archive holds the command line tool, `README.txt`, `LICENSE` and `SHA256SUMS.txt`. `SHA256SUMS.txt` beside the archives covers the archives and `ewfprobe.py`. Before it was attached, each executable was run on the repository's reference images, written by libewf's `ewfacquire` (EnCase 5, EnCase 6, and a four-segment EnCase 6 set). It printed the same `info` and `verify` output as `python ewfprobe.py`, verified the stored hashes, exported a disk matching the source disk's SHA-256, and refused a set with a segment missing.
+It reads EnCase/EWF `.E01`, SMART `.s01`, EnCase 7 `.Ex01`, and AFF, as an `.aff` file or an `.afd` folder, as a disk image, and lists and reads the files in an EnCase `.L01`.
+
+Each archive holds the command line tool, `README.txt`, `LICENSE` and `SHA256SUMS.txt`. `SHA256SUMS.txt` beside the archives covers the archives and `ewfprobe.py`. Before it was attached, each executable was run on the repository's reference images: E01, SMART and Ex01 images written by libewf's `ewfacquire`, E01 and SMART images written by FTK Imager, AFF files and AFD folders written by AFFLIB's `affconvert` and by FTK Imager, and an L01 written by EnCase. It printed the same output as `python ewfprobe.py`, verified the stored hashes where an image records them, exported a disk matching the source disk's SHA-256, listed and exported the L01's entries matching answers taken from libewf, and refused a set with a segment missing.
 
 None of the executables is code signed: Windows SmartScreen and macOS Gatekeeper will each ask once, and the README inside says what to do. Unzip to a local folder rather than running from a network share.
 
