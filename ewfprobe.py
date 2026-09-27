@@ -3644,9 +3644,10 @@ class EwfImage:
         wrapped = keys.get(_AF_AFFKEY, (0, b""))[1]
         seals = sorted((int(m.group(1)), data) for name, (_arg, data) in keys.items()
                        if (m := _AF_AFFKEY_EVP.fullmatch(name)))
+        which = ("a certificate" if len(seals) == 1
+                 else f"one of the {len(seals)} certificates")
         opens = (["its passphrase"] if wrapped else []) + (
-            [f"the private key of {'a certificate' if len(seals) == 1 else 'one of the '
-               + str(len(seals)) + ' certificates'} it is sealed to"] if seals else [])
+            [f"the private key of {which} it is sealed to"] if seals else [])
         if not opens:
             raise EwfFormatError(f"{label} has encrypted segments and no key segment to "
                                  f"open them with")
