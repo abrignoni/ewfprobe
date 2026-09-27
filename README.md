@@ -1,7 +1,8 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`, `.afd`) forensic images, and EnCase logical evidence (`.L01`). One file, pure
-Python, standard library only. No compiler, no network, nothing to install.
+A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`, `.afd`) forensic images, Apple disk images (`.dmg`, `.sparseimage`), and EnCase logical evidence (`.L01`). One file, pure
+Python, standard library only. No compiler, no network, nothing to install (an
+LZFSE-compressed `.dmg` alone needs the optional `pyliblzfse` package).
 
 It opens an acquisition, joins its segments, and presents the acquired disk as
 an ordinary seekable file object, so anything that can read a raw image can read
@@ -38,6 +39,7 @@ ewfprobe info    evidence.E01     # geometry, segments, metadata, stored hashes
 ewfprobe verify  evidence.E01     # recompute MD5 and SHA-1, compare with stored
 ewfprobe export  evidence.E01 -o out.raw
 ewfprobe export  evidence.E01 -o - --offset 1048576 --length 65536
+ewfprobe verify  acquisition.dmg  # also checks the checksums a .dmg records
 ewfprobe files   evidence.L01     # an L01's entries: kind, size, stored MD5, path
 ewfprobe export  evidence.L01 --entry "Folder/photo.jpg" -o photo.jpg
 ```
@@ -141,9 +143,50 @@ Times (`cr`, `ac`, `wr`, `mo`, `dl`, `aq`) are read as the POSIX values the
 specification describes. None of the tested files sets them, so that part rests on
 the specification alone.
 
+Reads Apple disk images: UDIF (`.dmg`), the format `hdiutil` writes and macOS
+acquisition tools deliver, and sparse images (`.sparseimage`). Fuji, the open-source
+macOS acquisition tool, copies the files into a sparse image and then converts it
+with `hdiutil convert -format UDZO` (`acquisition/abstract.py`, line 405 at
+[`d9cf00f`](https://github.com/Lazza/Fuji/blob/d9cf00f913970204fd75b94440206f9e6f09906d/acquisition/abstract.py#L405)),
+so its Rsync, ASR and Ditto acquisitions are UDZO `.dmg` files; its sysdiagnose
+method writes a zip instead.
+
+| `hdiutil` format | What the chunks are | Reads with |
+| --- | --- | --- |
+| UDZO | zlib | the standard library |
+| UDBZ | bzip2 | the standard library |
+| ULMO | LZMA | the standard library |
+| UDCO | ADC | this file (ADC is short and documented) |
+| ULFO | LZFSE | the optional `pyliblzfse` package; without it the image is refused, saying so |
+| UDRO, UFBI | stored, not compressed | this file |
+| UDSP (`.sparseimage`) | 1 MiB bands, stored in the order they were written | this file |
+
+A UDIF image is recognised by the 512-byte `koly` trailer at the end of the file, not
+by its name. An uncompressed read-write image (UDRW) and a `.cdr` have no trailer:
+they are the disk's bytes as they are and read as a raw image, so they need no
+reader. Runs of the disk that were never written are not stored and read as zeros.
+
+`verify` also checks what a UDIF image records about itself: the checksum of its
+stored data, each block table's checksum, and the master checksum over the
+tables' checksums. These were measured on images `hdiutil` wrote: type 2 is CRC32,
+type 4 (used by UFBI) is MD5, and a block table's checksum covers only the chunks it
+stores. None of them is a hash of the disk as a whole, since runs that were never
+written are left out, so `verify` prints the disk's MD5 and SHA-1 with "none stored"
+beside them.
+
+A sparse image longer than about a gigabyte of written bands carries more than one
+header. Measured on images `hdiutil` wrote, beyond what the format documentation
+covers: the first header holds 1,008 band slots, and once they are used it names a
+continuation header written after them, at offset 20; each continuation holds 1,010
+slots from offset 56 and names the next one at offset 12. The disk's sector count is
+64-bit at offset 28; the 32-bit field at offset 16 holds only its low half, which is
+0 on a 2 TiB image.
+
 `open_image()` is the same function as `open_ewf()`. `is_image()` is true for the
-disk images ewfprobe reads (EWF, EWF2, AFF, and an AFD directory),
-`is_logical_evidence()` for an L01, and `is_ewf()` for EWF alone.
+disk images ewfprobe reads (EWF, EWF2, AFF, an AFD directory, UDIF and sparse
+images), `is_logical_evidence()` for an L01, `is_ewf()` for EWF alone, and
+`apple_image_kind()` names an Apple disk image as `UDIF`, `SPARSEIMAGE` or
+`ENCRYPTED`.
 
 Refused with a message naming the reason rather than read wrongly:
 
@@ -165,6 +208,14 @@ Refused with a message naming the reason rather than read wrongly:
   a hash, the page size, the sector size or the bad-sector marker.
 - **AFM**, AFF metadata kept beside the image as split raw files (`.000`, `.001`
   and on).
+- **An encrypted Apple disk image** (`encrcdsa`): it needs its password.
+- **A segmented `.dmg`** (with `.dmgpart` files), **a sparse bundle**
+  (`.sparsebundle`, a folder of bands), **an older `.dmg` whose block tables are only
+  in a resource fork**, and **a sparse image of a version other than 3**. Join a
+  segmented image with `hdiutil convert` first.
+- **A `.dmg` whose block tables leave a gap or overlap, name a chunk type other
+  than the ones above, or point outside the stored data**, and **a `.dmg` or sparse
+  image cut short**.
 
 It never writes.
 
@@ -270,6 +321,18 @@ claims its own copyright. No L01 from another writer has been available; a write
 in the suite built from the specification and from the layout of these files
 covers the behaviours that file does not exercise.
 
+**Apple disk images, against Apple's own tools.** `hdiutil` wrote every format in
+the table above from the 3 MiB source the other fixtures use, and those images are
+committed under `tests/fixtures`: each reproduces the source byte for byte and
+verifies every checksum it records. ADC was written from its documentation, and the
+UDCO image's own checksums confirm the decode. A 2.5 GB sparse image `hdiutil` wrote
+with 2,433 bands across three headers, too large to commit, reads byte-identical to
+the same image attached with `hdiutil attach -readonly -nomount` and read from its
+raw device. A private sample written by Fuji 1.2.0 (UDZO) verified every checksum it
+records, 512 sampled windows across the disk matched its raw device the same way, and
+a walk of its APFS container through qnxprobe listed the same paths and file sizes as
+macOS's own read-only mount of the image.
+
 ## Standalone executables
 
 Each release carries `ewfprobe` built as a single executable with PyInstaller on
@@ -280,7 +343,8 @@ in `tests/fixtures`. It requires `info`, `verify` and `export` to write the same
 `python ewfprobe.py`, the export to match the source disk's SHA-256, and a set missing a
 segment to be refused, before it is packaged with `SHA256SUMS.txt` and a README. On the
 L01 it also requires `files` and `export --entry` to match, and the exports to match the
-known answers taken from libewf. The
+known answers taken from libewf. The executables do not include `pyliblzfse`, so they
+refuse an LZFSE-compressed `.dmg`, naming the package, and the workflow checks that. The
 executables are not code signed; the README inside each archive says what Windows
 SmartScreen and macOS Gatekeeper will ask.
 
@@ -305,7 +369,12 @@ and the manifest records which version wrote each variant:
 EWFACQUIRE=/path/to/ewfacquire python tools/make_fixtures.py tests/fixtures --add smart-fast smart-split
 ```
 
-That tool shells out to `ewfacquire` and `affconvert` and is for development only.
+The Apple disk image variants (`dmg-*`) are written by `hdiutil`, so on macOS only.
+The LZFSE one is skipped where `pyliblzfse` is not installed; set
+`EWFPROBE_REQUIRE_LZFSE=1` to make that a failure instead, as the CI jobs that
+install it do.
+
+That tool shells out to `ewfacquire`, `affconvert` and `hdiutil` and is for development only.
 libewf and AFFLIB are used there solely to produce test data. Nothing from them
 ships and `ewfprobe` imports nothing.
 
@@ -326,6 +395,18 @@ flag values in its public header, `include/afflib/afflib.h`, in the
 AFFLIB finds, names and joins the files of one, in `lib/vnode_afd.cpp` at commit
 [`f35df6c`](https://github.com/sshock/AFFLIBv3/blob/f35df6c1d2610e3233c30d50054c00e29d7d5a23/lib/vnode_afd.cpp).
 No AFFLIB code is copied.
+
+For Apple disk images: Joachim Metz, *Mac OS disk image types*, in the
+[libyal/libmodi](https://github.com/libyal/libmodi) repository under `documentation/`,
+and the block-table rules libmodi's own code applies (contiguous tables and entries,
+compressed chunks of at most 2048 sectors, chunk data offsets counted from the start of
+the file, unknown chunk types refused), in `libmodi/libmodi_handle.c`, both at commit
+[`8fc5088`](https://github.com/libyal/libmodi/blob/8fc5088e51cd606d9f2b8ce000bfdf5a78042f84/libmodi/libmodi_handle.c).
+ADC follows Joachim Metz, *ADC compressed data format*, in
+[libyal/libfmos](https://github.com/libyal/libfmos) at commit
+[`3396edf`](https://github.com/libyal/libfmos/blob/3396edfc19d172795971c00a2e848d8146cf7523/documentation/ADC%20compressed%20data%20format.asciidoc).
+The checksum rules and the sparse image's continuation headers and 64-bit sector count
+were measured on images `hdiutil` wrote, as described above. No libmodi code is copied.
 
 ## License
 

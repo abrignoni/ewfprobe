@@ -55,6 +55,14 @@ def main(argv: list[str]) -> int:
         work = Path(tmp)
         for name, variant in sorted(manifest["variants"].items()):
             image = str(fixtures / variant.get("image", variant["files"][0]))
+            if variant.get("needs") == "liblzfse":
+                # The executables do not bundle pyliblzfse, so an LZFSE image is
+                # refused, and the refusal has to name what is missing.
+                b = run(exe + ["info", image], work, want=2)
+                assert b"pyliblzfse" in b.stderr, (name, b.stderr)
+                checks += 1
+                print(f"{name}: refused, naming the optional package it needs")
+                continue
             out = {}
             for who, cmd in (("py", py), ("exe", exe)):
                 raw = work / f"{name}-{who}.raw"

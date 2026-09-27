@@ -18,12 +18,17 @@ jobs:
         os: [ubuntu-latest]
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         include:
+          # pyliblzfse has wheels for these, so the LZFSE (ULFO) fixture is read
+          # here and must not be skipped; elsewhere it is skipped, and the
+          # refusal that names the missing package is tested instead.
           - os: macos-latest
             python: "3.13"
+            lzfse: true
           - os: macos-latest
             python: "3.14"
           - os: windows-latest
             python: "3.13"
+            lzfse: true
           - os: windows-latest
             python: "3.14"
     steps:
@@ -32,4 +37,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install --upgrade pip pytest
-      - run: python -m pytest tests -q
+      - if: ${{ matrix.lzfse }}
+        run: 'python -m pip install --only-binary=:all: pyliblzfse'
+      - run: python -m pytest tests -q -rs
+        env:
+          EWFPROBE_REQUIRE_LZFSE: ${{ matrix.lzfse && '1' || '' }}
