@@ -36,6 +36,16 @@ dmg-encrypted`` rebuilds them). Each one is attached by hdiutil with that passwo
 and its /dev/rdisk read back before it is kept, so its known answer, the disk's
 SHA-256, is macOS's own reading and not ewfprobe's.
 
+The manifest's ``encrypted_aff`` section describes AFF images AFFLIB encrypted
+from this tool's own source (``--add aff-encrypted`` rebuilds them): written
+encrypted by affconvert with a passphrase set, sealed to a certificate as well by
+affcrypto -A, and encrypted in place by affcrypto -e with a passphrase or a
+certificate. The test key and certificate are generated once and kept beside the
+fixtures. Each image AFFLIB can open is read back by affconvert -r with its
+passphrase or key and must give the source; the ones encrypted in place are kept
+because AFFLIB 3.7.22 cannot open them (affcrypto -e writes its first segment over
+the file's header), and the manifest records that AFFLIB refused each.
+
 The manifest's ``ad_encrypted`` section describes sets FTK Imager wrote with AD
 encryption, from a small disk of their own that ``ad_source()`` regenerates
 (``--ad-source <file>`` writes it for FTK Imager to image), with the test
@@ -71,6 +81,7 @@ import sys
 
 EWFACQUIRE = os.environ.get("EWFACQUIRE", "ewfacquire")
 AFFCONVERT = os.environ.get("AFFCONVERT", "affconvert")
+AFFCRYPTO = os.environ.get("AFFCRYPTO", "affcrypto")
 HDIUTIL = os.environ.get("HDIUTIL", "hdiutil")
 
 # Apple disk image variants, written by hdiutil (so macOS only) from the same
@@ -139,6 +150,20 @@ AFF_VARIANTS = [
     # each file, so the pages spread across them and the image size and hashes land
     # in the last one.
     ("aff-afd",    ["-s64k", "-M32k"]),
+]
+
+# Encrypted AFF variants, by AFFLIB, from the same source: (name, affconvert options,
+# how it is encrypted). A variant ending -afd is written as an AFD, as above.
+AFF_PASSWORD = "ewfprobe-aff-password"
+AFF_TEST_KEY = "aff-enc-test-key.pem"
+AFF_TEST_CERT = "aff-enc-test-cert.pem"
+ENC_AFF_VARIANTS = [
+    ("aff-enc-pass",          ["-s64k"],          "passphrase"),
+    ("aff-enc-lzma",          ["-L", "-s64k"],    "passphrase"),
+    ("aff-enc-afd",           ["-s64k", "-M32k"], "passphrase"),
+    ("aff-enc-both",          ["-s64k"],          "passphrase and certificate"),
+    ("aff-enc-inplace-pass",  ["-s64k"],          "passphrase, in place"),
+    ("aff-enc-inplace-cert",  ["-s64k"],          "certificate, in place"),
 ]
 
 # Acquisition variants. Between them these cover the older table layout with no
@@ -277,7 +302,7 @@ def acquire(raw_path, out_dir, name, fmt, compression, sectors_per_chunk, segmen
     return made
 
 
-def acquire_aff(raw_path, out_dir, name, options):
+def acquire_aff(raw_path, out_dir, name, options, env=None):
     """One AFF variant, as (the path to open, the files written). affconvert records
     its command line in the image, so it runs in the output folder with relative
     names, keeping local paths out of the fixture. A variant with a file size cap
@@ -292,7 +317,7 @@ def acquire_aff(raw_path, out_dir, name, options):
         os.remove(stale)
     result = subprocess.run(
         [AFFCONVERT, "-q", *options, "-o", target, os.path.basename(raw_path)],
-        cwd=out_dir, capture_output=True, text=True, check=False)
+        cwd=out_dir, capture_output=True, text=True, check=False, env=env)
     if result.returncode != 0 or not os.path.exists(stale):
         raise SystemExit(f"affconvert failed for {name}:\n{result.stdout}\n{result.stderr}")
     files = ([f"{target}/{f}" for f in sorted(os.listdir(stale)) if f.lower().endswith(".aff")]
@@ -300,6 +325,97 @@ def acquire_aff(raw_path, out_dir, name, options):
     for f in files:
         os.chmod(os.path.join(out_dir, f), 0o644)   # affconvert creates them 0777
     return target, files
+
+
+def _afflib_reads(out_dir, image, source_sha256, env):
+    """True when AFFLIB's affconvert -r, with ``env`` giving it the passphrase or
+    key, reads ``image`` back as the source; False when it refuses the image."""
+    work = os.path.join(out_dir, "aff-enc-check")
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    try:
+        local = os.path.join(work, "check" + (".afd" if image.endswith(".afd") else ".aff"))
+        if os.path.isdir(os.path.join(out_dir, image)):
+            shutil.copytree(os.path.join(out_dir, image), local)
+        else:
+            shutil.copy(os.path.join(out_dir, image), local)
+        subprocess.run([AFFCONVERT, "-q", "-r", os.path.basename(local)], cwd=work,
+                       capture_output=True, text=True, check=False, env=env)
+        raw = os.path.join(work, "check.raw")
+        if not os.path.exists(raw):
+            return False
+        with open(raw, "rb") as fh:
+            got = hashlib.sha256(fh.read()).hexdigest()
+        if got != source_sha256:
+            raise SystemExit(f"{image}: AFFLIB reads it as another disk")
+        return True
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def build_encrypted_affs(out_dir, raw_path, source_sha256):
+    """The encrypted AFF images, as the manifest section."""
+    key, cert = (os.path.join(out_dir, f) for f in (AFF_TEST_KEY, AFF_TEST_CERT))
+    if not (os.path.exists(key) and os.path.exists(cert)):
+        result = subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key,
+             "-out", cert, "-days", "36500", "-subj", "/CN=ewfprobe AFF test"],
+            capture_output=True, text=True, check=False)
+        if result.returncode:
+            raise SystemExit(f"openssl could not make the test key:\n{result.stderr}")
+        os.chmod(key, 0o644)                 # a test key, published with the fixtures
+    section = {"writer": "AFFLIB " + writer_version(AFFCONVERT).split()[-1],
+               "password": AFF_PASSWORD, "key": AFF_TEST_KEY, "certificate": AFF_TEST_CERT,
+               "variants": {}}
+    plain = {k: v for k, v in os.environ.items() if not k.startswith("AFFLIB_")}
+    with_password = dict(plain, AFFLIB_PASSPHRASE=AFF_PASSWORD)
+    for name, options, how in ENC_AFF_VARIANTS:
+        in_place = how.endswith("in place")
+        image, made = acquire_aff(raw_path, out_dir, name, options,
+                                  env=plain if in_place else with_password)
+        if how == "passphrase and certificate":
+            step = [AFFCRYPTO, "-A", "-C", AFF_TEST_CERT, "-p", AFF_PASSWORD, image]
+        elif how == "passphrase, in place":
+            step = [AFFCRYPTO, "-e", "-N", AFF_PASSWORD, image]
+        elif how == "certificate, in place":
+            step = [AFFCRYPTO, "-e", "-C", AFF_TEST_CERT, image]
+        else:
+            step = None
+        if step:
+            result = subprocess.run(step, cwd=out_dir, capture_output=True, text=True,
+                                    check=False, env=plain)
+            if result.returncode:
+                raise SystemExit(f"affcrypto failed for {name}:\n{result.stdout}"
+                                 f"{result.stderr}")
+        opens = []
+        if "passphrase" in how:
+            opens.append("password")
+        if "certificate" in how:
+            opens.append("private key")
+        env = dict(plain, **({"AFFLIB_PASSPHRASE": AFF_PASSWORD} if "password" in opens
+                             else {"AFFLIB_DECRYPTING_PRIVATE_KEYFILE": key}))
+        entry = {"encryption": how, "opens_with": opens, "options": options,
+                 "files": made, "afflib_reads": _afflib_reads(out_dir, image,
+                                                              source_sha256, env)}
+        if in_place:
+            if entry["afflib_reads"]:
+                raise SystemExit(f"{name}: AFFLIB now reads a file encrypted in place; "
+                                 f"the note on it is out of date")
+            with open(os.path.join(out_dir, image), "rb") as fh:
+                entry["header_lost"] = fh.read(8) != b"AFF10\r\n\x00"
+        elif not entry["afflib_reads"]:
+            raise SystemExit(f"{name}: AFFLIB cannot read it back")
+        if "private key" in opens and "password" in opens:
+            entry["afflib_reads_with_key"] = _afflib_reads(
+                out_dir, image, source_sha256,
+                dict(plain, AFFLIB_DECRYPTING_PRIVATE_KEYFILE=key))
+        if image != made[0]:
+            entry["image"] = image
+        section["variants"][name] = entry
+        size = sum(os.path.getsize(os.path.join(out_dir, f)) for f in made)
+        print(f"  {name:<24} {how:<28} {size:>9,} bytes, AFFLIB reads it: "
+              f"{entry['afflib_reads']}")
+    return section
 
 
 def _hdiutil(out_dir, name, *args):
@@ -590,7 +706,9 @@ def main(argv):
     dmg_known = dict(DMG_VARIANTS)
     gpt_wanted = not add or "dmg-gpt" in args[1:]
     enc_wanted = not add or "dmg-encrypted" in args[1:]
-    args = [a for a in args if a not in ("dmg-gpt", "dmg-encrypted")] if add else args
+    enc_aff_wanted = not add or "aff-encrypted" in args[1:]
+    args = ([a for a in args if a not in ("dmg-gpt", "dmg-encrypted", "aff-encrypted")]
+            if add else args)
     ewf_wanted = not add or any(a not in aff_known and a not in dmg_known for a in args[1:])
     aff_wanted = not add or any(a in aff_known for a in args[1:])
     dmg_wanted = not add or any(a in dmg_known for a in args[1:])
@@ -599,7 +717,7 @@ def main(argv):
                          f"on macOS (test tool only)")
     if ewf_wanted and not shutil.which(EWFACQUIRE):
         raise SystemExit(f"{EWFACQUIRE} not found; install libewf (test tool only)")
-    if aff_wanted and not shutil.which(AFFCONVERT):
+    if (aff_wanted or enc_aff_wanted) and not shutil.which(AFFCONVERT):
         raise SystemExit(f"{AFFCONVERT} not found; install AFFLIB (test tool only)")
     writer = writer_version() if ewf_wanted else None
 
@@ -680,6 +798,10 @@ def main(argv):
         manifest["gpt_dmg"] = build_gpt_dmgs(out)
         print(f"  gpt disk             {manifest['gpt_dmg']['size']:,} bytes, "
               f"{len(manifest['gpt_dmg']['variants'])} segmented images")
+
+    if enc_aff_wanted:
+        manifest["encrypted_aff"] = build_encrypted_affs(out, raw_path, manifest["sha256"])
+        print(f"  {len(manifest['encrypted_aff']['variants'])} encrypted AFF images")
 
     if enc_wanted:
         manifest["encrypted_dmg"] = build_encrypted_dmgs(out)

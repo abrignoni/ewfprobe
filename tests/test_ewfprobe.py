@@ -802,7 +802,7 @@ def test_aff_every_page_form_reads(tmp_path):
     path = write_aff(tmp_path / "img.aff", data, kinds=["z", "0", "l", "r", "r"])
     with ewfprobe.open_ewf(path) as img:
         assert img.format == ewfprobe.FORMAT_AFF
-        assert sorted(arg for _i, _o, _l, arg in img._aff_pages.values()) == [
+        assert sorted(arg for _i, _o, _l, arg, _e in img._aff_pages.values()) == [
             0x00, 0x00, 0x01, 0x21, 0x33]
         assert img.media_size == len(data)
         assert img.read() == data
@@ -864,11 +864,20 @@ def test_aff_missing_page_without_a_marker_is_refused_on_read(tmp_path):
             img.read(1024)
 
 
-@pytest.mark.parametrize("name", ["page0/aes256", "affkey_aes256"])
-def test_encrypted_aff_is_refused(tmp_path, name):
-    path = write_aff(tmp_path / "img.aff", aff_sample(2), extra=[(name, b"\x00" * 32, 0)])
-    with pytest.raises(ewfprobe.EwfFormatError, match="encrypted"):
+def test_encrypted_aff_segments_with_no_key_segment_are_refused(tmp_path):
+    path = write_aff(tmp_path / "img.aff", aff_sample(2),
+                     extra=[("page0/aes256", b"\x00" * 32, 0)])
+    with pytest.raises(ewfprobe.EwfFormatError, match="no key segment"):
         ewfprobe.open_ewf(path)
+
+
+def test_a_key_segment_with_nothing_encrypted_reads_in_the_clear(tmp_path):
+    data = aff_sample(2)
+    path = write_aff(tmp_path / "img.aff", data,
+                     extra=[("affkey_aes256", b"\x00" * 52, 0)])
+    with ewfprobe.open_ewf(path) as img:
+        assert img.read() == data
+        assert img.encryption is None
 
 
 def test_aff_without_an_image_size_is_refused(tmp_path):
@@ -948,7 +957,7 @@ def test_an_afd_reads_as_one_image_with_its_pages_spread_across_files(tmp_path):
         assert img.format == ewfprobe.FORMAT_AFD
         assert [os.path.basename(p) for p in img.paths] == [
             "file_000.aff", "file_001.aff", "file_002.aff", "file_003.aff"]
-        assert {i for i, _o, _l, _a in img._aff_pages.values()} == {1, 2, 3}
+        assert {i for i, _o, _l, _a, _e in img._aff_pages.values()} == {1, 2, 3}
         assert len(img.sizes) == 4 and img.missing_page_count == 0
         assert img.read() == data
         result = img.verify()

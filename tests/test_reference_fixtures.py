@@ -243,7 +243,7 @@ def test_aff_fixtures_cover_every_page_form_and_read_as_aff():
         with ewfprobe.open_ewf(_first(variants[name])) as img:
             assert img.format == ewfprobe.FORMAT_AFF, name
             assert img.missing_page_count == 0, name
-            forms |= {arg for _i, _off, _len, arg in img._aff_pages.values()}
+            forms |= {arg for _i, _off, _len, arg, _enc in img._aff_pages.values()}
     assert {0x00, 0x01, 0x21, 0x33} <= forms, sorted(forms)
     with ewfprobe.open_ewf(_first(variants["ftk-aff"])) as img:
         assert img.metadata["case_number"] == "FIXTURE"
@@ -272,11 +272,11 @@ def test_afd_fixtures_read_as_one_image_from_the_directory_or_any_file():
                 assert img.missing_page_count == 0, path
                 assert _media_sha(img) == man["sha256"], path
     with ewfprobe.open_ewf(_first(variants["aff-afd"])) as img:
-        holders = {i for i, _o, _l, _a in img._aff_pages.values()}
+        holders = {i for i, _o, _l, _a, _e in img._aff_pages.values()}
         assert 0 not in holders and len(holders) >= 3, holders
         assert set(img.stored_hashes) == {"MD5", "SHA1"}
     with ewfprobe.open_ewf(_first(variants["ftk-aff-split"])) as img:
-        assert {i for i, _o, _l, _a in img._aff_pages.values()} == {1}
+        assert {i for i, _o, _l, _a, _e in img._aff_pages.values()} == {1}
         assert img.sector_size == 512 and img.chunk_size == 16 << 20
         assert img.metadata["case_number"] == "FIXTURE"
         assert img.metadata["ad_unique_desc"] == "ewfprobe fixture ftk-aff-split"
@@ -547,3 +547,176 @@ def test_ad_encrypted_sets_read_back_the_disk_ftk_imager_imaged(name, variant):
         ewfprobe.open_ewf(files[0])
     with pytest.raises(ewfprobe.EwfWrongPasswordError):
         ewfprobe.open_ewf(files[0], password=section["password"] + "x")
+
+
+# -- encrypted AFF -----------------------------------------------------------------
+
+def _encrypted_aff():
+    section = _manifest().get("encrypted_aff", {"variants": {}})
+    missing = (ewfprobe._AES is None or ewfprobe._RSA is None) and not _CRYPTO_REQUIRED  # pylint: disable=protected-access
+    marks = ([pytest.mark.skip(reason="encrypted AFF needs the optional pycryptodome "
+                                      "package")] if missing else [])
+    return [pytest.param(name, v, marks=marks, id=name)
+            for name, v in sorted(section["variants"].items())]
+
+
+def _aff_credentials(section, how):
+    if how == "password":
+        return {"password": section["password"]}
+    return {"private_key": os.path.join(FIXTURES, section["key"])}
+
+
+def test_the_encrypted_aff_fixtures_are_all_there():
+    section = _manifest().get("encrypted_aff")
+    assert section, "the encrypted AFF images are missing from the manifest"
+    kinds = {v["encryption"] for v in section["variants"].values()}
+    assert kinds == {"passphrase", "passphrase and certificate", "passphrase, in place",
+                     "certificate, in place"}, kinds
+    # AFFLIB reads back every one written encrypted, and refuses the ones affcrypto -e
+    # encrypted in place, each of which begins with a segment where its header was
+    for v in section["variants"].values():
+        assert v["afflib_reads"] is (not v["encryption"].endswith("in place")), v
+        assert v.get("header_lost", False) is v["encryption"].endswith("in place"), v
+
+
+@pytest.mark.parametrize("name,variant", _encrypted_aff())
+def test_encrypted_aff_reads_as_its_source_with_each_key_that_opens_it(name, variant):
+    """AFFLIB wrote each of these from the fixtures' source; the ones it can open it
+    read back as that source before make_fixtures.py kept them."""
+    man = _manifest()
+    section = man["encrypted_aff"]
+    for how in variant["opens_with"]:
+        with ewfprobe.open_ewf(_first(variant), **_aff_credentials(section, how)) as img:
+            assert img.format in (ewfprobe.FORMAT_AFF, ewfprobe.FORMAT_AFD), name
+            assert _media_sha(img) == man["sha256"], (name, how)
+            assert img.encryption["cipher"] == "AES-256-CBC"
+            assert img.encryption["opened_with"].startswith(
+                "passphrase" if how == "password" else "private key"), img.encryption
+            assert bool(img.aff_header_lost) is variant.get("header_lost", False), name
+            # the stored hashes are themselves encrypted segments
+            img.seek(0)
+            data = img.read()
+            assert img.stored_hashes["MD5"] == hashlib.md5(data).hexdigest(), name
+            assert img.stored_hashes["SHA1"] == hashlib.sha1(data).hexdigest(), name
+            # a segment name longer than the 15 bytes of the IV decrypts too
+            target = variant.get("image", variant["files"][0])
+            assert img.metadata["acquisition_commandline"].endswith(
+                f"-o {target} source.raw"), img.metadata
+
+
+@pytest.mark.parametrize("name,variant", _encrypted_aff())
+def test_encrypted_aff_without_its_key_or_with_the_wrong_one_is_refused(name, variant):
+    section = _manifest()["encrypted_aff"]
+    with pytest.raises(ewfprobe.EwfPasswordRequiredError) as caught:
+        ewfprobe.open_ewf(_first(variant))
+    assert caught.value.needs == ("password" if "password" in variant["opens_with"]
+                                  else "private key")
+    if "password" in variant["opens_with"]:
+        with pytest.raises(ewfprobe.EwfWrongPasswordError, match="not its passphrase"):
+            ewfprobe.open_ewf(_first(variant), password=section["password"] + "x")
+    if "private key" in variant["opens_with"]:
+        other = ewfprobe._RSA.generate(2048).export_key()   # pylint: disable=protected-access
+        with pytest.raises(ewfprobe.EwfWrongPasswordError, match="opens none"):
+            ewfprobe.open_ewf(_first(variant), private_key=other)
+    if len(variant["opens_with"]) == 2:
+        # a wrong passphrase still leaves the private key to try
+        key = os.path.join(FIXTURES, section["key"])
+        with ewfprobe.open_ewf(_first(variant), password="not it", private_key=key) as img:
+            assert img.encryption["opened_with"].startswith("private key")
+
+
+@pytest.mark.skipif((ewfprobe._AES is None or ewfprobe._RSA is None)  # pylint: disable=protected-access
+                    and not _CRYPTO_REQUIRED,
+                    reason="encrypted AFF needs the optional pycryptodome package")
+def test_a_sealed_key_whose_inner_layer_is_damaged_is_not_used(tmp_path):
+    """The session key opens with the right private key, but the file key it wraps
+    no longer ends in valid padding, so it is refused rather than used."""
+    section = _manifest()["encrypted_aff"]
+    source = os.path.join(FIXTURES, section["variants"]["aff-enc-inplace-cert"]["files"][0])
+    with open(source, "rb") as fh:
+        data = bytearray(fh.read())
+    (name, _arg, _start, end), = [s for s in _aff_segments(bytes(data))
+                                  if s[0] == "affkey_evp0"]
+    data[end - 9] ^= 0xFF                   # the last byte of the wrapped file key
+    path = tmp_path / "damaged.aff"
+    path.write_bytes(bytes(data))
+    with pytest.raises(ewfprobe.EwfWrongPasswordError, match="opens none"):
+        ewfprobe.open_ewf(str(path), private_key=os.path.join(FIXTURES, section["key"]))
+
+
+@pytest.mark.skipif((ewfprobe._AES is None or ewfprobe._RSA is None)  # pylint: disable=protected-access
+                    and not _CRYPTO_REQUIRED,
+                    reason="encrypted AFF needs the optional pycryptodome package")
+def test_the_command_line_asks_for_the_private_key_and_uses_it(capsys):
+    section = _manifest()["encrypted_aff"]
+    image = _first(section["variants"]["aff-enc-inplace-cert"])
+    assert ewfprobe.main(["info", image]) == 2
+    assert "--private-key" in capsys.readouterr().err
+    key = os.path.join(FIXTURES, section["key"])
+    assert ewfprobe.main(["info", "--private-key", key, image]) == 0
+    out = capsys.readouterr().out
+    assert "its key opened with the private key (affkey_evp0)" in out
+    assert "AFF header      overwritten by a segment" in out
+    assert ewfprobe.main(["verify", "-q", "--private-key", key, image]) == 0
+    assert capsys.readouterr().out.count("matches the stored hash") == 2
+
+
+def _aff_segments(data):
+    """(name, arg, start, end) of each segment of an AFF file's bytes."""
+    at = 8 if data[:8] == ewfprobe.AF_HEADER else 0
+    out = []
+    while at < len(data):
+        _m, name_len, data_len, arg = struct.unpack_from(">4sIII", data, at)
+        end = at + 16 + name_len + data_len + 8
+        out.append((data[at + 16:at + 16 + name_len].decode(), arg, at, end))
+        at = end
+    return out
+
+
+def _aff_segment_bytes(name, value, arg=0):
+    raw = name.encode()
+    body = struct.pack(">4sIII", b"AFF\x00", len(raw), len(value), arg) + raw + value
+    return body + struct.pack(">4sI", b"ATT\x00", len(body) + 8)
+
+
+@pytest.mark.skipif(ewfprobe._AES is None and not _CRYPTO_REQUIRED,  # pylint: disable=protected-access
+                    reason="encrypted AFF needs the optional pycryptodome package")
+def test_an_encrypted_page_is_read_over_a_clear_copy_of_it(tmp_path):
+    """affcrypto -e leaves clear copies behind when it encrypts in place; AFFLIB reads
+    a segment's encrypted form first, and so does ewfprobe."""
+    man = _manifest()
+    section = man["encrypted_aff"]
+    source = os.path.join(FIXTURES, section["variants"]["aff-enc-pass"]["files"][0])
+    path = tmp_path / "copy.aff"
+    with open(source, "rb") as fh:
+        data = fh.read()
+    path.write_bytes(data + _aff_segment_bytes("page0", b"\xaa" * 65536, 0)
+                     + _aff_segment_bytes("acquisition_commandline", b"a clear copy"))
+    with ewfprobe.open_ewf(str(path), password=section["password"]) as img:
+        assert _media_sha(img) == man["sha256"]
+        assert img.metadata["acquisition_commandline"].endswith("aff-enc-pass.aff source.raw")
+
+
+@pytest.mark.skipif(ewfprobe._AES is None and not _CRYPTO_REQUIRED,  # pylint: disable=protected-access
+                    reason="encrypted AFF needs the optional pycryptodome package")
+def test_the_key_segment_padded_to_56_bytes_opens_and_another_version_does_not(tmp_path):
+    """Some AFFLIB builds wrote affkey_aes256 padded to 56 bytes (lib/crypto.cpp);
+    only version 1 is defined."""
+    man = _manifest()
+    section = man["encrypted_aff"]
+    source = os.path.join(FIXTURES, section["variants"]["aff-enc-pass"]["files"][0])
+    with open(source, "rb") as fh:
+        data = fh.read()
+    (name, arg, start, end), = [s for s in _aff_segments(data) if s[0] == "affkey_aes256"]
+    stored = data[start + 16 + len(name):end - 8]
+    assert len(stored) == 52
+    padded = tmp_path / "padded.aff"
+    padded.write_bytes(data[:start] + _aff_segment_bytes(name, stored + bytes(4), arg)
+                       + data[end:])
+    with ewfprobe.open_ewf(str(padded), password=section["password"]) as img:
+        assert _media_sha(img) == man["sha256"]
+    other = tmp_path / "version2.aff"
+    other.write_bytes(data[:start] + _aff_segment_bytes(
+        name, struct.pack(">I", 2) + stored[4:], arg) + data[end:])
+    with pytest.raises(ewfprobe.EwfFormatError, match="version 2, not 1"):
+        ewfprobe.open_ewf(str(other), password=section["password"])

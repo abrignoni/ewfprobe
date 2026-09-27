@@ -19,7 +19,10 @@ entry MD5 as matching. For each encrypted Apple disk image under "encrypted_dmg"
 byte-identical between the two, the export must hash to the disk hdiutil read back from it,
 and a wrong password must be refused the same way by both; so the executable carries the
 cipher package. The same holds for each set FTK Imager encrypted with AD encryption, under
-"ad_encrypted", whose export must hash to the disk it was made from. For the AFF4
+"ad_encrypted", whose export must hash to the disk it was made from, and for each AFF
+AFFLIB encrypted, under "encrypted_aff", opened with its passphrase or, when it is sealed
+only to a certificate, the test private key (so the executable carries the RSA code too),
+whose export must hash to the source. For the AFF4
 containers in AFF4_KNOWN (written by pyaff4 or by tools/make_aff4_fixtures.py, one Snappy,
 one LZ4, one deflate and a striped pair), `info`, `verify` and a full `export` must be
 byte-identical between the two and the export must hash to the content the container was
@@ -199,6 +202,33 @@ def main(argv: list[str]) -> int:
                   f"{len(out['exe'][3]):,} byte export identical; the export matches the disk "
                   f"hdiutil read back, and a wrong password is refused by both")
 
+        enc_aff = manifest.get("encrypted_aff", {"variants": {}})
+        for name, variant in sorted(enc_aff["variants"].items()):
+            image = str(fixtures / variant.get("image", variant["files"][0]))
+            if "password" in variant["opens_with"]:
+                given = ["--password-env", "EWFPROBE_SMOKE_PASSWORD"]
+            else:
+                given = ["--private-key", str(fixtures / enc_aff["key"])]
+            env = dict(os.environ, EWFPROBE_SMOKE_PASSWORD=enc_aff["password"])
+            out = {}
+            for who, cmd in (("py", py), ("exe", exe)):
+                raw = work / f"{name}-{who}.raw"
+                out[who] = (run(cmd + ["info", *given, image], work, env=env).stdout,
+                            run(cmd + ["verify", "-q", *given, image], work, env=env).stdout,
+                            run(cmd + ["export", "-q", *given, image, "-o", str(raw)], work,
+                                env=env).stdout,
+                            raw.read_bytes())
+            assert out["py"] == out["exe"], f"{name}: the executable's output differs"
+            assert hashlib.sha256(out["exe"][3]).hexdigest() == manifest["sha256"], name
+            a = run(py + ["info", image], work, want=2).stderr
+            b = run(exe + ["info", image], work, want=2).stderr
+            assert a.replace(b"\r\n", b"\n") == b.replace(b"\r\n", b"\n"), (a, b)
+            assert b"encrypted AFF" in b, b
+            checks += 1
+            print(f"{name}: opened with its {'password' if '--password-env' in given else 'private key'}, info, "
+                  f"verify and a {len(out['exe'][3]):,} byte export identical; the export "
+                  f"matches the source, and without it both refuse the image")
+
         ad = manifest.get("ad_encrypted", {"variants": {}})
         for name, variant in sorted(ad["variants"].items()):
             image = str(fixtures / variant["files"][0])
@@ -298,6 +328,7 @@ def main(argv: list[str]) -> int:
     assert checks == (len(manifest["variants"]) + len(manifest.get("logical", {})) + 2
                       + len(manifest.get("encrypted_dmg", {}).get("variants", {}))
                       + len(manifest.get("ad_encrypted", {}).get("variants", {}))
+                      + len(manifest.get("encrypted_aff", {}).get("variants", {}))
                       + len(AFF4_KNOWN) + len(AD1_KNOWN) + 1 + len(VIRTUAL_KNOWN)), checks
     print(f"{checks} checks: the executable wrote the same bytes as the source")
     return 0
