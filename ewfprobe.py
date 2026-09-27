@@ -6,7 +6,8 @@ segments, and presents the original disk as an ordinary seekable file object,
 so anything that can read a raw image can read an E01 without changing how it
 reads. It also reads Ex01 (EWF2), the format EnCase 7 introduced, and AFF, the
 Advanced Forensic Format that AFFLIB and FTK Imager write, as a single .aff file or
-as an AFD directory of them.
+as an AFD directory of them. From an L01, EnCase's logical evidence, it lists the
+files collected and reads each one's content.
 
     with ewfprobe.open_ewf("evidence.E01") as img:
         img.seek(0)
@@ -28,11 +29,11 @@ code is copied.
 
 Scope. This reads EWF-E01, the format EnCase 6 and 7 and FTK Imager write and
 by far the most common one in the field, EWF-S01, the variant ASR Data's SMART
-writes, EWF2-Ex01, which EnCase 7 and later write, and AFF, including AFD. It
-does not read logical evidence (.L01, .Lx01), encrypted Ex01 images (the
-encryption is not publicly documented), Ex01 images compressed with bzip2 (no
-sample exists to validate against), encrypted AFF, or AFM (AFF metadata beside
-split raw files), and it never writes.
+writes, EWF2-Ex01, which EnCase 7 and later write, AFF, including AFD, and
+EWF-L01 logical evidence. It does not read Lx01 logical evidence, encrypted Ex01
+images (the encryption is not publicly documented), Ex01 images compressed with
+bzip2 (no sample exists to validate against), encrypted AFF, or AFM (AFF metadata
+beside split raw files), and it never writes.
 
 An image whose content is encrypted at rest, by BitLocker or FileVault or an
 encrypted APFS volume, reads back as the ciphertext that was acquired: the
@@ -44,6 +45,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import hashlib
+import io
 import os
 import re
 import struct
@@ -83,6 +85,7 @@ SMART_COMPRESSION = {"n": "none", "f": "fast", "b": "best"}
 FORMAT_E01 = "EWF-E01"
 FORMAT_S01 = "EWF-S01"
 FORMAT_EX01 = "EWF2-Ex01"
+FORMAT_L01 = "EWF-L01"
 
 # EWF2 (Ex01). A 32-byte file header, then sections whose 64-byte descriptor sits
 # AFTER the section's data and points back at the previous descriptor, so a
@@ -175,7 +178,18 @@ _AFD_MEMBER_NAME = re.compile(r"file_(\d+)\.aff", re.IGNORECASE)
 _AFD_MUST_AGREE = {"pagesize", "segsize", "sectorsize", "badflag", "md5", "sha1", "sha256"}
 
 # Logical evidence files share the section machinery but hold files, not a disk.
-LOGICAL_SIGNATURES = (b"LVF\x09\x0d\x0a\xff\x00", b"LEF2\r\n\x81\x00")
+# An L01 keeps the content of the files it collected back to back in its chunks,
+# the "media data", and describes them in an ltree section: a 48-byte header (the
+# MD5 of the text, its size, and an Adler-32 of the header) and UTF-16LE text in
+# categories, of which "rec" gives the media data size (tb) and "entry" the file
+# tree. From the EWF-L01 parts of the EWF specification.
+LVF_SIGNATURE = b"LVF\x09\x0d\x0a\xff\x00"
+LEF2_SIGNATURE = b"LEF2\r\n\x81\x00"
+LOGICAL_SIGNATURES = (LVF_SIGNATURE, LEF2_SIGNATURE)
+_LTREE_HEADER = struct.Struct("<16sQI20s")      # MD5 of the text, text size, Adler-32
+L01_FLAG_FOLDER = 0x02000000                    # the opr (flags) values the reader uses
+L01_FLAG_SPARSE = 0x04000000
+_L01_TIMES = ("cr", "ac", "wr", "mo", "dl", "aq")
 
 # How many decompressed chunks and open segment handles to keep. A chunk is
 # normally 32 KiB, so the cache is a couple of megabytes at the default.
@@ -249,16 +263,19 @@ def _extension_sequence_v2():
 
 
 def _family(ext):
-    """The segment family an extension belongs to: "E", "s" or "Ex"."""
+    """The segment family an extension belongs to: "E", "s", "L", "Ex" or "Lx"."""
     low = ext.lower()
-    if len(ext) == 4 and low[:1] == "e" and low[1:2] in "xyz":
-        return "Ex"
+    if len(ext) == 4 and low[:1] in "el" and low[1:2] in "xyz":
+        return low[:1].upper() + "x"
+    if low[:1] == "l":
+        return "L"
     return "s" if low[:1] == "s" else "E"
 
 
 def is_image(path) -> bool:
-    """True when ``path`` is something ewfprobe reads: a file beginning with the EWF,
-    EWF2 or AFF signature, or an AFD directory holding AFF files."""
+    """True when ``path`` is a disk image ewfprobe reads: a file beginning with the
+    EWF, EWF2 or AFF signature, or an AFD directory holding AFF files. An L01 holds
+    files rather than a disk; is_logical_evidence answers for it."""
     if os.path.isdir(path):
         afd = _afd_directory(path)
         try:
@@ -270,6 +287,16 @@ def is_image(path) -> bool:
     try:
         with open(path, "rb") as fh:
             return fh.read(8) in (SIGNATURE, SIGNATURE_V2, AF_HEADER)
+    except OSError:
+        return False
+
+
+def is_logical_evidence(path) -> bool:
+    """True when the file begins with the L01 signature, logical evidence ewfprobe
+    reads as a tree of files."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(8) == LVF_SIGNATURE
     except OSError:
         return False
 
@@ -360,6 +387,10 @@ def ewf_segments(path) -> list[str]:
 
     segments = []
     family = _family(ext)
+    if family == "Lx":
+        raise EwfFormatError(
+            f"{os.path.basename(path)} has an Lx01 name; Lx01 logical evidence is not "
+            f"read")
     sequence = _extension_sequence_v2() if family == "Ex" else _extension_sequence(family)
     for seg_ext in sequence:
         want = f"{stem}.{seg_ext}".lower()
@@ -370,7 +401,8 @@ def ewf_segments(path) -> list[str]:
     if not segments:
         raise EwfFormatError(
             f"{os.path.basename(path)} is not the first segment of an EWF set; "
-            f"the set is opened from its .E01, its .Ex01, or its .s01 for SMART")
+            f"the set is opened from its .E01, its .Ex01, its .L01, or its .s01 for "
+            f"SMART")
     return segments
 
 
@@ -388,7 +420,7 @@ def _sections(fh, segment_path):
     fh.seek(0)
     head = _read_exactly(fh, FILE_HEADER_SIZE)
     signature, one, segment_number, zero = _FILE_HEADER.unpack(head)
-    if signature != SIGNATURE:
+    if signature not in (SIGNATURE, LVF_SIGNATURE):
         raise EwfFormatError(f"{os.path.basename(segment_path)} is not an EWF file")
     if one != 1 or zero != 0:
         raise EwfFormatError(
@@ -570,8 +602,217 @@ class _Table:
         self.limit = limit
 
 
+class LogicalEntry:
+    """One entry of an L01's file tree, with its values as the ltree stores them.
+
+    ``names`` is the path from the root as a tuple; a name can itself hold "/" or
+    "\\", so ``path``, the names joined by "/", is for display. ``values`` holds
+    every column exactly as stored, and the rest are read from it: ``size`` (ls),
+    ``extents`` ((offset, size) runs in the media data, from be), ``flags`` (opr),
+    ``duplicate_offset`` (du), ``md5`` and ``sha1`` (ha and sha, None when unset),
+    and ``times`` (the POSIX times among cr, ac, wr, mo, dl and aq that are set).
+    An entry can be a folder and hold data of its own at once.
+    """
+
+    __slots__ = ("names", "values", "parent", "children", "size", "extents",
+                 "extent_types", "flags", "duplicate_offset", "md5", "sha1", "times")
+
+    def __init__(self, names, values, parent):
+        self.names = names
+        self.values = values
+        self.parent = parent
+        self.children = []
+        where = self.path or "the root entry"
+        self.size = _l01_int(values.get("ls"), 10, where, "file size") or 0
+        self.flags = _l01_int(values.get("opr"), 10, where, "flags") or 0
+        self.duplicate_offset = _l01_int(values.get("du"), 10, where,
+                                         "duplicate data offset")
+        self.extents, self.extent_types = _l01_extents(values.get("be", ""), where)
+        self.md5 = _l01_digest(values.get("ha"), 32)
+        self.sha1 = _l01_digest(values.get("sha"), 40)
+        self.times = {k: int(values[k]) for k in _L01_TIMES
+                      if values.get(k, "").lstrip("-").isdigit()}
+
+    @property
+    def name(self):
+        return self.names[-1] if self.names else self.values.get("n", "")
+
+    @property
+    def path(self):
+        return "/".join(self.names)
+
+    @property
+    def is_folder(self):
+        """True when the entry is marked as a parent (p) or carries the folder flag."""
+        return self.values.get("p") == "1" or bool(self.flags & L01_FLAG_FOLDER)
+
+    def __repr__(self):
+        return f"<LogicalEntry {self.path!r} size={self.size}>"
+
+
+def _l01_int(text, base, where, what):
+    if text is None or text == "":
+        return None
+    try:
+        return int(text, base)
+    except ValueError:
+        raise EwfFormatError(f"L01 entry {where}: its {what} {text!r} is not a number") from None
+
+
+def _l01_digest(text, width):
+    text = (text or "").strip().lower()
+    if len(text) == width and text.strip("0") and all(c in "0123456789abcdef" for c in text):
+        return text
+    return None
+
+
+def _l01_extents(text, where):
+    """The be value: a count, then per extent an optional type, a hexadecimal offset
+    into the media data and a hexadecimal size."""
+    tokens = text.split()
+    if not tokens:
+        return [], []
+    count = _l01_int(tokens[0], 10, where, "extent count")
+    rest = tokens[1:]
+    if len(rest) == 2 * count:
+        types = []
+        pairs = [(rest[2 * k], rest[2 * k + 1]) for k in range(count)]
+    elif len(rest) == 3 * count:
+        types = [rest[3 * k] for k in range(count)]
+        pairs = [(rest[3 * k + 1], rest[3 * k + 2]) for k in range(count)]
+    else:
+        raise EwfFormatError(f"L01 entry {where}: its extents {text!r} do not hold "
+                             f"{count} offset and size pairs")
+    extents = [(_l01_int(o, 16, where, "extent offset"),
+                _l01_int(n, 16, where, "extent size")) for o, n in pairs]
+    return extents, types
+
+
+def _parse_ltree_text(text):
+    """The media data size (rec tb) and the root entry of an L01's ltree text."""
+    lines = text.split("\n")
+    categories = {}
+    root = None
+    i = 1                                   # line 1 is the number of categories
+    while i < len(lines):
+        name = lines[i]
+        if not name:
+            i += 1
+            continue
+        if name == "entry" and root is None:
+            root, i = _parse_l01_entries(lines, i + 1)
+            continue
+        j = i + 1
+        while j < len(lines) and lines[j]:
+            j += 1
+        categories.setdefault(name, lines[i + 1:j])
+        i = j
+    rec = categories.get("rec", [])
+    record = dict(zip(rec[0].split("\t"), rec[1].split("\t"))) if len(rec) >= 2 else {}
+    media_size = _l01_int(record.get("tb"), 10, "records", "total size")
+    if media_size is None:
+        raise EwfFormatError("the L01 ltree records no total size (rec tb), which is "
+                             "how much file content its chunks hold")
+    if root is None:
+        raise EwfFormatError("the L01 ltree has no entry category, which is where its "
+                             "files are described")
+    return media_size, root
+
+
+def _parse_l01_entries(lines, start):
+    """The entry category's tree. Each entry is a line giving its number of child
+    entries, a line of tab-separated values in the order of the category's column
+    line, and then its children, each the same way."""
+    if start + 1 >= len(lines):
+        raise EwfFormatError("the L01 ltree ends inside its entry category")
+    columns = lines[start + 1].split("\t")
+
+    def read(pos):
+        try:
+            _first, count = lines[pos].split("\t")
+            count = int(count)
+            values = lines[pos + 1].split("\t")
+        except (IndexError, ValueError):
+            raise EwfFormatError(f"the L01 ltree entry list is malformed or cut short at "
+                                 f"line {pos + 1}") from None
+        return dict(zip(columns, values)), count, pos + 2
+
+    values, count, pos = read(start + 2)
+    root = LogicalEntry((), values, None)
+    stack = [[root, count]]
+    while stack:
+        node, remaining = stack[-1]
+        if not remaining:
+            stack.pop()
+            continue
+        stack[-1][1] -= 1
+        values, count, pos = read(pos)
+        child = LogicalEntry(node.names + (values.get("n", ""),), values, node)
+        node.children.append(child)
+        stack.append([child, count])
+    return root, pos
+
+
+class _LogicalFile(io.RawIOBase):
+    """An L01 entry's content as a seekable file object, read from the image's
+    media data through the runs the entry's values describe."""
+
+    def __init__(self, image, runs, size):
+        super().__init__()
+        self._image = image
+        self._runs = runs                   # (media offset or None, length, fill byte)
+        self._starts = []
+        at = 0
+        for _offset, length, _fill in runs:
+            self._starts.append(at)
+            at += length
+        self._size = size
+        self._pos = 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if whence == os.SEEK_SET:
+            pos = offset
+        elif whence == os.SEEK_CUR:
+            pos = self._pos + offset
+        elif whence == os.SEEK_END:
+            pos = self._size + offset
+        else:
+            raise ValueError(f"invalid whence {whence}")
+        if pos < 0:
+            raise ValueError("negative seek position")
+        self._pos = pos
+        return pos
+
+    def readinto(self, buffer):
+        view = memoryview(buffer).cast("B")
+        done = 0
+        while done < len(view) and self._pos < self._size:
+            k = bisect.bisect_right(self._starts, self._pos) - 1
+            offset, length, fill = self._runs[k]
+            within = self._pos - self._starts[k]
+            take = min(len(view) - done, length - within)
+            if offset is None:
+                view[done:done + take] = bytes([fill]) * take
+            else:
+                self._image.seek(offset + within)
+                view[done:done + take] = self._image.read(take)
+            done += take
+            self._pos += take
+        return done
+
+
 class EwfImage:
-    """An EWF-E01, EWF-S01, EWF2-Ex01, AFF or AFD acquisition, read as one seekable stream.
+    """An EWF-E01, EWF-S01, EWF2-Ex01, AFF or AFD acquisition, read as one seekable stream,
+    or an EWF-L01, read as its media data with its entries in ``logical_entries``.
 
     ``media_size`` is the size of the disk that was acquired, which is what
     ``seek`` and ``read`` address. The segment files themselves are an
@@ -613,6 +854,9 @@ class EwfImage:
         self.bad_sectors = None
         self._aff_pages: dict[int, tuple[int, int, int, int]] = {}
         self._aff_badflag = b""
+        self.logical_root = None
+        self.logical_entries: list[LogicalEntry] = []
+        self._l01_media_size = None
 
         self._tables: list[_Table] = []
         self._table_starts: list[int] = []
@@ -636,10 +880,11 @@ class EwfImage:
         """Walk every segment once and build the chunk offset index."""
         with open(self.paths[0], "rb") as fh:
             magic = fh.read(8)
-        if magic in LOGICAL_SIGNATURES:
+        if magic == LEF2_SIGNATURE:
             raise EwfFormatError(
-                f"{os.path.basename(self.paths[0])} is logical evidence (L01 or Lx01), "
-                f"which holds files rather than a disk image; ewfprobe does not read it")
+                f"{os.path.basename(self.paths[0])} is Lx01 logical evidence, which "
+                f"ewfprobe does not read")
+        logical = magic == LVF_SIGNATURE
         if magic == SIGNATURE_V2:
             self._index_v2()
             return
@@ -676,6 +921,9 @@ class EwfImage:
                 elif name in ("hash", "digest"):
                     fh.seek(offset)
                     self._parse_hashes(name, _read_exactly(fh, size))
+                elif name == "ltree" and logical and self.logical_root is None:
+                    fh.seek(offset)
+                    self._parse_ltree(_read_exactly(fh, size))
 
             if last_name == "next" and i == len(self.paths) - 1:
                 raise EwfIncompleteSetError(
@@ -687,6 +935,12 @@ class EwfImage:
 
         if not volume_seen:
             raise EwfFormatError("the image carries no volume section")
+        if logical:
+            self.format = FORMAT_L01
+            if self.logical_root is None:
+                raise EwfFormatError(
+                    "the L01 carries no ltree section, which is where its files are "
+                    "described")
         if self.format == FORMAT_S01:
             level = self.metadata.get("compression_level")
             if level is not None:
@@ -697,7 +951,12 @@ class EwfImage:
 
     def _finish_index(self, chunks):
         self.chunk_size = self.sectors_per_chunk * self.sector_size
-        self.media_size = self.sector_count * self.sector_size
+        if self.format == FORMAT_L01:
+            # An L01's volume section does not describe its data: the sector count
+            # times the sector size is not the content's size, the ltree's tb is.
+            self.media_size = self._l01_media_size
+        else:
+            self.media_size = self.sector_count * self.sector_size
         # ``size`` is the byte length of the acquired disk, which is what seek
         # and read address. A consumer that already handles a joined set of raw
         # segments asks an image object for exactly this, so answering it here
@@ -790,6 +1049,97 @@ class EwfImage:
         if not self._tables:
             raise EwfFormatError("the image carries no chunk table")
         self._finish_index(chunks)
+
+    def _parse_ltree(self, data):
+        """The ltree section: check its header and text, then read the file tree."""
+        if len(data) < _LTREE_HEADER.size:
+            raise EwfFormatError("the L01 ltree section is too short for its header")
+        digest, size, adler, _reserved = _LTREE_HEADER.unpack_from(data)
+        head = bytearray(data[:_LTREE_HEADER.size])
+        head[24:28] = b"\x00" * 4
+        if zlib.adler32(bytes(head)) & 0xFFFFFFFF != adler:
+            raise EwfFormatError("the L01 ltree header does not match its checksum")
+        text = data[_LTREE_HEADER.size:_LTREE_HEADER.size + size]
+        if len(text) != size:
+            raise EwfFormatError(f"the L01 ltree holds {len(text)} bytes of text where its "
+                                 f"header says {size}")
+        if hashlib.md5(text).digest() != digest:
+            raise EwfFormatError("the L01 ltree text does not match the MD5 its header "
+                                 "records")
+        # The specification notes names can hold unpaired surrogates, which a strict
+        # decoder refuses; they are kept as they are.
+        self._l01_media_size, root = _parse_ltree_text(
+            text.decode("utf-16-le", "surrogatepass"))
+        self.logical_root = root
+        order = []
+        stack = list(reversed(root.children))
+        while stack:
+            entry = stack.pop()
+            order.append(entry)
+            stack.extend(reversed(entry.children))
+        self.logical_entries = order
+
+    def _entry_runs(self, entry):
+        """Where an L01 entry's content lies in the media data, as (offset, length,
+        fill) runs covering its size."""
+        where = entry.path or "the root entry"
+        if entry.extent_types:
+            raise EwfFormatError(f"L01 entry {where}: its extents carry the type "
+                                 f"{entry.extent_types[0]!r}, which ewfprobe does not read")
+        size = entry.size
+        if entry.flags & L01_FLAG_SPARSE:
+            # The data is one stored byte, repeated, unless a duplicate data offset
+            # says where the full content is stored instead.
+            if entry.duplicate_offset is not None:
+                runs = [(entry.duplicate_offset, size, 0)]
+            elif entry.extents and entry.extents[0][1] >= 1:
+                self.seek(entry.extents[0][0])
+                byte = self.read(1)
+                if len(byte) != 1:
+                    raise EwfFormatError(f"L01 entry {where}: its data lies past the media "
+                                         f"data")
+                return [(None, size, byte[0])] if size else []
+            else:
+                raise EwfFormatError(f"L01 entry {where}: it is marked sparse and stores "
+                                     f"no data")
+        elif entry.duplicate_offset is not None:
+            raise EwfFormatError(f"L01 entry {where}: it has a duplicate data offset "
+                                 f"without the sparse flag, which ewfprobe does not read")
+        else:
+            runs, need = [], size
+            for offset, length in entry.extents:
+                if need <= 0:
+                    break
+                runs.append((offset, min(length, need), 0))
+                need -= length
+            if need > 0:
+                raise EwfFormatError(f"L01 entry {where}: its extents hold "
+                                     f"{size - need:,} of its {size:,} bytes")
+        for offset, length, _fill in runs:
+            if offset < 0 or offset + length > self.media_size:
+                raise EwfFormatError(f"L01 entry {where}: its data lies past the media "
+                                     f"data")
+        return runs
+
+    def open_entry(self, entry):
+        """An L01 entry's content as a seekable, read-only file object."""
+        if self.format != FORMAT_L01:
+            raise EwfFormatError("only an L01 holds entries")
+        return io.BufferedReader(_LogicalFile(self, self._entry_runs(entry), entry.size),
+                                 buffer_size=1 << 16)
+
+    def read_entry(self, entry):
+        """An L01 entry's content, whole."""
+        with self.open_entry(entry) as fh:
+            return fh.read()
+
+    def find_entry(self, path):
+        """The L01 entry whose path (its names joined by "/") is ``path``."""
+        path = path.strip("/")
+        for entry in self.logical_entries:
+            if entry.path == path:
+                return entry
+        raise EwfFormatError(f"no L01 entry has the path {path!r}")
 
     def _walk_aff(self, i):
         """One AFF file's segments, walked once: where each page is, and the content
@@ -1283,6 +1633,20 @@ class EwfImage:
         for name, value in self.stored_hashes.items():
             if name in computed:
                 match = (computed[name] == value) if match in (None, True) else False
+        checked, mismatched = 0, []
+        for entry in self.logical_entries:
+            if entry.md5 is None:
+                continue
+            digest = hashlib.md5()
+            with self.open_entry(entry) as fh:
+                while True:
+                    piece = fh.read(block)
+                    if not piece:
+                        break
+                    digest.update(piece)
+            checked += 1
+            if digest.hexdigest() != entry.md5:
+                mismatched.append(entry.path)
         return {
             "computed": computed,
             "stored": dict(self.stored_hashes),
@@ -1291,6 +1655,8 @@ class EwfImage:
             "checksum_errors": list(self.checksum_errors),
             "missing_page_count": self.missing_page_count,
             "missing_page_ranges": list(self.missing_page_ranges),
+            "entry_md5_checked": checked,
+            "entry_md5_mismatched": mismatched,
         }
 
     def info(self):
@@ -1312,13 +1678,15 @@ class EwfImage:
             "missing_page_count": self.missing_page_count,
             "missing_page_ranges": list(self.missing_page_ranges),
             "bad_sectors": self.bad_sectors,
+            "entry_count": len(self.logical_entries),
+            "entry_md5_count": sum(1 for e in self.logical_entries if e.md5),
             "metadata": dict(self.metadata),
         }
 
 
 def open_ewf(path, segments=None) -> EwfImage:
-    """Open an acquisition ewfprobe reads: an EWF or EWF2 set from any path in it,
-    an AFF file, or an AFD directory from the directory or any file in it."""
+    """Open an acquisition ewfprobe reads: an EWF, EWF2 or L01 set from any path in
+    it, an AFF file, or an AFD directory from the directory or any file in it."""
     return EwfImage(path, segments=segments)
 
 
@@ -1344,17 +1712,28 @@ def _cmd_info(args):
               f"{' .. ' + d['segments'][-1] if d['segment_count'] > 1 else ''})")
         print(f"format          {d['format']}")
         print(f"media type      {d['media_type'] or 'not recorded'}")
-        print(f"media size      {d['media_size']:,} bytes ({_size(d['media_size'])})")
-        if d["sector_size"]:
-            print(f"sector size     {d['sector_size']:,} bytes")
-            print(f"sectors         {d['sector_count']:,}")
+        if d["format"] == FORMAT_L01:
+            print(f"media data      {d['media_size']:,} bytes ({_size(d['media_size'])}), "
+                  f"the content of its entries")
+            print(f"entries         {d['entry_count']:,}, {d['entry_md5_count']:,} with a "
+                  f"stored MD5")
+            print(f"chunk size      {d['chunk_size']:,} bytes")
         else:
-            print("sector size     not recorded")
-        unit = "page size " if d["format"] in (FORMAT_AFF, FORMAT_AFD) else "chunk size"
-        print(f"{unit}      {d['chunk_size']:,} bytes "
-              f"({d['sectors_per_chunk']} sectors)")
-        print(f"chunks          {d['indexed_chunks']:,} indexed, "
-              f"{d['chunk_count']:,} declared")
+            print(f"media size      {d['media_size']:,} bytes ({_size(d['media_size'])})")
+        if d["format"] == FORMAT_L01:
+            # An L01's volume section declares no chunks; its tables list them.
+            print(f"chunks          {d['indexed_chunks']:,}")
+        else:
+            if d["sector_size"]:
+                print(f"sector size     {d['sector_size']:,} bytes")
+                print(f"sectors         {d['sector_count']:,}")
+            else:
+                print("sector size     not recorded")
+            unit = "page size " if d["format"] in (FORMAT_AFF, FORMAT_AFD) else "chunk size"
+            print(f"{unit}      {d['chunk_size']:,} bytes "
+                  f"({d['sectors_per_chunk']} sectors)")
+            print(f"chunks          {d['indexed_chunks']:,} indexed, "
+                  f"{d['chunk_count']:,} declared")
         print(f"compression     {d['compression_level'] or 'not recorded'}")
         if d["bad_sectors"] is not None:
             print(f"bad sectors     {d['bad_sectors']:,} recorded")
@@ -1396,13 +1775,41 @@ def _cmd_verify(args):
         if result["missing_page_count"]:
             print(f"pages not in the file, read as the bad-sector marker: "
                   f"{result['missing_page_count']:,}")
+        if result["entry_md5_checked"]:
+            bad = result["entry_md5_mismatched"]
+            print(f"entry MD5s      {result['entry_md5_checked']:,} checked, "
+                  f"{len(bad):,} DO NOT MATCH" if bad else
+                  f"entry MD5s      {result['entry_md5_checked']:,} checked, all match")
+            for path in bad:
+                print(f"  mismatch      {_shown(path)}")
+            if bad:
+                return 1
         if result["match"] is None:
             print("the acquisition recorded no hash, so nothing could be compared")
             return 0
         return 0 if result["match"] else 1
 
 
+def _shown(text):
+    """A name as printable text; an L01 name can hold unpaired surrogates."""
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _cmd_files(args):
+    with open_ewf(args.image) as img:
+        if img.format != FORMAT_L01:
+            raise EwfFormatError(f"{os.path.basename(args.image)} is a disk image, not "
+                                 f"logical evidence; it holds no entry list")
+        print("kind\tsize\tmd5\tpath")
+        for entry in img.logical_entries:
+            kind = "folder" if entry.is_folder else "file"
+            print(f"{kind}\t{entry.size}\t{entry.md5 or '-'}\t{_shown(entry.path)}")
+    return 0
+
+
 def _cmd_export(args):
+    if args.entry is not None:
+        return _export_entry(args)
     with open_ewf(args.image) as img:
         total = img.media_size
         img.seek(args.offset)
@@ -1427,11 +1834,27 @@ def _cmd_export(args):
     return 0
 
 
+def _export_entry(args):
+    with open_ewf(args.image) as img:
+        with img.open_entry(img.find_entry(args.entry)) as fh:
+            out = sys.stdout.buffer if args.output == "-" else open(args.output, "wb")
+            try:
+                while True:
+                    data = fh.read(1 << 22)
+                    if not data:
+                        break
+                    out.write(data)
+            finally:
+                if out is not sys.stdout.buffer:
+                    out.close()
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="ewfprobe",
         description="Read an EnCase/EWF (.E01, .Ex01), SMART (.s01) or AFF (.aff, "
-                    ".afd) forensic image. Read only.")
+                    ".afd) forensic image, or EnCase logical evidence (.L01). Read only.")
     ap.add_argument("--version", action="version", version=f"ewfprobe {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -1445,8 +1868,15 @@ def main(argv=None):
     s.add_argument("-q", "--quiet", action="store_true", help="no progress output")
     s.set_defaults(func=_cmd_verify)
 
-    s = sub.add_parser("export", help="write the acquired disk out as a raw image")
+    s = sub.add_parser("files", help="list the entries of an L01, tab separated")
     s.add_argument("image")
+    s.set_defaults(func=_cmd_files)
+
+    s = sub.add_parser("export", help="write the acquired disk out as a raw image, or "
+                                      "one L01 entry's content with --entry")
+    s.add_argument("image")
+    s.add_argument("--entry", default=None,
+                   help="the path of an L01 entry, as the files command lists it")
     s.add_argument("-o", "--output", default="-", help="output file, or - for stdout")
     s.add_argument("--offset", type=int, default=0, help="start at this byte offset")
     s.add_argument("--length", type=int, default=None, help="write this many bytes")
@@ -1455,10 +1885,16 @@ def main(argv=None):
 
     args = ap.parse_args(argv)
     try:
-        return args.func(args)
+        status = args.func(args)
+        sys.stdout.flush()              # a closed pipe shows here, not at exit
+        return status
     except EwfError as exc:
         print(f"ewfprobe: {exc}", file=sys.stderr)
         return 2
+    except BrokenPipeError:
+        # Whatever was reading the output (head, a pager) stopped; so does this.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 1
 
 
 if __name__ == "__main__":

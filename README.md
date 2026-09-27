@@ -1,6 +1,6 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`, `.afd`) forensic images. One file, pure
+A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`, `.afd`) forensic images, and EnCase logical evidence (`.L01`). One file, pure
 Python, standard library only. No compiler, no network, nothing to install.
 
 It opens an acquisition, joins its segments, and presents the acquired disk as
@@ -38,6 +38,8 @@ ewfprobe info    evidence.E01     # geometry, segments, metadata, stored hashes
 ewfprobe verify  evidence.E01     # recompute MD5 and SHA-1, compare with stored
 ewfprobe export  evidence.E01 -o out.raw
 ewfprobe export  evidence.E01 -o - --offset 1048576 --length 65536
+ewfprobe files   evidence.L01     # an L01's entries: kind, size, stored MD5, path
+ewfprobe export  evidence.L01 --entry "Folder/photo.jpg" -o photo.jpg
 ```
 
 `verify` exits non-zero when the recomputed hash does not match the one the
@@ -94,9 +96,54 @@ from the numbering: when it held the image size, as it does in an AFD from
 `affconvert`, the image is refused; otherwise its pages are counted as missing
 pages by `info` and `verify`.
 
-`open_image()` is the same function as `open_ewf()`, and `is_image()` is true for
-every signature ewfprobe reads and for an AFD directory, where `is_ewf()` stays
-true for EWF alone.
+Reads L01, EnCase's logical evidence: files collected from a device rather than a
+disk, in segments named `.L01`, `.L02` and on. The image object's stream is the
+L01's media data, the content of every entry back to back, and
+`logical_entries` lists the entries in tree order:
+
+```python
+with ewfprobe.open_ewf("evidence.L01") as img:
+    for entry in img.logical_entries:
+        print(entry.path, entry.size, entry.md5)
+    photo = img.read_entry(img.find_entry("Folder/photo.jpg"))
+```
+
+Each entry carries its names (a name can itself hold "/" or "\\", so `path`, the
+names joined by "/", is for display), its size, the MD5 and SHA-1 stored for it
+where set, its flags, the times that are set, its children, and `values`, every
+column exactly as the ltree stores it. `open_entry()` gives an entry's content as
+a seekable file and `read_entry()` reads it whole. `ewfprobe files` lists the
+entries, `ewfprobe export --entry` writes one out, and `verify` checks every MD5
+EnCase stored for an entry.
+
+Measured on the five real L01s described under validation:
+
+- **An entry can hold data of its own and have children.** 123 to 191 entries
+  per file do, among them plists, photos and databases. Their own data begins
+  with the bytes `02 00 00 00` in every case and usually names the entry in
+  UTF-16, and most have a child of the same name, with parsed content such as a
+  plist's keys beside it. For the plist examined and for 30 photos checked against
+  a separate logical dump, that child holds the file's bytes. What EnCase means by
+  the parent's data is not documented, so it is read as stored. libewf's
+  `ewfexport -f files` writes the child and treats the parent as a plain folder.
+- **A sparse entry's duplicate data offset (`du`) is decimal**, where extent
+  offsets are hexadecimal. Read as decimal, the one sparse entry in each file gives
+  content matching its stored MD5; read as hexadecimal it does not. A sparse entry
+  without a duplicate offset repeats its one stored byte, as the specification
+  describes; none of the tested files holds one.
+- **Names are reported as stored.** The specification describes a middle dot
+  (U+00B7) as the separator of an NTFS alternate data stream. In the tested files
+  middle dots appear in the names of parsed plist keys, so a middle dot does not
+  by itself mark a stream. Unpaired surrogates, which the specification says the
+  ltree allows, are kept.
+
+Times (`cr`, `ac`, `wr`, `mo`, `dl`, `aq`) are read as the POSIX values the
+specification describes. None of the tested files sets them, so that part rests on
+the specification alone.
+
+`open_image()` is the same function as `open_ewf()`. `is_image()` is true for the
+disk images ewfprobe reads (EWF, EWF2, AFF, and an AFD directory),
+`is_logical_evidence()` for an L01, and `is_ewf()` for EWF alone.
 
 Refused with a message naming the reason rather than read wrongly:
 
@@ -104,7 +151,12 @@ Refused with a message naming the reason rather than read wrongly:
   publicly documented.
 - **Ex01 compressed with bzip2.** The format allows it, EnCase does not appear to
   offer it, and no sample exists to check a reader against.
-- **Logical evidence** (`.L01`, `.Lx01`). These hold files, not a disk image.
+- **Lx01**, the logical evidence EnCase 7 writes in the EWF2 format. No sample
+  has been available.
+- **An L01 whose ltree fails its own MD5, Adler-32 or size**, or lacks the total
+  size or the entry list, and **an L01 entry** whose extents are shorter than its
+  size, reach past the media data, carry an extent type, or give a duplicate
+  offset without the sparse flag. None of those occur in the tested files.
 - **Encrypted AFF**, and **AFF pages compressed with bzip2**, which AFFLIB itself
   never implemented.
 - **An AFF file with no image size.** AFF records the size when the acquisition
@@ -199,6 +251,21 @@ volume header while still writing compressed chunks. A reader that decides
 compression from the header rather than from each chunk's own flag produces
 garbage on such an image.
 
+L01 was checked against five L01s EnCase wrote of an iPhone for Digital Corpora's
+2012 National Gallery DC scenario (`corpora/scenarios/2012-ngdc/extra/tracy-phone-encase/`),
+four from EnCase 7.2.4.2 and one from 7.4.1.10, holding 9,951 to 14,803 entries
+each. libewf 20260924's `ewfexport` was the oracle. On all five the media data is
+identical to `ewfexport -f raw`, and every one of the 55,599 files `ewfexport -f
+files` writes is byte-identical to ewfprobe's read of the same entry (`ewfexport`
+writes `$` in a name as `\x24`, which the comparison maps). Every entry with data
+and no children appears in that export, and all 646 MD5s EnCase stored for entries
+match. A check that does not depend on libewf: the logical zip taken of the same
+phone a minute after the last L01 holds 30 photos, and all 30 are byte-identical to
+entries ewfprobe reads from that L01. No L01 from another writer has been
+available, and no real L01 is committed under `tests/fixtures`; in the suite, a
+writer built from the specification and from the layout of these files covers each
+behaviour above.
+
 ## Standalone executables
 
 Each release carries `ewfprobe` built as a single executable with PyInstaller on
@@ -207,7 +274,8 @@ and arm64, beside `ewfprobe.py` itself. The workflow that builds them
 (`.github/workflows/build-executables.yml`) runs each executable on the reference images
 in `tests/fixtures`. It requires `info`, `verify` and `export` to write the same bytes as
 `python ewfprobe.py`, the export to match the source disk's SHA-256, and a set missing a
-segment to be refused, before it is packaged with `SHA256SUMS.txt` and a README. The
+segment to be refused, before it is packaged with `SHA256SUMS.txt` and a README. No L01 is
+among those images, so the L01 commands are tested from `ewfprobe.py` only. The
 executables are not code signed; the README inside each archive says what Windows
 SmartScreen and macOS Gatekeeper will ask.
 
@@ -242,7 +310,10 @@ Joachim Metz, *Expert Witness Compression Format (EWF)* and *Expert Witness
 Compression Format 2 (EWF2)*, in the
 [libyal/libewf](https://github.com/libyal/libewf) repository under
 `documentation/`. The format is publicly documented, which is what makes an
-independent implementation possible.
+independent implementation possible. L01 support follows the EWF-L01 parts of the
+first document (the ltree section and its categories, the file entry flags and the
+binary extents), read at commit
+[`d76fd0b`](https://github.com/libyal/libewf/blob/d76fd0bb21601e2969bc88ffdaeb861023f6a5b2/documentation/Expert%20Witness%20Compression%20Format%20(EWF).asciidoc).
 
 For AFF: AFFLIB's own documentation (`doc/affdoc.doc`) and the segment names and
 flag values in its public header, `include/afflib/afflib.h`, in the
