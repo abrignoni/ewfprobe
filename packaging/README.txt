@@ -19,6 +19,10 @@ ewfprobe, built as a standalone executable
                       LZFSE-compressed .dmg needs the Python package
                       pyliblzfse, which this executable does not include;
                       run python3 ewfprobe.py with it installed.
+                      An encrypted .dmg, .sparseimage or .sparsebundle opens
+                      with its password: ewfprobe asks for it, or give it
+                      with --password-file FILE (the first line of FILE)
+                      or --password-env NAME (an environment variable).
 
   SHA256SUMS.txt      the hash of the executable as built. Check it with
                           certutil -hashfile ewfprobe.exe SHA256     (Windows)

@@ -14,13 +14,18 @@ offset, and a split set with a segment missing must be refused the same way by b
 each L01 under "logical" in the manifest, `info`, `verify`, `files`, a full `export` and an
 `export --entry` of its sparse entry must also be byte-identical between the two, the
 exports must hash to the manifest's known answers, and verify must report every stored
-entry MD5 as matching. The executable's --version must name the source's __version__.
+entry MD5 as matching. For each encrypted Apple disk image under "encrypted_dmg", `info`,
+`verify` and a full `export`, given its password through --password-env, must be
+byte-identical between the two, the export must hash to the disk hdiutil read back from it,
+and a wrong password must be refused the same way by both; so the executable carries the
+cipher package. The executable's --version must name the source's __version__.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -28,8 +33,8 @@ import tempfile
 from pathlib import Path
 
 
-def run(cmd: list[str], cwd: Path, want: int = 0) -> subprocess.CompletedProcess:
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, check=False)
+def run(cmd: list[str], cwd: Path, want: int = 0, env=None) -> subprocess.CompletedProcess:
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, check=False, env=env)
     if r.returncode != want:
         sys.exit(f"FAILED (exit {r.returncode}, wanted {want}): {' '.join(cmd)}\n"
                  f"{r.stdout[-2000:]!r}\n{r.stderr[-4000:]!r}")
@@ -127,7 +132,34 @@ def main(argv: list[str]) -> int:
             print(f"{name}: info, verify, files and exports identical; the media data and its "
                   f"sparse entry match libewf's export, {known['entry_md5s']} entry MD5s match")
 
-    assert checks == len(manifest["variants"]) + len(manifest.get("logical", {})) + 2, checks
+        encrypted = manifest.get("encrypted_dmg", {"variants": {}})
+        for name, variant in sorted(encrypted["variants"].items()):
+            image = str(fixtures / variant.get("image", variant["files"][0]))
+            pw = ["--password-env", "EWFPROBE_SMOKE_PASSWORD"]
+            env = dict(os.environ, EWFPROBE_SMOKE_PASSWORD=variant["password"])
+            out = {}
+            for who, cmd in (("py", py), ("exe", exe)):
+                raw = work / f"{name}-{who}.raw"
+                out[who] = (run(cmd + ["info", *pw, image], work, env=env).stdout,
+                            run(cmd + ["verify", "-q", *pw, image], work, env=env).stdout,
+                            run(cmd + ["export", "-q", *pw, image, "-o", str(raw)], work,
+                                env=env).stdout,
+                            raw.read_bytes())
+            assert out["py"] == out["exe"], f"{name}: the executable's output differs"
+            disk = encrypted["disks"][variant["disk"]]
+            assert hashlib.sha256(out["exe"][3]).hexdigest() == disk["sha256"], f"{name}: export"
+            bad = dict(os.environ, EWFPROBE_SMOKE_PASSWORD=variant["password"] + "x")
+            a = run(py + ["info", *pw, image], work, want=2, env=bad).stderr
+            b = run(exe + ["info", *pw, image], work, want=2, env=bad).stderr
+            assert a.replace(b"\r\n", b"\n") == b.replace(b"\r\n", b"\n"), (a, b)
+            assert b"does not open" in b, b
+            checks += 1
+            print(f"{name}: decrypted with its password, info, verify and a "
+                  f"{len(out['exe'][3]):,} byte export identical; the export matches the disk "
+                  f"hdiutil read back, and a wrong password is refused by both")
+
+    assert checks == (len(manifest["variants"]) + len(manifest.get("logical", {})) + 2
+                      + len(manifest.get("encrypted_dmg", {}).get("variants", {}))), checks
     print(f"{checks} checks: the executable wrote the same bytes as the source")
     return 0
 

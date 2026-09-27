@@ -268,12 +268,13 @@ def test_a_udif_image_cut_short_is_refused(tmp_path):
         ewfprobe.open_ewf(path)
 
 
-def test_an_encrypted_image_is_recognised_and_refused(tmp_path):
+def test_an_encrypted_image_is_recognised_and_a_bad_header_refused(tmp_path):
+    # reading encrypted images is tested in test_encrypted_images.py
     path = tmp_path / "enc.dmg"
     path.write_bytes(b"encrcdsa" + bytes(8192))
     assert ewfprobe.apple_image_kind(str(path)) == "ENCRYPTED"
     assert not ewfprobe.is_image(str(path))
-    with pytest.raises(ewfprobe.EwfFormatError, match="encrypted Apple disk image"):
+    with pytest.raises(ewfprobe.EwfFormatError, match="encrcdsa version 0"):
         ewfprobe.open_ewf(str(path))
 
 
@@ -570,13 +571,12 @@ def test_band_files_hdiutil_would_ignore_are_ignored_and_listed(tmp_path, capsys
     assert "3 other entries in bands, not read" in out
 
 
-def test_an_encrypted_sparse_bundle_is_recognised_and_refused(tmp_path):
+def test_an_encrypted_sparse_bundle_is_recognised(tmp_path):
+    # reading encrypted bundles is tested in test_encrypted_images.py
     path = write_bundle(tmp_path / "enc.sparsebundle", _zeroed_disk(8), 2048,
                         token=b"encrcdsa" + bytes(1000))
     assert ewfprobe.apple_image_kind(path) == "ENCRYPTED"
     assert not ewfprobe.is_image(path)
-    with pytest.raises(ewfprobe.EwfFormatError, match="encrypted sparse bundle"):
-        ewfprobe.open_ewf(path)
 
 
 def test_a_folder_is_a_sparse_bundle_only_by_its_info_plist(tmp_path):
