@@ -69,6 +69,12 @@ VARIANTS = [
     # SMART compresses every chunk; "none" stores them at zlib level 0, so the
     # source stays large enough to split
     ("smart-split",   "smart",    "none",        64,            "1M"),
+    # Ex01 needs libewf 20260924 or later; 20140817 writes an E01 when asked for it
+    ("ex01-fast",     "encase7-v2", "fast",      64,            None),
+    # Ex01 stores runs of one byte value as pattern-fill chunks, so this source
+    # cannot be made to split: a multi-segment Ex01 set is written by the test
+    # suite's own writer instead.
+    ("ex01-none",     "encase7-v2", "none",      64,            None),
 ]
 
 
@@ -214,6 +220,8 @@ SMALL_VARIANTS = [
     ("encase6-split", "encase6",  "none",        64,            "1M"),
     ("smart-fast",    "smart",    "fast",        64,            None),
     ("smart-split",   "smart",    "none",        64,            "1M"),
+    ("ex01-fast",     "encase7-v2", "fast",      64,            None),
+    ("ex01-none",     "encase7-v2", "none",      64,            None),
 ]
 
 
