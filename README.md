@@ -86,9 +86,17 @@ under `tests/fixtures` so the suite runs without libewf present.
 
 SMART is covered the same way: two variants written by `ewfacquire -f smart`
 (libewf 20260924), one of them a four-segment set, are committed beside the
-E01 fixtures, and libewf 20140817 writes the same layout. SMART is not yet
-checked against an image written by ASR Data's SMART or by FTK Imager, so for
-now it rests on the format documentation and on libewf's writer.
+E01 fixtures, and libewf 20140817 writes the same layout. So are SMART images
+written by FTK Imager 4.7.3.61 from the same source, one a single file and one a
+four-segment set, together with an FTK Imager E01: every one reproduces the
+source and matches the MD5 and SHA-1 FTK Imager recorded. SMART has not been
+checked against an image written by ASR Data's own SMART.
+
+The compression a SMART image reports is the value its header records, and FTK
+Imager records it inaccurately: its four-segment set was written at compression
+0, holds stored chunks, and its header still says "fast". FTK Imager's E01 errs
+the other way, as described below. Read that line as what the image
+claims, not as a measurement.
 
 **Against real evidence.** Physical acquisitions written by FTK Imager, from
 28.6 GiB to 238 GiB, including 15-segment sets. Decoded ranges are byte

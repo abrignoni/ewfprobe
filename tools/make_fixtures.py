@@ -21,6 +21,11 @@ hash to the manifest's recorded SHA-256 before anything is written. Rebuilding
 it from the generator instead would depend on the imaging library encoding the
 same JPEG bytes years later.
 
+Variants whose ``writer`` in the manifest is not ewfacquire were written by
+hand in another tool (FTK Imager, from the same source image) and copied in.
+``--add`` leaves them alone; ``--small`` rebuilds the manifest from scratch and
+would drop them, so re-add them afterwards from the tool that wrote them.
+
 ``EWFACQUIRE`` selects the ewfacquire binary (default: the one on PATH). Each
 variant records the version that wrote it, because libewf releases differ in
 what they can write: 20140817 writes Ex01 as an ordinary E01, 20260924 does not.
