@@ -5,7 +5,8 @@ nothing to install. It opens an EWF-E01 or SMART (.s01) acquisition, joins its
 segments, and presents the original disk as an ordinary seekable file object,
 so anything that can read a raw image can read an E01 without changing how it
 reads. It also reads Ex01 (EWF2), the format EnCase 7 introduced, and AFF, the
-Advanced Forensic Format that AFFLIB and FTK Imager write.
+Advanced Forensic Format that AFFLIB and FTK Imager write, as a single .aff file or
+as an AFD directory of them.
 
     with ewfprobe.open_ewf("evidence.E01") as img:
         img.seek(0)
@@ -20,17 +21,18 @@ Compression Format (EWF)" and "Expert Witness Compression Format 2 (EWF2)", in
 the libyal/libewf repository under ``documentation/``. No code is taken from
 libewf, which is LGPL, or from any other EWF implementation. This file is MIT,
 and reimplementing a documented format is what keeps it that way. The AFF
-reader is written from AFFLIB's own documentation and the segment names and
-flag values in its public header, include/afflib/afflib.h (sshock/AFFLIBv3); no
-AFFLIB code is copied.
+reader is written from AFFLIB's own documentation, the segment names and flag
+values in its public header, include/afflib/afflib.h, and, for AFD, how
+lib/vnode_afd.cpp finds and joins the files of one (sshock/AFFLIBv3); no AFFLIB
+code is copied.
 
 Scope. This reads EWF-E01, the format EnCase 6 and 7 and FTK Imager write and
 by far the most common one in the field, EWF-S01, the variant ASR Data's SMART
-writes, EWF2-Ex01, which EnCase 7 and later write, and AFF. It does not read
-logical evidence (.L01, .Lx01), encrypted Ex01 images (the encryption is not
-publicly documented), Ex01 images compressed with bzip2 (no sample exists to
-validate against), encrypted AFF, or the split AFD and AFM forms of AFF, and it
-never writes.
+writes, EWF2-Ex01, which EnCase 7 and later write, and AFF, including AFD. It
+does not read logical evidence (.L01, .Lx01), encrypted Ex01 images (the
+encryption is not publicly documented), Ex01 images compressed with bzip2 (no
+sample exists to validate against), encrypted AFF, or AFM (AFF metadata beside
+split raw files), and it never writes.
 
 An image whose content is encrypted at rest, by BitLocker or FileVault or an
 encrypted APFS volume, reads back as the ciphertext that was acquired: the
@@ -163,6 +165,14 @@ _AFF_FIELDS = {
 }
 FORMAT_AFF = "AFF"
 _AFF_MAX_SMALL = 1 << 16                         # non-page segments read into memory
+# AFD: one AFF image kept as a directory whose name ends .afd, holding ordinary AFF
+# files. AFFLIB (lib/vnode_afd.cpp) opens every .aff file in the directory, reads a
+# segment from the first file that holds it, and names the files it writes
+# file_000.aff, file_001.aff and on, numbered by how many it already has.
+FORMAT_AFD = "AFD"
+_AFD_MEMBER_NAME = re.compile(r"file_(\d+)\.aff", re.IGNORECASE)
+# Segments the files of an AFD must agree on when more than one of them holds one.
+_AFD_MUST_AGREE = {"pagesize", "segsize", "sectorsize", "badflag", "md5", "sha1", "sha256"}
 
 # Logical evidence files share the section machinery but hold files, not a disk.
 LOGICAL_SIGNATURES = (b"LVF\x09\x0d\x0a\xff\x00", b"LEF2\r\n\x81\x00")
@@ -247,7 +257,16 @@ def _family(ext):
 
 
 def is_image(path) -> bool:
-    """True when the file begins with a signature ewfprobe reads: EWF, EWF2 or AFF."""
+    """True when ``path`` is something ewfprobe reads: a file beginning with the EWF,
+    EWF2 or AFF signature, or an AFD directory holding AFF files."""
+    if os.path.isdir(path):
+        afd = _afd_directory(path)
+        try:
+            return bool(afd) and any(_is_aff(os.path.join(afd, name))
+                                     for name in os.listdir(afd)
+                                     if name.lower().endswith(".aff"))
+        except OSError:
+            return False
     try:
         with open(path, "rb") as fh:
             return fh.read(8) in (SIGNATURE, SIGNATURE_V2, AF_HEADER)
@@ -261,6 +280,50 @@ def _is_aff(path):
             return fh.read(8) == AF_HEADER
     except OSError:
         return False
+
+
+def _afd_directory(path):
+    """The AFD directory ``path`` names, as the directory itself or as one of the .aff
+    files in it, else None. AFFLIB takes a directory whose name ends .afd as an AFD
+    (afd_identify_file in lib/vnode_afd.cpp). Given one file of an AFD, the whole
+    directory is opened, because one file holds only some of the image's pages."""
+    full = os.path.abspath(path)
+    if os.path.isdir(full):
+        return full if full.lower().endswith(".afd") else None
+    parent = os.path.dirname(full)
+    if full.lower().endswith(".aff") and parent.lower().endswith(".afd"):
+        return parent
+    return None
+
+
+def _natural(name):
+    return [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", name)]
+
+
+def _afd_members(directory):
+    """The .aff files of an AFD directory, in numbered order.
+
+    AFFLIB numbers the files it writes from file_000.aff, so when every file carries
+    such a name, a gap in the numbering is a file that is missing, and the set is
+    refused as an EWF set with a missing segment is.
+    """
+    label = os.path.basename(directory)
+    names = sorted((n for n in os.listdir(directory)
+                    if n.lower().endswith(".aff")
+                    and os.path.isfile(os.path.join(directory, n))), key=_natural)
+    if not names:
+        raise EwfFormatError(f"{label} is an AFD directory with no .aff file in it")
+    numbers = [_AFD_MEMBER_NAME.fullmatch(n) for n in names]
+    if all(numbers):
+        have = {int(m.group(1)) for m in numbers}
+        gaps = [f"file_{k:03d}.aff" for k in range(max(have) + 1) if k not in have]
+        if gaps:
+            raise EwfIncompleteSetError(
+                f"{label} is missing {', '.join(gaps[:5])}"
+                f"{f' and {len(gaps) - 5} more' if len(gaps) > 5 else ''}; AFFLIB "
+                f"numbers the files of an AFD in order, so a gap is a file that is "
+                f"not there")
+    return [os.path.join(directory, n) for n in names]
 
 
 def is_ewf(path) -> bool:
@@ -465,6 +528,28 @@ def _parse_header_text(text):
 
 # ---------------------------------------------------------------- the reader
 
+def _af_number(entry):
+    """A number AFFLIB keeps in a segment's argument. FTK Imager writes some of them,
+    the sector size among them, as decimal text in the data instead."""
+    arg, data = entry
+    text = data.strip(b"\x00 ")
+    return int(text) if not arg and text.isdigit() else arg
+
+
+def _af_meaning(key, entry):
+    """What a segment says, for comparing two files' copies of it: the same sector
+    size can be stored as text in one file of an AFD and as an argument in another."""
+    return _af_number(entry) if key in ("pagesize", "segsize", "sectorsize") else entry[1]
+
+
+def _af_quad(entry):
+    """An AFF 64-bit value, stored as its low 32 bits then its high 32 bits."""
+    if entry is None or len(entry[1]) != 8:
+        return None
+    low, high = struct.unpack(">II", entry[1])
+    return (high << 32) | low
+
+
 class _Table:
     """One table section: a run of chunk offsets sharing a base offset.
 
@@ -486,7 +571,7 @@ class _Table:
 
 
 class EwfImage:
-    """An EWF-E01, EWF-S01, EWF2-Ex01 or AFF acquisition, read as one seekable stream.
+    """An EWF-E01, EWF-S01, EWF2-Ex01, AFF or AFD acquisition, read as one seekable stream.
 
     ``media_size`` is the size of the disk that was acquired, which is what
     ``seek`` and ``read`` address. The segment files themselves are an
@@ -494,12 +579,11 @@ class EwfImage:
     """
 
     def __init__(self, path, segments=None):
+        self._afd = None if segments else _afd_directory(path)
         if segments:
             self.paths = list(segments)
-        elif os.path.isdir(path) and str(path).lower().endswith(".afd"):
-            raise EwfFormatError(
-                f"{os.path.basename(path)} is an AFD directory, AFF split across "
-                f"several files; ewfprobe reads a single .aff file")
+        elif self._afd:
+            self.paths = _afd_members(self._afd)
         elif _is_aff(path):
             self.paths = [os.path.abspath(path)]
         else:
@@ -527,7 +611,7 @@ class EwfImage:
         self.missing_page_ranges: list[tuple[int, int]] = []
         self.missing_page_count = 0
         self.bad_sectors = None
-        self._aff_pages: dict[int, tuple[int, int, int]] = {}
+        self._aff_pages: dict[int, tuple[int, int, int, int]] = {}
         self._aff_badflag = b""
 
         self._tables: list[_Table] = []
@@ -707,16 +791,17 @@ class EwfImage:
             raise EwfFormatError("the image carries no chunk table")
         self._finish_index(chunks)
 
-    def _index_aff(self):
-        """Walk an AFF file's segments once, keeping page locations and metadata."""
-        self.format = FORMAT_AFF
-        path = self.paths[0]
+    def _walk_aff(self, i):
+        """One AFF file's segments, walked once: where each page is, and the content
+        of every small segment."""
+        path = self.paths[i]
         name_of_file = os.path.basename(path)
-        fh = self._handle(0)
+        fh = self._handle(i)
         end = os.path.getsize(path)
         fh.seek(0)
         if _read_exactly(fh, len(AF_HEADER)) != AF_HEADER:
             raise EwfFormatError(f"{name_of_file} is not an AFF file")
+        pages: dict[int, tuple[int, int, int]] = {}
         small: dict[str, tuple[int, bytes]] = {}
         offset = len(AF_HEADER)
         while offset < end:
@@ -746,31 +831,75 @@ class EwfImage:
                     f"{name_of_file} is encrypted. ewfprobe does not read encrypted AFF")
             page = _AF_PAGE_NAME.fullmatch(name)
             if page:
-                self._aff_pages[int(page.group(1))] = (data_offset, data_len, arg)
+                pages[int(page.group(1))] = (data_offset, data_len, arg)
             elif name and data_len <= _AFF_MAX_SMALL:
                 fh.seek(data_offset)
                 small[name] = (arg, _read_exactly(fh, data_len))
             offset = tail + _AF_SEGTAIL.size
+        return pages, small, end
 
-        def quad(entry):
-            if entry is None or len(entry[1]) != 8:
-                return None
-            low, high = struct.unpack(">II", entry[1])
-            return (high << 32) | low
+    def _same_page(self, n, first, second):
+        """A page stored in two files of an AFD has to be the same page twice."""
+        def stored(location):
+            i, offset, length, arg = location
+            fh = self._handle(i)
+            fh.seek(offset)
+            return arg, _read_exactly(fh, length)
+        if stored(first) != stored(second):
+            raise EwfFormatError(
+                f"page {n} is stored in both {os.path.basename(self.paths[first[0]])} and "
+                f"{os.path.basename(self.paths[second[0]])} with different contents; "
+                f"AFFLIB reads it from whichever file the directory lists first, so the "
+                f"image has no single reading")
 
-        page_size = (small.get("pagesize") or small.get("segsize") or (0, b""))[0]
+    def _index_aff(self):
+        """Walk an AFF file's segments once, or each file of an AFD, keeping page
+        locations and metadata.
+
+        An AFD's files are merged the way AFFLIB merges them: a segment is read from
+        the first file that holds it, in numbered order, and the image size is the
+        largest any file records (afd_get_seg and afd_vstat in lib/vnode_afd.cpp).
+        AFFLIB takes the files in the order the directory lists them, which differs
+        between filesystems, so a page or a hash that two files record differently
+        is refused rather than resolved by that order.
+        """
+        self.format = FORMAT_AFD if (self._afd or len(self.paths) > 1) else FORMAT_AFF
+        label = os.path.basename(self._afd or self.paths[0])
+        small: dict[str, tuple[int, bytes]] = {}
+        holder: dict[str, int] = {}
+        image_sizes = []
+        for i, path in enumerate(self.paths):
+            pages, seen, end = self._walk_aff(i)
+            self.sizes.append(end)
+            for key, value in seen.items():
+                if key == "imagesize" and _af_quad(value) is not None:
+                    image_sizes.append(_af_quad(value))
+                if key not in small:
+                    small[key], holder[key] = value, i
+                elif (key in _AFD_MUST_AGREE
+                      and _af_meaning(key, small[key]) != _af_meaning(key, value)):
+                    raise EwfFormatError(
+                        f"{label}: {os.path.basename(self.paths[holder[key]])} and "
+                        f"{os.path.basename(path)} record different {key} values")
+            for n, (offset, length, arg) in pages.items():
+                if n in self._aff_pages:
+                    self._same_page(n, self._aff_pages[n], (i, offset, length, arg))
+                else:
+                    self._aff_pages[n] = (i, offset, length, arg)
+
+        page_size = _af_number(small.get("pagesize") or small.get("segsize") or (0, b""))
         if not page_size:
-            raise EwfFormatError(f"{name_of_file} records no page size")
-        image_size = quad(small.get("imagesize"))
-        if image_size is None:
+            raise EwfFormatError(f"{label} records no page size")
+        if not image_sizes:
+            where = (", in an AFD into one of its files," if self.format == FORMAT_AFD
+                     else "")
             raise EwfIncompleteSetError(
-                f"{name_of_file} records no image size, which an AFF file gains when "
-                f"its acquisition finishes; reading it would report missing data as empty")
-        sector_arg, sector_data = small.get("sectorsize", (0, b""))
-        if not sector_arg and sector_data.strip(b"\x00 ").isdigit():
-            sector_arg = int(sector_data.strip(b"\x00 "))  # FTK Imager writes it as text
+                f"{label} records no image size, which AFFLIB writes{where} when an "
+                f"acquisition finishes; reading it would report missing data as empty")
+        image_size = max(image_sizes)
+        sector_arg = _af_number(small.get("sectorsize", (0, b"")))
         self._aff_badflag = small.get("badflag", (0, b""))[1]
-        self.bad_sectors = quad(small.get("badsectors"))
+        self.bad_sectors = _af_quad(small.get("badsectors"))
         for key, algo, width in (("md5", "MD5", 16), ("sha1", "SHA1", 20),
                                  ("sha256", "SHA256", 32)):
             digest = small.get(key, (0, b""))[1]
@@ -799,7 +928,6 @@ class EwfImage:
         self.sector_count = image_size // sector_arg if sector_arg else 0
         self.sectors_per_chunk = page_size // sector_arg if sector_arg else 0
         self.compression_level = None
-        self.sizes = [end]
         needed = self._needed_chunks()
         self.chunk_count = needed
         self._indexed_chunks = sum(1 for n in self._aff_pages if n < needed)
@@ -825,8 +953,8 @@ class EwfImage:
                                      f"no bad-sector marker to stand in for it")
             flag = self._aff_badflag
             return (flag * (self.chunk_size // len(flag) + 1))[:self.chunk_size]
-        offset, length, arg = location
-        fh = self._handle(0)
+        i, offset, length, arg = location
+        fh = self._handle(i)
         fh.seek(offset)
         raw = _read_exactly(fh, length)
         if not arg & AF_PAGE_COMPRESSED:
@@ -1017,7 +1145,7 @@ class EwfImage:
         if self.format == FORMAT_EX01:
             data = self._chunk_data_v2(n)
             return self._keep(n, data, want)
-        if self.format == FORMAT_AFF:
+        if self.format in (FORMAT_AFF, FORMAT_AFD):
             data = self._chunk_data_aff(n)
             return self._keep(n, data, want)
 
@@ -1190,7 +1318,7 @@ class EwfImage:
 
 def open_ewf(path, segments=None) -> EwfImage:
     """Open an acquisition ewfprobe reads: an EWF or EWF2 set from any path in it,
-    or an AFF file."""
+    an AFF file, or an AFD directory from the directory or any file in it."""
     return EwfImage(path, segments=segments)
 
 
@@ -1222,7 +1350,7 @@ def _cmd_info(args):
             print(f"sectors         {d['sector_count']:,}")
         else:
             print("sector size     not recorded")
-        unit = "page size " if d["format"] == FORMAT_AFF else "chunk size"
+        unit = "page size " if d["format"] in (FORMAT_AFF, FORMAT_AFD) else "chunk size"
         print(f"{unit}      {d['chunk_size']:,} bytes "
               f"({d['sectors_per_chunk']} sectors)")
         print(f"chunks          {d['indexed_chunks']:,} indexed, "
@@ -1302,8 +1430,8 @@ def _cmd_export(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="ewfprobe",
-        description="Read an EnCase/EWF (.E01, .Ex01), SMART (.s01) or AFF (.aff) "
-                    "forensic image. Read only.")
+        description="Read an EnCase/EWF (.E01, .Ex01), SMART (.s01) or AFF (.aff, "
+                    ".afd) forensic image. Read only.")
     ap.add_argument("--version", action="version", version=f"ewfprobe {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

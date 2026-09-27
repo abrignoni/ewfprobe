@@ -188,6 +188,35 @@
       ],
       "writer": "FTK Imager 4.7.3.61 (AFFLIB 3.7.18, per the image's afflib_version segment)",
       "stores_no_hash": true
+    },
+    "aff-afd": {
+      "format": "aff",
+      "options": [
+        "-s64k",
+        "-M32k"
+      ],
+      "files": [
+        "aff-afd.afd/file_000.aff",
+        "aff-afd.afd/file_001.aff",
+        "aff-afd.afd/file_002.aff",
+        "aff-afd.afd/file_003.aff",
+        "aff-afd.afd/file_004.aff"
+      ],
+      "writer": "affconvert 3.7.22",
+      "image": "aff-afd.afd"
+    },
+    "ftk-aff-split": {
+      "format": "aff",
+      "compression": "0",
+      "segment_size": "1M",
+      "files": [
+        "ftk-aff-split.afd/file_000.aff",
+        "ftk-aff-split.afd/file_001.aff",
+        "ftk-aff-split.afd/file_002.aff"
+      ],
+      "image": "ftk-aff-split.afd",
+      "writer": "FTK Imager 4.7.3.61 (AFFLIB 3.7.18, per the image's afflib_version segment)",
+      "stores_no_hash": true
     }
   }
 }

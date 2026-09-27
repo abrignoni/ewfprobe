@@ -799,7 +799,7 @@ def test_aff_every_page_form_reads(tmp_path):
     path = write_aff(tmp_path / "img.aff", data, kinds=["z", "0", "l", "r", "r"])
     with ewfprobe.open_ewf(path) as img:
         assert img.format == ewfprobe.FORMAT_AFF
-        assert sorted(arg for _o, _l, arg in img._aff_pages.values()) == [
+        assert sorted(arg for _i, _o, _l, arg in img._aff_pages.values()) == [
             0x00, 0x00, 0x01, 0x21, 0x33]
         assert img.media_size == len(data)
         assert img.read() == data
@@ -905,8 +905,178 @@ def test_aff_detection_and_the_afd_form(tmp_path):
     assert ewfprobe.is_image(path) is True and ewfprobe.is_ewf(path) is False
     afd = tmp_path / "set.afd"
     afd.mkdir()
-    with pytest.raises(ewfprobe.EwfFormatError, match="AFD"):
+    assert ewfprobe.is_image(str(afd)) is False
+    with pytest.raises(ewfprobe.EwfFormatError, match="no .aff file"):
         ewfprobe.open_ewf(str(afd))
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    write_aff(plain / "file_000.aff", aff_sample(1))
+    assert ewfprobe.is_image(str(plain)) is False       # not named .afd
+
+
+# ---------------------------------------------------------- AFD, spec-written
+
+def write_afd(directory, data, groups, *, page_size=1024, names=None, sizes_in="last",
+              image_sizes=None, sector_text=None):
+    """Write ``data`` as an AFD: one AFF file per entry of ``groups``, holding the
+    pages that entry lists. Every file carries the metadata, as AFFLIB copies it into
+    each file it adds. The image size goes in the last file (affconvert's layout) or
+    in every file (FTK Imager's), and the hashes in the last."""
+    os.makedirs(directory, exist_ok=True)
+    n_pages = -(-len(data) // page_size)
+    for k, keep in enumerate(groups):
+        last = k == len(groups) - 1
+        write_aff(os.path.join(directory, names[k] if names else f"file_{k:03d}.aff"),
+                  data, page_size=page_size,
+                  drop=[n for n in range(n_pages) if n not in keep],
+                  record_image_size=sizes_in == "all" or last,
+                  image_size=image_sizes[k] if image_sizes else None,
+                  sector_text=bool(sector_text and sector_text[k]), hashes=last)
+    return str(directory)
+
+
+def test_an_afd_reads_as_one_image_with_its_pages_spread_across_files(tmp_path):
+    """affconvert's layout: a first file with no page, and the image size and hashes
+    only in the last file."""
+    data = aff_sample(7)
+    afd = write_afd(tmp_path / "set.afd", data, [[], [0, 1], [2, 3, 4], [5, 6]])
+    assert ewfprobe.is_image(afd) is True
+    with ewfprobe.open_ewf(afd) as img:
+        assert img.format == ewfprobe.FORMAT_AFD
+        assert [os.path.basename(p) for p in img.paths] == [
+            "file_000.aff", "file_001.aff", "file_002.aff", "file_003.aff"]
+        assert {i for i, _o, _l, _a in img._aff_pages.values()} == {1, 2, 3}
+        assert len(img.sizes) == 4 and img.missing_page_count == 0
+        assert img.read() == data
+        result = img.verify()
+    assert result["match"] is True and set(result["stored"]) == {"MD5", "SHA1", "SHA256"}
+
+
+def test_an_afd_holding_one_file_reads_as_an_afd(tmp_path):
+    """FTK Imager 4.7.3.61 wrote a 1,600 MiB source larger than its 1500 MB fragment
+    size as an AFD, and the zeros compressed into one file."""
+    data = aff_sample(3)
+    afd = write_afd(tmp_path / "one.afd", data, [[0, 1, 2]], sizes_in="all")
+    with ewfprobe.open_ewf(afd) as img:
+        assert img.format == ewfprobe.FORMAT_AFD and len(img.paths) == 1
+        assert img.read() == data
+
+
+def test_any_file_of_an_afd_opens_the_whole_directory(tmp_path):
+    """One file alone holds only some of the pages. AFFLIB's affcat, given one, reads
+    that file as an image of its own; this reader opens the directory it is in."""
+    data = aff_sample(5)
+    afd = write_afd(tmp_path / "SET.AFD", data, [[0, 1], [2, 3], [4]],
+                    names=["FILE_000.AFF", "FILE_001.AFF", "FILE_002.AFF"])
+    for name in ("FILE_000.AFF", "FILE_002.AFF"):
+        member = os.path.join(afd, name)
+        assert ewfprobe.is_image(member) is True
+        with ewfprobe.open_ewf(member) as img:
+            assert img.format == ewfprobe.FORMAT_AFD and len(img.paths) == 3
+            assert img.read() == data
+
+
+def test_an_afd_image_size_is_the_largest_any_file_records(tmp_path):
+    """AFFLIB's afd_vstat takes the largest image size among the files, not the
+    first file's."""
+    data = aff_sample(4)
+    afd = write_afd(tmp_path / "set.afd", data, [[0, 1], [2, 3]], sizes_in="all",
+                    image_sizes=[2048, len(data)])
+    with ewfprobe.open_ewf(afd) as img:
+        assert img.media_size == len(data)
+        assert img.read() == data
+
+
+def test_an_afd_sector_size_stored_two_ways_is_the_same_sector_size(tmp_path):
+    """FTK Imager writes the first file's sector size as the text "512", and AFFLIB
+    writes the files it adds with 512 as the segment's argument."""
+    data = aff_sample(3)
+    afd = write_afd(tmp_path / "set.afd", data, [[0], [1, 2]], sizes_in="all",
+                    sector_text=[True, False])
+    with ewfprobe.open_ewf(afd) as img:
+        assert img.sector_size == 512 and img.read() == data
+
+
+@pytest.mark.parametrize("gone", ["file_000.aff", "file_001.aff"])
+def test_a_gap_in_the_numbering_of_an_afd_is_refused(tmp_path, gone):
+    afd = write_afd(tmp_path / "set.afd", aff_sample(5), [[0, 1], [2, 3], [4]])
+    os.remove(os.path.join(afd, gone))
+    with pytest.raises(ewfprobe.EwfIncompleteSetError, match=gone):
+        ewfprobe.open_ewf(afd)
+
+
+def test_afd_files_are_taken_in_numbered_order_past_file_999(tmp_path):
+    """AFFLIB's %03d numbering runs on to file_1000.aff, which sorts before
+    file_999.aff by name."""
+    afd = tmp_path / "set.afd"
+    afd.mkdir()
+    for k in range(1001):
+        (afd / f"file_{k:03d}.aff").write_bytes(b"")
+    names = [os.path.basename(p) for p in ewfprobe._afd_members(str(afd))]
+    assert names[-2:] == ["file_999.aff", "file_1000.aff"] and len(names) == 1001
+
+
+def test_a_gap_is_refused_when_the_afd_names_are_upper_case(tmp_path):
+    """A copy through a FAT volume without long names shows them as FILE_000.AFF."""
+    afd = write_afd(tmp_path / "SET.AFD", aff_sample(5), [[0, 1], [2, 3], [4]],
+                    names=["FILE_000.AFF", "FILE_001.AFF", "FILE_002.AFF"])
+    os.remove(os.path.join(afd, "FILE_001.AFF"))
+    with pytest.raises(ewfprobe.EwfIncompleteSetError, match="file_001.aff"):
+        ewfprobe.open_ewf(afd)
+
+
+def test_an_afd_that_lost_its_last_file_has_no_image_size(tmp_path):
+    """Where the last file carries the image size, losing it is refused; the
+    numbering alone cannot show that a last file is gone."""
+    afd = write_afd(tmp_path / "set.afd", aff_sample(5), [[0, 1], [2, 3], [4]])
+    os.remove(os.path.join(afd, "file_002.aff"))
+    with pytest.raises(ewfprobe.EwfIncompleteSetError, match="in an AFD"):
+        ewfprobe.open_ewf(afd)
+
+
+def test_afd_files_not_named_by_afflib_are_read_without_a_numbering_check(tmp_path):
+    data = aff_sample(4)
+    afd = write_afd(tmp_path / "set.afd", data, [[0, 1], [2, 3]], names=["a.aff", "c.aff"])
+    with ewfprobe.open_ewf(afd) as img:
+        assert img.read() == data
+
+
+def test_a_page_stored_twice_in_an_afd(tmp_path):
+    """The same page in two files is read once; two different pages under one number
+    have no single reading, since AFFLIB takes whichever file its directory listing
+    returns first."""
+    data = aff_sample(4)
+    afd = write_afd(tmp_path / "same.afd", data, [[0, 1, 2], [2, 3]])
+    with ewfprobe.open_ewf(afd) as img:
+        assert img.read() == data
+    other = bytearray(data)
+    other[2048] ^= 0xFF
+    afd = write_afd(tmp_path / "diff.afd", data, [[0, 1, 2], [3]])
+    write_aff(os.path.join(afd, "file_001.aff"), bytes(other), drop=(0, 1), hashes=False)
+    with pytest.raises(ewfprobe.EwfFormatError, match="page 2 is stored in both"):
+        ewfprobe.open_ewf(afd)
+
+
+@pytest.mark.parametrize("key", ["md5", "pagesize"])
+def test_afd_files_that_disagree_on_a_hash_or_the_page_size_are_refused(tmp_path, key):
+    data = aff_sample(4)
+    afd = write_afd(tmp_path / "set.afd", data, [[0, 1], [2, 3]])
+    if key == "md5":        # a second file carrying hashes of different content
+        write_aff(os.path.join(afd, "file_000.aff"), bytes(len(data)), drop=(2, 3),
+                  kinds=["0"] * 4)
+    else:
+        write_aff(os.path.join(afd, "file_000.aff"), data, page_size=512,
+                  drop=range(4, 8), hashes=False)
+    with pytest.raises(ewfprobe.EwfFormatError, match=f"different {key}"):
+        ewfprobe.open_ewf(afd)
+
+
+def test_afd_files_given_as_segments_read_as_an_afd(tmp_path):
+    data = aff_sample(4)
+    afd = write_afd(tmp_path / "set.afd", data, [[0, 1], [2, 3]])
+    files = sorted(os.path.join(afd, n) for n in os.listdir(afd))
+    with ewfprobe.open_ewf(files[0], segments=files) as img:
+        assert img.format == ewfprobe.FORMAT_AFD and img.read() == data
 
 
 def test_the_chunk_cache_is_bounded_in_bytes(tmp_path):
