@@ -26,6 +26,10 @@ hand in another tool (FTK Imager, from the same source image) and copied in.
 ``--add`` leaves them alone; ``--small`` rebuilds the manifest from scratch and
 would drop them, so re-add them afterwards from the tool that wrote them.
 
+The manifest's ``logical`` section describes an L01 EnCase wrote, copied from
+Digital Corpora with known answers taken from libewf's ewfexport. It has its own
+source rather than this tool's, so both modes keep that section as it is.
+
 ``EWFACQUIRE`` selects the ewfacquire binary (default: the one on PATH). Each
 variant records the version that wrote it, because libewf releases differ in
 what they can write: 20140817 writes Ex01 as an ordinary E01, 20260924 does not.
@@ -296,8 +300,14 @@ def main(argv):
         raw_path = rebuild_source(out, manifest)
         print(f"raw source rebuilt and matches the manifest: {manifest['sha256'][:16]}")
     else:
+        kept = None
+        if os.path.exists(os.path.join(out, "manifest.json")):
+            with open(os.path.join(out, "manifest.json"), encoding="utf-8") as fh:
+                kept = json.load(fh).get("logical")
         raw_path = os.path.join(out, "source.raw")
         manifest = build_raw(raw_path, size=(3 << 20) if small else (8 << 20))
+        if kept:
+            manifest["logical"] = kept
         print(f"raw source: {manifest['size']:,} bytes, "
               f"{len(manifest['media'])} media items")
         manifest["variants"] = {}

@@ -270,3 +270,50 @@ def test_a_missing_file_of_a_real_afd_is_refused(tmp_path):
         os.remove(folder / gone)
         with pytest.raises(ewfprobe.EwfIncompleteSetError, match=words):
             ewfprobe.open_ewf(str(folder))
+
+
+def _logical():
+    return sorted(_manifest().get("logical", {}).items())
+
+
+@pytest.mark.parametrize("name,known", _logical())
+def test_a_real_l01_reads_as_libewf_exports_it(name, known):
+    """An L01 EnCase wrote, from Digital Corpora. The known answers were taken from
+    libewf's ewfexport, not from this reader: the media data it exports raw, and
+    every file it exports with -f files, as one digest."""
+    path = os.path.join(FIXTURES, known["files"][0])
+    with ewfprobe.open_ewf(path) as img:
+        assert img.format == ewfprobe.FORMAT_L01, name
+        assert img.media_size == known["media_size"], name
+        assert _media_sha(img) == known["media_sha256"], name
+        assert len(img.logical_entries) == known["entries"], name
+        assert sum(1 for e in img.logical_entries if e.md5) == known["entry_md5s"], name
+        assert sum(1 for e in img.logical_entries
+                   if e.children and e.size) == known["entries_with_data_and_children"]
+        lines = []
+        for entry in img.logical_entries:
+            if entry.children or entry.is_folder:
+                continue                      # ewfexport writes these as folders
+            digest = hashlib.sha256(img.read_entry(entry)).hexdigest()
+            lines.append(f"{entry.path}\t{digest}\n")
+        assert len(lines) == known["exported_files"], name
+        joined = "".join(sorted(lines)).encode("utf-8", "surrogatepass")
+        assert hashlib.sha256(joined).hexdigest() == known["exported_files_digest"], name
+        sparse = img.find_entry(known["sparse_entry"]["path"])
+        assert sparse.flags & ewfprobe.L01_FLAG_SPARSE, name
+        data = img.read_entry(sparse)
+        assert len(data) == known["sparse_entry"]["size"], name
+        assert hashlib.sha256(data).hexdigest() == known["sparse_entry"]["sha256"], name
+        result = img.verify()
+    assert result["checksum_errors"] == [], name
+    assert result["entry_md5_checked"] == known["entry_md5s"], name
+    assert result["entry_md5_mismatched"] == [], name
+    assert result["computed"]["MD5"] == known["media_md5"], name
+
+
+def test_the_real_l01_fixture_is_the_file_digital_corpora_publishes():
+    for name, known in _logical():
+        with open(os.path.join(FIXTURES, known["files"][0]), "rb") as fh:
+            assert hashlib.sha256(fh.read()).hexdigest() == known["file_sha256"], name
+    assert _logical(), "the L01 fixture is missing from the manifest"
+

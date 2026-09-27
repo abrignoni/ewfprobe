@@ -698,12 +698,15 @@ def test_a_corrupt_ex01_chunk_table_is_refused(tmp_path):
         ewfprobe.open_ewf(path)
 
 
-def test_logical_evidence_is_named_not_misread(tmp_path):
-    for name, magic in (("x.L01", b"LVF\x09\x0d\x0a\xff\x00"),
-                        ("y.Lx01", b"LEF2\r\n\x81\x00")):
-        (tmp_path / name).write_bytes(magic + b"\x00" * 120)
-        with pytest.raises(ewfprobe.EwfFormatError, match="logical evidence"):
-            ewfprobe.open_ewf(str(tmp_path / name), segments=[str(tmp_path / name)])
+def test_lx01_logical_evidence_is_named_not_misread(tmp_path):
+    (tmp_path / "y.Lx01").write_bytes(b"LEF2\r\n\x81\x00" + b"\x00" * 120)
+    with pytest.raises(ewfprobe.EwfFormatError, match="Lx01"):
+        ewfprobe.open_ewf(str(tmp_path / "y.Lx01"), segments=[str(tmp_path / "y.Lx01")])
+    with pytest.raises(ewfprobe.EwfFormatError, match="Lx01"):
+        ewfprobe.open_ewf(str(tmp_path / "y.Lx01"))
+    (tmp_path / "z.Lx01").write_bytes(b"\x00" * 128)      # refused by its name alone
+    with pytest.raises(ewfprobe.EwfFormatError, match="has an Lx01 name"):
+        ewfprobe.open_ewf(str(tmp_path / "z.Lx01"))
 
 
 def test_ex01_extension_sequence_and_detection(tmp_path):
@@ -1102,3 +1105,385 @@ def test_a_damaged_aff_image_size_does_not_make_the_reader_count_to_it(tmp_path)
         assert img.missing_page_ranges == [(3, (1 << 60) // 1024 - 1)]
         assert img.missing_page_count == (1 << 60) // 1024 - 3
     assert time.monotonic() - started < 5
+
+
+# ---------------------------------------------------------- L01, spec-written
+
+# EnCase 7's entry columns, in the order its L01s list them (EWF specification,
+# "EnCase 7 (EWF-L01) file entry type indicators"; the same order in the five L01s
+# the reader was checked against, four from EnCase 7.2.4.2 and one from 7.4.1.10).
+L01_COLUMNS = ("mid ls be id cr ac wr mo dl sig ha sha p n du lo po pm oes opr src sub "
+               "cid jq alt ep aq cfi sg lpt").split()
+
+
+def l01_node(name, data=None, *, children=(), folder=None, md5=False, **values):
+    """One entry for write_l01. ``data`` is its content; ``values`` override columns
+    as stored (be, du, opr, ls and so on)."""
+    return {"name": name, "data": data, "children": list(children),
+            "folder": (data is None) if folder is None else folder, "md5": md5,
+            "values": values}
+
+
+def _l01_text(root_kids, media):
+    """The ltree text for a tree, appending each entry's content to ``media``."""
+    rows = []
+
+    def emit(node, depth_kids):
+        values = dict.fromkeys(L01_COLUMNS, "")
+        values.update(ha="0" * 32, sha="0" * 40, pm="-1", opr="4194304",
+                      n=node["name"], mid=f"{len(rows):032X}")
+        if node["folder"]:
+            values["p"] = "1"
+        data = node["data"]
+        if data is None:
+            values["be"] = f"1 {len(media):x} 1"         # a folder keeps one byte
+            media.extend(b"\x00")
+        else:
+            values["ls"] = str(len(data))
+            values["be"] = f"1 {len(media):x} {len(data):x}"
+            media.extend(data)
+            if node["md5"]:
+                values["ha"] = hashlib.md5(data).hexdigest().upper()
+        values.update(node["values"])
+        rows.append(f"26\t{len(node['children'])}")
+        rows.append("\t".join(values[c] for c in L01_COLUMNS))
+        for kid in node["children"]:
+            emit(kid, None)
+
+    root = dict.fromkeys(L01_COLUMNS, "")
+    root.update(ha="0" * 32, sha="0" * 40, p="1", n="LogicalEntries", pm="-1", be="1 0 1")
+    media.extend(b"\x00")
+    rows.append(f"26\t{len(root_kids)}")
+    rows.append("\t".join(root[c] for c in L01_COLUMNS))
+    for kid in root_kids:
+        emit(kid, None)
+    return rows
+
+
+def write_l01(folder, stem, tree, *, chunk_size=1024, chunks_per_segment=None,
+              tb=None, ltree_tamper=None, text_tamper=None, drop_ltree=False):
+    """Write ``tree`` (a list of l01_node) as an EWF-L01 set, return (paths, media).
+
+    The sections are those the five real L01s the reader was checked against carry,
+    in their order: header2, header, volume (media type 0x0e, no chunks declared),
+    the chunks, and in the last segment ltypes, ltree, data and done. Those files also
+    carry a second header2 and a map section, which the reader does not use.
+    """
+    media = bytearray()
+    rows = _l01_text(tree, media)
+    media = bytes(media)
+    text = "\n".join(["5", "rec", "tb\tcl\tn\tfp\tiv\tpg",
+                      f"{len(media) if tb is None else tb}\t1\t1\t\t\t{'0' * 32}", "",
+                      "perm", "0\t1", "p\tn\ts\tpr\tnta\tnti", "0\t0", "1\t\t\t10\t\t", "",
+                      "srce", "0\t1", "p\tn\tid\tev\ttb\tlo\tpo\tah\tsh\tgu\tpgu\taq", "0\t0",
+                      "\t\t\t\t\t-1\t-1\t\t\t\t\t", "",
+                      "sub", "0\t1", "p\tn\tid\tnu\tco\tgu", "0\t0", "\t\t\t\t1 \t", "",
+                      "entry", f"{len(rows) // 2}\t1", "\t".join(L01_COLUMNS)]
+                     + rows + ["", ""])
+    if text_tamper:
+        text = text_tamper(text)
+    body = text.encode("utf-16-le", "surrogatepass")
+    head = bytearray(struct.pack("<16sQI20s", hashlib.md5(body).digest(), len(body), 0,
+                                 b"\x00" * 20))
+    struct.pack_into("<I", head, 24, zlib.adler32(bytes(head)) & 0xFFFFFFFF)
+    ltree = bytes(head) + body
+    if ltree_tamper:
+        ltree = ltree_tamper(ltree)
+
+    chunks = [media[i:i + chunk_size] for i in range(0, len(media), chunk_size)] or [b""]
+    per_segment = chunks_per_segment or len(chunks)
+    groups = [chunks[i:i + per_segment] for i in range(0, len(chunks), per_segment)]
+    volume = bytearray(1052)
+    volume[0] = 0x0E
+    struct.pack_into("<III", volume, 4, 0, chunk_size // 512, 512)
+    struct.pack_into("<Q", volume, 16, 524160)           # not the content's size
+    volume[52] = 0x02
+    paths = []
+    for index, group in enumerate(groups):
+        path = os.path.join(folder, f"{stem}.L{index + 1:02d}")
+        paths.append(path)
+        with open(path, "wb") as out:
+            out.write(struct.pack("<8sBHH", ewfprobe.LVF_SIGNATURE, 1, index + 1, 0))
+            if index == 0:
+                _section(out, "header2", _header2())
+                _section(out, "header", zlib.compress(b"1\nmain\nc\n\n"))
+                _section(out, "volume", bytes(volume))
+            blob, entries = _pack_chunks(group, True)
+            base = out.tell() + ewfprobe.SECTION_SIZE
+            _section(out, "sectors", blob)
+            _section(out, "table", _table_payload(entries, base))
+            _section(out, "table2", _table_payload(entries, base))
+            if index == len(groups) - 1:
+                _section(out, "ltypes", b"\x00" * 6)
+                if not drop_ltree:
+                    _section(out, "ltree", ltree)
+                _section(out, "data", bytes(volume))
+                _section(out, "done", b"", last=True)
+            else:
+                _section(out, "next", b"", last=True)
+    return paths, media
+
+
+def l01_sample_tree():
+    rnd = random.Random(5)
+    noisy = bytes(rnd.randrange(256) for _ in range(2500))     # spans chunks, stored
+    return [
+        l01_node("Phone Information", children=[
+            l01_node("Device", b"iPhone 4S\n" * 30, md5=True)]),
+        l01_node("Raw Data", children=[
+            l01_node("record.plist", b"\x02\x00record of the file below", folder=True,
+                     children=[l01_node("record.plist", b"bplist00" + b"A" * 90, md5=True),
+                               l01_node("Parsed", children=[l01_node("Key", b"value")])]),
+            l01_node("noise.bin", noisy, md5=True),
+            l01_node("empty folder")]),
+    ]
+
+
+def test_an_l01_reads_back_every_entry_and_its_media_data(tmp_path):
+    tree = l01_sample_tree()
+    paths, media = write_l01(str(tmp_path), "ev", tree)
+    with ewfprobe.open_ewf(paths[0]) as img:
+        assert img.format == ewfprobe.FORMAT_L01 and img.media_type == "logical"
+        assert img.media_size == len(media)           # rec tb, not the volume's count
+        img.seek(0)
+        assert img.read() == media
+        got = {e.path: e for e in img.logical_entries}
+        assert list(got) == [
+            "Phone Information", "Phone Information/Device", "Raw Data",
+            "Raw Data/record.plist", "Raw Data/record.plist/record.plist",
+            "Raw Data/record.plist/Parsed", "Raw Data/record.plist/Parsed/Key",
+            "Raw Data/noise.bin", "Raw Data/empty folder"]
+        assert img.logical_root.name == "LogicalEntries"
+        assert img.read_entry(got["Phone Information/Device"]) == b"iPhone 4S\n" * 30
+        noisy = got["Raw Data/noise.bin"]
+        assert img.read_entry(noisy) == tree[1]["children"][1]["data"]
+        record = got["Raw Data/record.plist"]
+        assert record.is_folder and record.size == 26 and len(record.children) == 2
+        assert img.read_entry(record) == b"\x02\x00record of the file below"
+        assert img.read_entry(got["Raw Data/empty folder"]) == b""
+        assert got["Phone Information"].is_folder and not noisy.is_folder
+        assert noisy.md5 == hashlib.md5(img.read_entry(noisy)).hexdigest()
+        result = img.verify()
+    assert result["entry_md5_checked"] == 3 and result["entry_md5_mismatched"] == []
+    assert result["checksum_errors"] == [] and result["match"] is None
+
+
+def test_an_l01_entry_reads_as_a_seekable_file(tmp_path):
+    tree = l01_sample_tree()
+    paths, _media = write_l01(str(tmp_path), "ev", tree, chunk_size=512)
+    data = tree[1]["children"][1]["data"]
+    with ewfprobe.open_ewf(paths[0]) as img:
+        with img.open_entry(img.find_entry("/Raw Data/noise.bin/")) as fh:
+            fh.seek(1000)
+            assert fh.read(700) == data[1000:1700]     # across chunk boundaries
+            fh.seek(-10, os.SEEK_END)
+            assert fh.read() == data[-10:] and fh.tell() == len(data)
+        with pytest.raises(ewfprobe.EwfFormatError, match="no L01 entry"):
+            img.find_entry("Raw Data/absent")
+
+
+def test_an_l01_sparse_entry_reads_its_duplicate_data_offset_as_decimal(tmp_path):
+    """In the five real L01s the one sparse entry each stores a single byte, and its
+    duplicate data offset (du) read as decimal gives content matching its stored MD5;
+    read as hexadecimal it does not."""
+    copy = bytes(range(256)) * 4
+    decoy = b"\xee" * 2000
+    tree = [l01_node("first", b"\x00" * 7), l01_node("pad", decoy),
+            l01_node("orig", copy), l01_node("pad2", decoy)]
+    os.makedirs(tmp_path / "a")
+    _paths, media = write_l01(str(tmp_path / "a"), "ev", tree)
+    offset = media.index(copy)
+    assert offset < 0x1000 and int(str(offset), 16) != offset
+    tree.append(l01_node("sparse", b"Z", folder=False, md5=False, ls=str(len(copy)),
+                         du=str(offset), opr=str(0x04400000)))
+    os.makedirs(tmp_path / "b")
+    paths, _ = write_l01(str(tmp_path / "b"), "ev", tree)
+    with ewfprobe.open_ewf(paths[0]) as img:
+        assert img.read_entry(img.find_entry("sparse")) == copy
+
+
+def test_an_l01_sparse_entry_without_a_duplicate_offset_repeats_its_byte(tmp_path):
+    tree = [l01_node("zeros", b"\x00", folder=False, ls="4096", opr=str(0x04000000))]
+    paths, _ = write_l01(str(tmp_path), "ev", tree)
+    with ewfprobe.open_ewf(paths[0]) as img:
+        entry = img.find_entry("zeros")
+        assert entry.size == 4096 and img.read_entry(entry) == b"\x00" * 4096
+        with img.open_entry(entry) as fh:
+            fh.seek(4000)
+            assert fh.read() == b"\x00" * 96
+
+
+@pytest.mark.parametrize("values,words", [
+    ({"du": "3"}, "duplicate data offset without the sparse flag"),
+    ({"be": "1 S 1 4"}, "type 'S'"),
+    ({"ls": "99"}, "its extents hold 5 of its 99 bytes"),
+    ({"be": "1 fffff 5"}, "past the media data"),
+])
+def test_l01_entry_values_that_cannot_be_read_as_stated_are_refused(tmp_path, values, words):
+    paths, _ = write_l01(str(tmp_path), "ev", [l01_node("f", b"hello", **values)])
+    with ewfprobe.open_ewf(paths[0]) as img:
+        with pytest.raises(ewfprobe.EwfFormatError, match=words):
+            img.open_entry(img.find_entry("f"))            # refused before any read
+
+
+@pytest.mark.parametrize("tamper,words", [
+    (lambda lt: lt[:60] + bytes([lt[60] ^ 1]) + lt[61:], "MD5"),
+    (lambda lt: lt[:40] + b"\x01" + lt[41:], "checksum"),
+    (lambda lt: lt[:-10], "holds"),
+])
+def test_a_damaged_l01_ltree_is_refused(tmp_path, tamper, words):
+    paths, _ = write_l01(str(tmp_path), "ev", l01_sample_tree(), ltree_tamper=tamper)
+    with pytest.raises(ewfprobe.EwfFormatError, match=words):
+        ewfprobe.open_ewf(paths[0])
+
+
+def test_an_l01_ltree_whose_entry_list_is_cut_short_is_refused(tmp_path):
+    cut = lambda text: text[:text.index("Parsed") - 200]           # noqa: E731
+    paths, _ = write_l01(str(tmp_path), "ev", l01_sample_tree(), text_tamper=cut)
+    with pytest.raises(ewfprobe.EwfFormatError, match="cut short"):
+        ewfprobe.open_ewf(paths[0])
+
+
+def test_an_l01_without_its_ltree_or_its_total_size_is_refused(tmp_path):
+    os.makedirs(tmp_path / "a")
+    paths, _ = write_l01(str(tmp_path / "a"), "ev", l01_sample_tree(), drop_ltree=True)
+    with pytest.raises(ewfprobe.EwfFormatError, match="no ltree"):
+        ewfprobe.open_ewf(paths[0])
+    os.makedirs(tmp_path / "b")
+    paths, _ = write_l01(str(tmp_path / "b"), "ev", l01_sample_tree(), tb="")
+    with pytest.raises(ewfprobe.EwfFormatError, match="total size"):
+        ewfprobe.open_ewf(paths[0])
+
+
+def test_an_l01_ltree_without_an_entry_category_is_refused(tmp_path):
+    drop = lambda text: text[:text.index("entry\n")]                # noqa: E731
+    paths, _ = write_l01(str(tmp_path), "ev", l01_sample_tree(), text_tamper=drop)
+    with pytest.raises(ewfprobe.EwfFormatError, match="no entry category"):
+        ewfprobe.open_ewf(paths[0])
+
+
+def test_an_l01_entry_reads_its_size_even_when_its_extent_runs_longer(tmp_path):
+    """The run is cut to the entry's size, so an extent whose unused tail would lie
+    past the media data does not make the entry unreadable."""
+    _probe, media = write_l01(str(tmp_path), "probe", [l01_node("f", b"tail!")])
+    end = len(media) - 5                        # where f's five bytes start
+    paths, _ = write_l01(str(tmp_path), "ev", [l01_node("f", b"tail!",
+                                                        be=f"1 {end:x} 40")])
+    with ewfprobe.open_ewf(paths[0]) as img:
+        assert img.read_entry(img.find_entry("f")) == b"tail!"
+
+
+def test_an_l01_set_split_across_segments_opens_from_its_l01(tmp_path):
+    tree = l01_sample_tree()
+    paths, media = write_l01(str(tmp_path), "ev", tree, chunks_per_segment=1)
+    assert [os.path.basename(p) for p in paths[:3]] == ["ev.L01", "ev.L02", "ev.L03"]
+    with ewfprobe.open_ewf(paths[0]) as img:
+        assert len(img.paths) == len(paths)
+        img.seek(0)
+        assert img.read() == media
+        assert img.verify()["entry_md5_mismatched"] == []
+    os.remove(paths[-1])
+    with pytest.raises(ewfprobe.EwfIncompleteSetError):
+        ewfprobe.open_ewf(paths[0])
+
+
+def test_l01_names_keep_separators_and_unpaired_surrogates(tmp_path, capsys):
+    tree = [l01_node("a/b\\c", b"x"), l01_node("odd\ud800name", b"y")]
+    paths, _ = write_l01(str(tmp_path), "ev", tree)
+    with ewfprobe.open_ewf(paths[0]) as img:
+        names = [e.names for e in img.logical_entries]
+    assert names == [("a/b\\c",), ("odd\ud800name",)]
+    assert ewfprobe.main(["files", paths[0]]) == 0
+    assert "odd\\ud800name" in capsys.readouterr().out
+
+
+def test_l01_times_and_hashes_are_read_as_stored(tmp_path):
+    tree = [l01_node("f", b"data", cr="1342200000", wr="1342200123", ac="",
+                     sha="AB" * 20, ha="0" * 32)]
+    paths, _ = write_l01(str(tmp_path), "ev", tree)
+    with ewfprobe.open_ewf(paths[0]) as img:
+        entry = img.find_entry("f")
+    assert entry.times == {"cr": 1342200000, "wr": 1342200123}
+    assert entry.md5 is None and entry.sha1 == "ab" * 20
+    assert entry.values["cr"] == "1342200000"
+
+
+def test_l01_detection_and_its_commands(tmp_path, capsys):
+    tree = l01_sample_tree()
+    paths, _ = write_l01(str(tmp_path), "ev", tree)
+    assert ewfprobe.is_logical_evidence(paths[0]) is True
+    assert ewfprobe.is_image(paths[0]) is False and ewfprobe.is_ewf(paths[0]) is False
+    assert ewfprobe.main(["info", paths[0]]) == 0
+    out = capsys.readouterr().out
+    assert "EWF-L01" in out and "entries         9, 3 with a stored MD5" in out
+    assert ewfprobe.main(["files", paths[0]]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "kind\tsize\tmd5\tpath"
+    assert "folder\t26\t-\tRaw Data/record.plist" in lines
+    target = tmp_path / "device.out"
+    assert ewfprobe.main(["export", paths[0], "--entry", "Phone Information/Device",
+                          "-o", str(target)]) == 0
+    assert target.read_bytes() == b"iPhone 4S\n" * 30
+    assert ewfprobe.main(["verify", "-q", paths[0]]) == 0
+    assert "3 checked, all match" in capsys.readouterr().out
+
+
+def test_an_l01_entry_whose_content_disagrees_with_its_md5_fails_verify(tmp_path, capsys):
+    tree = [l01_node("f", b"data", ha=hashlib.md5(b"other").hexdigest())]
+    paths, _ = write_l01(str(tmp_path), "ev", tree)
+    with ewfprobe.open_ewf(paths[0]) as img:
+        assert img.verify()["entry_md5_mismatched"] == ["f"]
+    assert ewfprobe.main(["verify", "-q", paths[0]]) == 1
+    assert "1 DO NOT MATCH" in capsys.readouterr().out
+
+
+def test_files_piped_into_a_reader_that_stops_early_exits_quietly(tmp_path):
+    import subprocess
+    tree = [l01_node(f"f{k:05d}", b"x") for k in range(12000)]   # past a pipe buffer
+    paths, _ = write_l01(str(tmp_path), "ev", tree)
+    script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "ewfprobe.py")
+    proc = subprocess.Popen([sys.executable, script, "files", paths[0]],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout.readline().rstrip(b"\r\n") == b"kind\tsize\tmd5\tpath"
+    proc.stdout.close()                                   # as head does after its lines
+    err = proc.stderr.read()
+    proc.wait(timeout=30)
+    assert b"Traceback" not in err and b"BrokenPipe" not in err, err
+
+
+def test_an_oserror_naming_a_file_is_not_taken_for_a_closed_pipe(monkeypatch):
+    """Windows reports a closed pipe as EINVAL with no file name; an EINVAL from a bad
+    path carries the path and must still surface."""
+    import errno
+
+    def refuse(_args):
+        raise OSError(errno.EINVAL, "Invalid argument", "C:\\bad:name")
+    monkeypatch.setattr(ewfprobe, "_cmd_info", refuse)
+    monkeypatch.setattr(ewfprobe.os, "name", "nt")
+    with pytest.raises(OSError, match="bad:name"):
+        ewfprobe.main(["info", "x.E01"])
+
+
+def test_the_files_listing_is_utf8_even_where_the_platform_default_is_not(tmp_path):
+    """On Windows a pipe or a file gets the ANSI code page by default, which cannot
+    hold a name such as this one."""
+    import subprocess
+    paths, _ = write_l01(str(tmp_path), "ev", [l01_node("相片 \u00b7 photo.jpg", b"x")])
+    script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "ewfprobe.py")
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("PYTHONUTF8", "PYTHONIOENCODING")}
+    proc = subprocess.run([sys.executable, script, "files", paths[0]],
+                          capture_output=True, env=env, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert "相片 \u00b7 photo.jpg" in proc.stdout.decode("utf-8")
+
+
+def test_a_disk_image_has_no_entries(tmp_path, capsys):
+    write_ewf(str(tmp_path), "img", sample_bytes())
+    with ewfprobe.open_ewf(str(tmp_path / "img.E01")) as img:
+        assert img.logical_entries == []
+        with pytest.raises(ewfprobe.EwfFormatError, match="only an L01"):
+            img.open_entry(None)
+    assert ewfprobe.main(["files", str(tmp_path / "img.E01")]) == 2

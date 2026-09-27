@@ -4,14 +4,17 @@
 
 <source folder> is a checkout holding ewfprobe.py and tests/fixtures (the build workflow
 checks out the tag being released there). The fixtures were written by libewf's ewfacquire,
-affconvert or FTK Imager, not by ewfprobe. For each one (EnCase 5 and 6, SMART, Ex01 and
+affconvert, FTK Imager or EnCase, not by ewfprobe. For each one (EnCase 5 and 6, SMART, Ex01 and
 AFF, single files, multi-segment sets and AFD directories) `info`, `verify` and a full
 `export` are run once through `python ewfprobe.py` and once through the executable. Their
 output must be byte-identical, verify must report the stored hashes as matching (or, for an
 image that stores none, say so), and the export must hash to the source disk the manifest
 records. A byte range exported to stdout must equal the manifest's media item at that
-offset, and a split set with a segment missing must be refused the same way by both. The
-executable's --version must name the source's __version__.
+offset, and a split set with a segment missing must be refused the same way by both. For
+each L01 under "logical" in the manifest, `info`, `verify`, `files`, a full `export` and an
+`export --entry` of its sparse entry must also be byte-identical between the two, the
+exports must hash to the manifest's known answers, and verify must report every stored
+entry MD5 as matching. The executable's --version must name the source's __version__.
 """
 
 from __future__ import annotations
@@ -91,7 +94,32 @@ def main(argv: list[str]) -> int:
         checks += 1
         print("a set missing a segment is refused by both:", b.stderr.decode().strip())
 
-    assert checks == len(manifest["variants"]) + 2, checks
+        for name, known in sorted(manifest.get("logical", {}).items()):
+            image = str(fixtures / known["files"][0])
+            entry = known["sparse_entry"]
+            out = {}
+            for who, cmd in (("py", py), ("exe", exe)):
+                media = work / f"{name}-{who}.media"
+                sparse = work / f"{name}-{who}.entry"
+                out[who] = (run(cmd + ["info", image], work).stdout,
+                            run(cmd + ["verify", "-q", image], work).stdout,
+                            run(cmd + ["files", image], work).stdout,
+                            run(cmd + ["export", "-q", image, "-o", str(media)], work).stdout,
+                            run(cmd + ["export", image, "--entry", entry["path"],
+                                       "-o", str(sparse)], work).stdout,
+                            media.read_bytes(), sparse.read_bytes())
+            assert out["py"] == out["exe"], f"{name}: the executable's output differs"
+            verify = out["exe"][1].decode()
+            assert f"{known['entry_md5s']:,} checked, all match" in verify, verify
+            assert hashlib.sha256(out["exe"][5]).hexdigest() == known["media_sha256"], name
+            assert hashlib.sha256(out["exe"][6]).hexdigest() == entry["sha256"], name
+            listed = out["exe"][2].decode("utf-8").splitlines()
+            assert len(listed) == known["entries"] + 1, (name, len(listed))
+            checks += 1
+            print(f"{name}: info, verify, files and exports identical; the media data and its "
+                  f"sparse entry match libewf's export, {known['entry_md5s']} entry MD5s match")
+
+    assert checks == len(manifest["variants"]) + len(manifest.get("logical", {})) + 2, checks
     print(f"{checks} checks: the executable wrote the same bytes as the source")
     return 0
 
