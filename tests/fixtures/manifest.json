@@ -371,5 +371,107 @@
         "hdiutil_segment_size": "100m"
       }
     }
+  },
+  "encrypted_dmg": {
+    "writer": "hdiutil, macOS 26.6.2",
+    "disks": {
+      "small": {
+        "sha256": "2d0eae247eef9f48fa16666ee549724f54ef6538933b0eb2828cc6d3e95a8a17",
+        "size": 196608
+      },
+      "banded": {
+        "sha256": "34da288883b19cd673922b2674d8a25faf1d07e7dbd4335240718c1c7044ea3a",
+        "size": 2129920
+      }
+    },
+    "variants": {
+      "dmg-enc-udzo-aes128": {
+        "format": "udif",
+        "hdiutil_format": "UDZO",
+        "encryption": "AES-128",
+        "password": "ewfprobe-test-password",
+        "disk": "small",
+        "checked_by": "hdiutil attach -stdinpass, /dev/rdisk read back",
+        "files": [
+          "dmg-enc-udzo-aes128.dmg"
+        ]
+      },
+      "dmg-enc-udzo-aes256": {
+        "format": "udif",
+        "hdiutil_format": "UDZO",
+        "encryption": "AES-256",
+        "password": "ewfprobe-test-password",
+        "disk": "small",
+        "checked_by": "hdiutil attach -stdinpass, /dev/rdisk read back",
+        "files": [
+          "dmg-enc-udzo-aes256.dmg"
+        ]
+      },
+      "dmg-enc-udrw-aes256": {
+        "format": "udrw",
+        "hdiutil_format": "UDRW",
+        "encryption": "AES-256",
+        "password": "ewfprobe-test-password",
+        "disk": "small",
+        "checked_by": "hdiutil attach -stdinpass, /dev/rdisk read back",
+        "files": [
+          "dmg-enc-udrw-aes256.dmg"
+        ]
+      },
+      "dmg-enc-sparse-aes128": {
+        "format": "sparseimage",
+        "hdiutil_format": "UDSP",
+        "encryption": "AES-128",
+        "password": "ewfprobe-test-password",
+        "disk": "small",
+        "checked_by": "hdiutil attach -stdinpass, /dev/rdisk read back",
+        "files": [
+          "dmg-enc-sparse-aes128.sparseimage"
+        ]
+      },
+      "dmg-enc-segmented-aes128": {
+        "format": "udif",
+        "hdiutil_format": "UDZO",
+        "encryption": "AES-128",
+        "password": "ewfprobe-test-password",
+        "disk": "small",
+        "checked_by": "hdiutil attach -stdinpass, /dev/rdisk read back",
+        "files": [
+          "dmg-enc-segmented-aes128.dmg",
+          "dmg-enc-segmented-aes128.002.dmgpart",
+          "dmg-enc-segmented-aes128.003.dmgpart"
+        ],
+        "hdiutil_segment_size": "20k"
+      },
+      "dmg-enc-udzo-non-ascii": {
+        "format": "udif",
+        "hdiutil_format": "UDZO",
+        "encryption": "AES-128",
+        "password": "p\u00e4ssw\u00f6rd-\u00fc",
+        "disk": "small",
+        "checked_by": "hdiutil attach -stdinpass, /dev/rdisk read back",
+        "files": [
+          "dmg-enc-udzo-non-ascii.dmg"
+        ]
+      },
+      "dmg-enc-sparsebundle-aes256": {
+        "format": "sparsebundle",
+        "hdiutil_format": "UDSB",
+        "encryption": "AES-256",
+        "password": "ewfprobe-test-password",
+        "disk": "banded",
+        "trimmed": "band file 0 (all zeros) removed and band file 1 cut to 32 KiB after writing; hdiutil attach reads the same disk",
+        "checked_by": "hdiutil attach -stdinpass, /dev/rdisk read back",
+        "files": [
+          "dmg-enc-sparsebundle-aes256.sparsebundle/Info.bckup",
+          "dmg-enc-sparsebundle-aes256.sparsebundle/Info.plist",
+          "dmg-enc-sparsebundle-aes256.sparsebundle/bands/1",
+          "dmg-enc-sparsebundle-aes256.sparsebundle/bands/2",
+          "dmg-enc-sparsebundle-aes256.sparsebundle/lock",
+          "dmg-enc-sparsebundle-aes256.sparsebundle/token"
+        ],
+        "image": "dmg-enc-sparsebundle-aes256.sparsebundle"
+      }
+    }
   }
 }

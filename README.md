@@ -2,7 +2,8 @@
 
 A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`) and AFF (`.aff`, `.afd`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.sparsebundle`), and EnCase logical evidence (`.L01`). One file, pure
 Python, standard library only. No compiler, no network, nothing to install (an
-LZFSE-compressed `.dmg` alone needs the optional `pyliblzfse` package).
+LZFSE-compressed `.dmg` needs the optional `pyliblzfse` package, and an encrypted Apple
+disk image the optional `pycryptodome` package).
 
 It opens an acquisition, joins its segments, and presents the acquired disk as
 an ordinary seekable file object, so anything that can read a raw image can read
@@ -42,10 +43,16 @@ ewfprobe export  evidence.E01 -o - --offset 1048576 --length 65536
 ewfprobe verify  acquisition.dmg  # also checks the checksums a .dmg records
 ewfprobe files   evidence.L01     # an L01's entries: kind, size, stored MD5, path
 ewfprobe export  evidence.L01 --entry "Folder/photo.jpg" -o photo.jpg
+ewfprobe info    --password-file pw.txt encrypted.dmg
 ```
 
 `verify` exits non-zero when the recomputed hash does not match the one the
 acquisition recorded.
+
+An encrypted Apple disk image needs its password. `--password-file FILE` reads it
+from the first line of a file and `--password-env NAME` from an environment
+variable; without either, ewfprobe asks for it at a terminal. It is never taken as
+an argument's value, which would put it in the process list and the shell history.
 
 ## What it reads
 
@@ -205,6 +212,33 @@ the same, and `info` lists any such files and anything else in `bands/`. A spars
 bundle records no checksum, so `verify` prints the disk's hashes with nothing to
 compare.
 
+Reads Apple disk images encrypted with a password (`hdiutil -encryption`, AES-128 or
+AES-256): a `.dmg` of any format above, a segmented one, a sparse image, a sparse
+bundle, and an encrypted read-write image, which decrypts to the disk itself and is
+reported as format `UDRW`, the name `hdiutil imageinfo` gives it. This needs the
+optional `pycryptodome` package (or `pycryptodomex`); without it the image is refused,
+naming the package. From Python, `open_ewf(path, password=...)` takes the password as
+a string or as bytes, and raises `EwfPasswordRequiredError` without one and
+`EwfWrongPasswordError` when it does not open the image; both are `EwfPasswordError`
+and `EwfFormatError`. The password is used while the image is opened and not kept;
+the keys it unwraps stay in memory while the image is open, since every read needs
+them. `info` names the cipher, how the keys are wrapped and the PBKDF2 rounds.
+
+The container (`encrcdsa`, version 2) is read from the layout two published readers
+describe, credited below: a header at the start of the file, key items, and the data
+in 512-byte blocks, each decrypted with AES-CBC under an IV made from the block's
+number with HMAC-SHA1. Measured on images `hdiutil` wrote on macOS 26.6.2, where those
+readers differ or say nothing: the keys are wrapped with AES-192, the stored 8-byte IV
+padded with zeros, where both readers expect 3DES, so ewfprobe reads both (the 3DES
+wrap only on files the test suite writes); each band of an encrypted sparse bundle is
+encrypted on its own from its first byte, its block numbers starting again at zero,
+and the bundle's `token` file holds only the header; each file of an encrypted
+segmented image is a container of its own; and a password is used as its UTF-8 bytes
+with no Unicode normalisation, as `hdiutil attach` refused the NFD spelling of a
+password set in NFC. What decrypts is a UDIF image, a sparse image, or the disk. On
+the Mac they were measured on, 512 MiB images read at about 100 MiB/s (UDRW) and
+140 MiB/s (UDZO).
+
 A sparse image longer than about a gigabyte of written bands carries more than one
 header. Measured on images `hdiutil` wrote, beyond what the format documentation
 covers: the first header holds 1,008 band slots, and once they are used it names a
@@ -217,7 +251,8 @@ slots from offset 56 and names the next one at offset 12. The disk's sector coun
 disk images ewfprobe reads (EWF, EWF2, AFF, an AFD directory, UDIF, sparse images and
 sparse bundle folders), `is_logical_evidence()` for an L01, `is_ewf()` for EWF alone,
 and `apple_image_kind()` names an Apple disk image as `UDIF`, `SPARSEIMAGE`,
-`SPARSEBUNDLE` or `ENCRYPTED`.
+`SPARSEBUNDLE` or `ENCRYPTED` (any encrypted one, which `is_image()` leaves out
+because it opens only with its password).
 
 Refused with a message naming the reason rather than read wrongly:
 
@@ -239,8 +274,11 @@ Refused with a message naming the reason rather than read wrongly:
   a hash, the page size, the sector size or the bad-sector marker.
 - **AFM**, AFF metadata kept beside the image as split raw files (`.000`, `.001`
   and on).
-- **An encrypted Apple disk image** (`encrcdsa`), and **an encrypted sparse bundle**
-  (its `token` file holds the same header): they need their password.
+- **An encrypted Apple disk image opened with a certificate or a keybag** rather than
+  a password, and **one in the older version 1 format** (`cdsaencr`, with its header at
+  the end of the file), which is recognised in order to be refused. No sample of either
+  has been available. So is **a header that asks for more than 50 million PBKDF2
+  rounds**; the images measured used 344,827 to 588,235.
 - **An older `.dmg` whose block tables are only in a resource fork**, **a sparse image
   of a version other than 3**, and **a sparse bundle of a backing-store version other
   than 1**.
@@ -368,6 +406,22 @@ records, 512 sampled windows across the disk matched its raw device the same way
 a walk of its APFS container through qnxprobe listed the same paths and file sizes as
 macOS's own read-only mount of the image.
 
+**Encrypted Apple disk images, against `hdiutil attach`.** Eighteen encrypted images
+`hdiutil` wrote on macOS 26.6.2, AES-128 and AES-256, some made by `hdiutil create` and
+some by `hdiutil convert`, as UDZO (two of them segmented into two files each), ULFO,
+UDRW, sparse images and sparse bundles, read byte for byte the same as the same image
+attached with its password (`hdiutil attach -readonly -nomount -stdinpass`) and read
+from its raw device, and so did 512 MiB UDRW and UDZO images of random and zero
+stretches, whose decrypted disk also matched the file they were made from. The seven
+committed encrypted fixtures are each kept by `tools/make_fixtures.py` only after
+`hdiutil attach` gives back the disk they were made from. One uses a password outside
+ASCII. In the sparse bundle, after `hdiutil` wrote it, its all-zero first band file was
+removed and its second cut after its data, which `hdiutil` reads as zeros as it does
+for the bands it never writes; `hdiutil attach` read the same disk. The 3DES key wrap,
+an image opened with a certificate or a keybag, the version 1 container and damaged
+files are tested on files the test suite writes from the published layout, with the
+cipher library's own CBC mode rather than ewfprobe's.
+
 **Segmented images and sparse bundles, against `hdiutil attach`.** 36 images `hdiutil`
 wrote from HFS+ and APFS test disks read byte for byte the same as the same image
 attached read-only and read from its raw device: each of UDZO, UDBZ, ULMO, ULFO, UDCO
@@ -393,7 +447,10 @@ in `tests/fixtures`. It requires `info`, `verify` and `export` to write the same
 segment to be refused, before it is packaged with `SHA256SUMS.txt` and a README. On the
 L01 it also requires `files` and `export --entry` to match, and the exports to match the
 known answers taken from libewf. The executables do not include `pyliblzfse`, so they
-refuse an LZFSE-compressed `.dmg`, naming the package, and the workflow checks that. The
+refuse an LZFSE-compressed `.dmg`, naming the package, and the workflow checks that. They
+do include `pycryptodome`, and on every encrypted fixture the workflow requires the
+executable's output to match the source's, the export to match the disk `hdiutil`
+read back, and a wrong password to be refused the same way. The
 executables are not code signed; the README inside each archive says what Windows
 SmartScreen and macOS Gatekeeper will ask.
 
@@ -421,9 +478,13 @@ EWFACQUIRE=/path/to/ewfacquire python tools/make_fixtures.py tests/fixtures --ad
 The Apple disk image variants (`dmg-*`) are written by `hdiutil`, so on macOS only.
 `--add dmg-gpt` rebuilds the segmented images of a small GPT disk, which carry the
 block-table base offsets the unpartitioned source cannot.
-The LZFSE one is skipped where `pyliblzfse` is not installed; set
+`--add dmg-encrypted` rebuilds the encrypted images, attaching each with `hdiutil`
+before keeping it. The LZFSE one is skipped where `pyliblzfse` is not installed; set
 `EWFPROBE_REQUIRE_LZFSE=1` to make that a failure instead, as the CI jobs that
-install it do.
+install it do. The encrypted ones are skipped where neither `pycryptodome` nor
+`pycryptodomex` is installed; `EWFPROBE_REQUIRE_CRYPTO=1` makes that a failure. CI runs
+most jobs with `pycryptodome`, one with `pycryptodomex`, and one with neither, where
+the refusal that names the package is what runs.
 
 That tool shells out to `ewfacquire`, `affconvert` and `hdiutil` and is for development only.
 libewf and AFFLIB are used there solely to produce test data. Nothing from them
@@ -469,6 +530,17 @@ The sparse bundle layout follows the same libmodi documentation. The checksum ru
 the sparse image's continuation headers and 64-bit sector count, the layout of a
 segmented image, and how `hdiutil attach` treats short, long and extra band files were
 measured on images `hdiutil` wrote, as described above. No libmodi code is copied.
+
+For encrypted Apple disk images: the `encrcdsa` layout and its key unwrapping in
+nlitsme/encrypteddmg, `readencrcdsa.py` (`PassphraseWrappedKey` and `EncrCdsaFile`,
+[lines 125 to 198](https://github.com/nlitsme/encrypteddmg/blob/626dac30710140ac488ea199cd14b5c450f2760b/readencrcdsa.py#L125-L198)
+and [283 to 417](https://github.com/nlitsme/encrypteddmg/blob/626dac30710140ac488ea199cd14b5c450f2760b/readencrcdsa.py#L283-L417)
+at `626dac3`, where
+[lines 465 to 472](https://github.com/nlitsme/encrypteddmg/blob/626dac30710140ac488ea199cd14b5c450f2760b/readencrcdsa.py#L465-L472)
+also give the version 1 signature), and kev365/xways-imageio-dmg, `encrypted_source.cpp`
+([lines 30 to 98](https://github.com/kev365/xways-imageio-dmg/blob/406e738d1a43dfcb9d8f421d33a31d43078fb4b5/encrypted_source.cpp#L30-L98)
+at `406e738`), both MIT. No code from either is copied. What current macOS writes
+differently was measured, as described above.
 
 ## License
 

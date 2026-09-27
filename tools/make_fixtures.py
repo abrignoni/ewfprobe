@@ -30,6 +30,12 @@ The manifest's ``gpt_dmg`` section describes images hdiutil segment wrote from
 a small GPT disk of their own (``--add dmg-gpt`` rebuilds them); its known answer
 is that disk's SHA-256.
 
+The manifest's ``encrypted_dmg`` section describes encrypted images hdiutil
+wrote from a small disk of their own, with the test password it records (``--add
+dmg-encrypted`` rebuilds them). Each one is attached by hdiutil with that password
+and its /dev/rdisk read back before it is kept, so its known answer, the disk's
+SHA-256, is macOS's own reading and not ewfprobe's.
+
 The manifest's ``logical`` section describes an L01 EnCase wrote, copied from
 Digital Corpora with known answers taken from libewf's ewfexport. It has its own
 source rather than this tool's, so both modes keep that section as it is.
@@ -90,6 +96,29 @@ GPT_DMG_VARIANTS = [
     ("dmg-gpt-segment-one", "100m"),     # hdiutil segment, still one file
 ]
 _DMG_SUFFIX = {"UDSP": ".sparseimage", "UDSB": ".sparsebundle"}
+
+# Encrypted images (hdiutil -encryption). Most come from a 192 KiB disk: data, a
+# stretch of zeros, then data. hdiutil takes no sparse bundle band under 1 MiB and
+# writes every band in full, so the sparse bundle comes from a disk of three 1 MiB
+# bands (zeros; data then zeros; a short last band of data), and after writing it
+# its first band file, all zeros, is removed and its second cut after the data:
+# hdiutil reads a band with no file, and a band file's missing end, as zeros, as it
+# leaves unwritten bands of the images it creates. Every image is attached by
+# hdiutil afterwards and must give back its disk. One image uses a password outside
+# ASCII, which hdiutil uses as the UTF-8 bytes given, with no normalisation.
+ENC_PASSWORD = "ewfprobe-test-password"
+ENC_PASSWORD_NON_ASCII = "p\u00e4ssw\u00f6rd-\u00fc"   # NFC
+ENC_DMG_VARIANTS = [
+    # name,                         hdiutil format, encryption, password,  disk
+    ("dmg-enc-udzo-aes128",         "UDZO",        "AES-128", ENC_PASSWORD, "small"),
+    ("dmg-enc-udzo-aes256",         "UDZO",        "AES-256", ENC_PASSWORD, "small"),
+    ("dmg-enc-udrw-aes256",         "UDRW",        "AES-256", ENC_PASSWORD, "small"),
+    ("dmg-enc-sparse-aes128",       "UDSP",        "AES-128", ENC_PASSWORD, "small"),
+    ("dmg-enc-segmented-aes128",    "UDZO/20k",    "AES-128", ENC_PASSWORD, "small"),
+    ("dmg-enc-udzo-non-ascii",      "UDZO",        "AES-128", ENC_PASSWORD_NON_ASCII,
+     "small"),
+    ("dmg-enc-sparsebundle-aes256", "UDSB",        "AES-256", ENC_PASSWORD, "banded"),
+]
 
 # AFF variants, written by affconvert from AFFLIB. A 64 KiB page (the default is
 # 16 MiB) gives the 3 MiB source 48 pages, so zero pages, deflated pages, LZMA
@@ -356,6 +385,124 @@ def build_gpt_dmgs(out_dir):
     return section
 
 
+def _attached_disk(image, password):
+    """The bytes hdiutil gives for ``image`` attached read-only with ``password``,
+    read from /dev/rdisk: macOS's own reading of an encrypted image."""
+    import re                           # pylint: disable=import-outside-toplevel
+    out = subprocess.run([HDIUTIL, "attach", "-readonly", "-nomount", "-noverify",
+                          "-stdinpass", image], input=password, capture_output=True,
+                         text=True, timeout=120, check=False)
+    if out.returncode:
+        raise SystemExit(f"hdiutil could not attach {image}: {out.stderr.strip()}")
+    dev = re.search(r"^(/dev/disk\d+)\s", out.stdout, re.M).group(1)
+    try:
+        # a raw disk takes whole-sector reads only, so read it in large blocks
+        fd = os.open(dev.replace("/dev/disk", "/dev/rdisk"), os.O_RDONLY)
+        try:
+            pieces = []
+            while True:
+                piece = os.read(fd, 1 << 20)
+                if not piece:
+                    return b"".join(pieces)
+                pieces.append(piece)
+        finally:
+            os.close(fd)
+    finally:
+        subprocess.run([HDIUTIL, "detach", "-quiet", dev], timeout=60, check=False)
+
+
+def _encrypted_disks():
+    r = random.Random(20260927)
+    text = b"ewfprobe encrypted fixture, generated content. " * 2000
+    k64, mib = 64 << 10, 1 << 20
+    small = (r.randbytes(k64 // 2) + bytes(k64 // 2) + bytes(k64)
+             + r.randbytes(k64 // 4) + text[:k64 * 3 // 4])
+    banded = (bytes(mib) + r.randbytes(32 << 10) + bytes(mib - (32 << 10))
+              + r.randbytes(16 << 10) + text[:16 << 10])
+    return {"small": small, "banded": banded}
+
+
+def _trim_encrypted_bundle(bundle):
+    """Remove the first band file (its disk band is all zeros) and cut the second
+    after its data, in whole 512-byte encrypted blocks."""
+    bands = os.path.join(bundle, "bands")
+    os.remove(os.path.join(bands, "0"))
+    with open(os.path.join(bands, "1"), "r+b") as fh:
+        fh.truncate(32 << 10)
+
+
+def build_encrypted_dmgs(out_dir):
+    """The encrypted images and their disks, as the manifest section."""
+    work = os.path.join(out_dir, "enc-work")
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    disks = _encrypted_disks()
+    section = {"writer": hdiutil_version(), "disks": {}, "variants": {}}
+    try:
+        for label, disk in disks.items():
+            with open(os.path.join(work, label + ".img"), "wb") as fh:
+                fh.write(disk)
+            section["disks"][label] = {"sha256": hashlib.sha256(disk).hexdigest(),
+                                       "size": len(disk)}
+        for name, fmt, cipher, password, label in ENC_DMG_VARIANTS:
+            fmt, _slash, segment = fmt.partition("/")
+            target = name + _DMG_SUFFIX.get(fmt, ".dmg")
+            for stale in os.listdir(out_dir):
+                if stale == target or (stale.startswith(name + ".")
+                                       and stale.endswith(".dmgpart")):
+                    path = os.path.join(out_dir, stale)
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+            options = {"UDSB": ["-imagekey", "sparse-band-size=2048"],
+                       "UDSP": ["-imagekey", "sparse-band-size=128"]}.get(fmt, [])
+            if segment:
+                options += ["-segmentSize", segment]
+            result = subprocess.run(
+                [HDIUTIL, "convert", "-quiet", os.path.join(work, label + ".img"),
+                 "-format", fmt, *options, "-encryption", cipher, "-stdinpass", "-o",
+                 os.path.join(out_dir, name if segment else target)],
+                input=password, capture_output=True, text=True, timeout=300, check=False)
+            if result.returncode:
+                raise SystemExit(f"hdiutil failed for {name}:\n{result.stdout}"
+                                 f"{result.stderr}")
+            entry = {"format": {"UDSP": "sparseimage", "UDSB": "sparsebundle",
+                                "UDRW": "udrw"}.get(fmt, "udif"),
+                     "hdiutil_format": fmt, "encryption": cipher, "password": password,
+                     "disk": label}
+            if fmt == "UDSB":
+                _trim_encrypted_bundle(os.path.join(out_dir, target))
+                entry["trimmed"] = ("band file 0 (all zeros) removed and band file 1 "
+                                    "cut to 32 KiB after writing; hdiutil attach "
+                                    "reads the same disk")
+                base = os.path.join(out_dir, target)
+                made = sorted(os.path.relpath(os.path.join(d, f), out_dir)
+                              for d, _dirs, files in os.walk(base) for f in files)
+            else:
+                made = [target] + sorted(
+                    (f for f in os.listdir(out_dir)
+                     if f.startswith(name + ".") and f.endswith(".dmgpart")),
+                    key=lambda f: int(f.split(".")[-2]))
+            for f in made:
+                os.chmod(os.path.join(out_dir, f), 0o644)
+            attached = _attached_disk(os.path.join(out_dir, target), password)
+            if hashlib.sha256(attached).hexdigest() != section["disks"][label]["sha256"]:
+                raise SystemExit(f"{name}: hdiutil attach does not give back the disk")
+            entry["checked_by"] = "hdiutil attach -stdinpass, /dev/rdisk read back"
+            entry["files"] = [f.replace(os.sep, "/") for f in made]
+            if segment:
+                entry["hdiutil_segment_size"] = segment
+            if target != made[0]:
+                entry["image"] = target
+            section["variants"][name] = entry
+            size = sum(os.path.getsize(os.path.join(out_dir, f)) for f in made)
+            print(f"  {name:<30} {fmt:<5} {cipher} {len(made)} file(s) {size:>9,} bytes")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return section
+
+
 def hdiutil_version():
     out = subprocess.run(["sw_vers", "-productVersion"], capture_output=True, text=True,
                          check=False).stdout.strip()
@@ -414,11 +561,12 @@ def main(argv):
     aff_known = dict(AFF_VARIANTS)
     dmg_known = dict(DMG_VARIANTS)
     gpt_wanted = not add or "dmg-gpt" in args[1:]
-    args = [a for a in args if a != "dmg-gpt"] if add else args
+    enc_wanted = not add or "dmg-encrypted" in args[1:]
+    args = [a for a in args if a not in ("dmg-gpt", "dmg-encrypted")] if add else args
     ewf_wanted = not add or any(a not in aff_known and a not in dmg_known for a in args[1:])
     aff_wanted = not add or any(a in aff_known for a in args[1:])
     dmg_wanted = not add or any(a in dmg_known for a in args[1:])
-    if (dmg_wanted or gpt_wanted) and not shutil.which(HDIUTIL):
+    if (dmg_wanted or gpt_wanted or enc_wanted) and not shutil.which(HDIUTIL):
         raise SystemExit(f"{HDIUTIL} not found; the Apple disk image variants are written "
                          f"on macOS (test tool only)")
     if ewf_wanted and not shutil.which(EWFACQUIRE):
@@ -501,6 +649,11 @@ def main(argv):
         manifest["gpt_dmg"] = build_gpt_dmgs(out)
         print(f"  gpt disk             {manifest['gpt_dmg']['size']:,} bytes, "
               f"{len(manifest['gpt_dmg']['variants'])} segmented images")
+
+    if enc_wanted:
+        manifest["encrypted_dmg"] = build_encrypted_dmgs(out)
+        print(f"  {len(manifest['encrypted_dmg']['variants'])} encrypted images, each "
+              f"checked with hdiutil attach")
 
     if add:
         os.remove(raw_path)

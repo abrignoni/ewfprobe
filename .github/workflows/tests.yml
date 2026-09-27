@@ -18,6 +18,12 @@ jobs:
         os: [ubuntu-latest]
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         include:
+          # Every job installs pycryptodome for the encrypted Apple disk images,
+          # except one without a cipher package, where the refusal that names it is
+          # what runs, and one with pycryptodomex, the fallback ewfprobe imports.
+          - os: ubuntu-latest
+            python: "3.10"
+            crypto: none
           # pyliblzfse has wheels for these, so the LZFSE (ULFO) fixture is read
           # here and must not be skipped; elsewhere it is skipped, and the
           # refusal that names the missing package is tested instead.
@@ -26,6 +32,7 @@ jobs:
             lzfse: true
           - os: macos-latest
             python: "3.14"
+            crypto: pycryptodomex
           - os: windows-latest
             python: "3.13"
             lzfse: true
@@ -39,6 +46,10 @@ jobs:
       - run: python -m pip install --upgrade pip pytest
       - if: ${{ matrix.lzfse }}
         run: 'python -m pip install --only-binary=:all: pyliblzfse'
+      - if: ${{ matrix.crypto != 'none' }}
+        run: 'python -m pip install --only-binary=:all: ${{ matrix.crypto || ''pycryptodome'' }}'
       - run: python -m pytest tests -q -rs
         env:
           EWFPROBE_REQUIRE_LZFSE: ${{ matrix.lzfse && '1' || '' }}
+          EWFPROBE_REQUIRE_CRYPTO: ${{ matrix.crypto != 'none' && '1' || '' }}
+          EWFPROBE_CRYPTO_PACKAGE: ${{ matrix.crypto == 'pycryptodomex' && 'Cryptodome' || matrix.crypto != 'none' && 'Crypto' || '' }}

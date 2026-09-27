@@ -400,3 +400,88 @@ def test_segmented_images_hdiutil_wrote_from_a_gpt_disk():
             assert _media_sha(img) == gpt["sha256"], name
             checks = img.verify()["container_checks"]
         assert checks and all(c["match"] for c in checks), name
+
+
+# -- encrypted Apple disk images -------------------------------------------------
+
+# A job that installs pycryptodome sets this, so the encrypted fixtures have to run
+# there rather than skip unseen.
+_CRYPTO_REQUIRED = bool(os.environ.get("EWFPROBE_REQUIRE_CRYPTO"))
+_ENCRYPTED_FORMATS = {"udif": ewfprobe.FORMAT_UDIF, "udrw": ewfprobe.FORMAT_UDRW,
+                      "sparseimage": ewfprobe.FORMAT_SPARSEIMAGE,
+                      "sparsebundle": ewfprobe.FORMAT_SPARSEBUNDLE}
+
+
+def _encrypted():
+    section = _manifest().get("encrypted_dmg", {"variants": {}})
+    missing = ewfprobe._AES is None and not _CRYPTO_REQUIRED     # pylint: disable=protected-access
+    marks = ([pytest.mark.skip(reason="encrypted images need the optional pycryptodome "
+                                      "package")] if missing else [])
+    return [pytest.param(name, v, marks=marks, id=name)
+            for name, v in sorted(section["variants"].items())]
+
+
+def test_the_encrypted_fixtures_run_where_they_are_required():
+    if _CRYPTO_REQUIRED:
+        assert ewfprobe._AES is not None, (     # pylint: disable=protected-access
+            "EWFPROBE_REQUIRE_CRYPTO is set and pycryptodome is not installed")
+    section = _manifest().get("encrypted_dmg")
+    assert section, "the encrypted images are missing from the manifest"
+    assert {v["hdiutil_format"] for v in section["variants"].values()} == {
+        "UDZO", "UDRW", "UDSP", "UDSB"}
+    assert {v["encryption"] for v in section["variants"].values()} == {"AES-128",
+                                                                       "AES-256"}
+
+
+@pytest.mark.parametrize("name,variant", _encrypted())
+def test_encrypted_images_read_as_hdiutil_attach_reads_them(name, variant):
+    """hdiutil wrote each of these with -encryption, and make_fixtures.py kept it only
+    after hdiutil attach, given the password, read back the disk it was made from."""
+    section = _manifest()["encrypted_dmg"]
+    disk = section["disks"][variant["disk"]]
+    path = os.path.join(FIXTURES, variant.get("image", variant["files"][0]))
+    assert ewfprobe.apple_image_kind(path) == "ENCRYPTED"
+    with ewfprobe.open_ewf(path, password=variant["password"]) as img:
+        assert img.format == _ENCRYPTED_FORMATS[variant["format"]]
+        assert img.encryption["cipher"] == variant["encryption"]
+        assert img.encryption["key_wrap"] == "AES-192"      # what hdiutil writes now
+        assert img.media_size == disk["size"]
+        assert _media_sha(img) == disk["sha256"]
+        if img.format == ewfprobe.FORMAT_UDIF:
+            assert [os.path.basename(p) for p in img.paths] == variant["files"]
+            checks = img.verify()["container_checks"]
+            assert checks and all(c["match"] for c in checks), name
+    with pytest.raises(ewfprobe.EwfPasswordRequiredError):
+        ewfprobe.open_ewf(path)
+    with pytest.raises(ewfprobe.EwfWrongPasswordError):
+        ewfprobe.open_ewf(path, password=variant["password"] + "x")
+
+
+@pytest.mark.parametrize("name,variant", [p for p in _encrypted()
+                                          if p.id == "dmg-enc-udzo-non-ascii"])
+def test_a_password_outside_ascii_is_used_as_its_utf8_bytes(name, variant):
+    """hdiutil refused the NFD spelling of this NFC password when the image was
+    measured, so ewfprobe does not normalise either."""
+    import unicodedata                  # pylint: disable=import-outside-toplevel
+    path = os.path.join(FIXTURES, variant["files"][0])
+    decomposed = unicodedata.normalize("NFD", variant["password"])
+    assert decomposed != variant["password"], name
+    with ewfprobe.open_ewf(path, password=variant["password"].encode("utf-8")) as img:
+        assert img.format == ewfprobe.FORMAT_UDIF
+    with pytest.raises(ewfprobe.EwfWrongPasswordError):
+        ewfprobe.open_ewf(path, password=decomposed)
+
+
+@pytest.mark.parametrize("name,variant", [p for p in _encrypted()
+                                          if p.id == "dmg-enc-segmented-aes128"])
+def test_an_encrypted_segment_that_will_not_open_is_named(tmp_path, name, variant):
+    """Each file of an encrypted segmented image is its own container, so a .dmgpart
+    beside it that the password does not open cannot be matched, and the refusal
+    says so rather than only that a segment is missing."""
+    for f in variant["files"][:1] + variant["files"][2:]:
+        shutil.copy(os.path.join(FIXTURES, f), tmp_path / f)
+    foreign = _manifest()["encrypted_dmg"]["variants"]["dmg-enc-udzo-non-ascii"]
+    shutil.copy(os.path.join(FIXTURES, foreign["files"][0]), tmp_path / variant["files"][1])
+    with pytest.raises(ewfprobe.EwfIncompleteSetError,
+                       match="1 encrypted .dmgpart file beside it did not open"):
+        ewfprobe.open_ewf(str(tmp_path / variant["files"][0]), password=variant["password"])
