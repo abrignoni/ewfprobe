@@ -23,7 +23,11 @@ cipher package. The same holds for each set FTK Imager encrypted with AD encrypt
 containers in AFF4_KNOWN (written by pyaff4 or by tools/make_aff4_fixtures.py, one Snappy,
 one LZ4, one deflate and a striped pair), `info`, `verify` and a full `export` must be
 byte-identical between the two and the export must hash to the content the container was
-written from. The executable's --version must name the source's __version__.
+written from. For the AD1s in AD1_KNOWN, written by FTK Imager (one of them AD-encrypted),
+`info`, `verify`, `files` and an `export --entry` must be byte-identical between the two,
+verify must report FTK's logged hashes and every entry's hashes as matching, the entry must
+hash to the content written to it, and a set missing a file must be refused the same way
+by both. The executable's --version must name the source's __version__.
 """
 
 from __future__ import annotations
@@ -45,6 +49,17 @@ AFF4_KNOWN = {
     "aff4-deflate-zlibstream.aff4": "8dd04764855150cb5ac7f36dd584571d",
     "aff4-striped_1.aff4": "66fae939a0fd6b5b9608aa0a1615a71c",
 }
+
+
+# AD1s FTK Imager wrote (tests/fixtures/ad1): the password, if any, one entry and the MD5
+# of the content written to it
+AD1_KNOWN = [
+    ("lean-src-c0-1mb.ad1", None, "docs/exact-64k.bin", "931c16b5fb19651e435e08b9db899364"),
+    ("lean-src-c6-1mb-adcrypt.ad1", "Ad1Test-2026!", "docs/pattern-2300k.bin",
+     "b8015224bde72d81265895d4bd95979d"),
+    ("lean-multi-ntfs-c9.ad1", None, "U:\\:AD1LEAN [NTFS]/[root]/known/readme.txt/extra",
+     "7680f5e1acfeff91e96ea53619522e02"),
+]
 
 
 def run(cmd: list[str], cwd: Path, want: int = 0, env=None) -> subprocess.CompletedProcess:
@@ -212,10 +227,42 @@ def main(argv: list[str]) -> int:
             print(f"{name}: AFF4 info, verify and a {len(out['exe'][3]):,} byte export "
                   f"identical; the export matches the content it was written from")
 
+        for name, password, entry, md5 in AD1_KNOWN:
+            image = str(fixtures / "ad1" / name)
+            pw = ["--password-env", "EWFPROBE_SMOKE_PASSWORD"] if password else []
+            env = dict(os.environ, EWFPROBE_SMOKE_PASSWORD=password or "")
+            out = {}
+            for who, cmd in (("py", py), ("exe", exe)):
+                got = work / f"{name}-{who}.entry"
+                out[who] = (run(cmd + ["info", *pw, image], work, env=env).stdout,
+                            run(cmd + ["verify", "-q", *pw, image], work, env=env).stdout,
+                            run(cmd + ["files", *pw, image], work, env=env).stdout,
+                            run(cmd + ["export", "-q", *pw, image, "--entry", entry,
+                                       "-o", str(got)], work, env=env).stdout,
+                            got.read_bytes())
+            assert out["py"] == out["exe"], f"{name}: the executable's output differs"
+            verify = out["exe"][1]
+            assert verify.count(b"matches the stored hash") == 2, (name, verify)
+            assert b"DO NOT MATCH" not in verify, (name, verify)
+            assert hashlib.md5(out["exe"][4]).hexdigest() == md5, name
+            checks += 1
+            print(f"{name}: AD1 info, verify, files and an entry export identical; FTK's "
+                  f"logged hashes and every entry's match, and the entry matches its content")
+        short = work / "ad1-short"
+        short.mkdir()
+        for n in (1, 2, 3):
+            shutil.copy(fixtures / "ad1" / f"lean-src-c0-1mb.ad{n}", short)
+        a = run(py + ["info", str(short / "lean-src-c0-1mb.ad1")], work, want=2).stderr
+        b = run(exe + ["info", str(short / "lean-src-c0-1mb.ad1")], work, want=2).stderr
+        assert a.replace(b"\r\n", b"\n") == b.replace(b"\r\n", b"\n"), (a, b)
+        assert b"records 4 files" in b, b
+        checks += 1
+        print("an AD1 set missing a file is refused the same way by both")
+
     assert checks == (len(manifest["variants"]) + len(manifest.get("logical", {})) + 2
                       + len(manifest.get("encrypted_dmg", {}).get("variants", {}))
                       + len(manifest.get("ad_encrypted", {}).get("variants", {}))
-                      + len(AFF4_KNOWN)), checks
+                      + len(AFF4_KNOWN) + len(AD1_KNOWN) + 1), checks
     print(f"{checks} checks: the executable wrote the same bytes as the source")
     return 0
 
