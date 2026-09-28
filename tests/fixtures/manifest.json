@@ -709,5 +709,78 @@
         "image": "dmg-cert-only-sparsebundle-aes128.sparsebundle"
       }
     }
+  },
+  "ad_certificate": {
+    "writer": "FTK Imager 4.7.3.61",
+    "given": "a PEM certificate in the AD Encryption Credentials dialog (Certificate, not Password)",
+    "source": {
+      "size": 1257984,
+      "md5": "fbc8c24845be0e9f7596b46ef88b27a2",
+      "sha1": "c8fcc8e1eb278de2ae4d0d058867ec561c4b38d3",
+      "sha256": "b824970a22f4c9a99128bba83eff9494b6beac41c1664481891b2fde2cb37a15",
+      "made_by": "tools/make_fixtures.py ad_source()"
+    },
+    "ftk_recorded": {
+      "MD5": "fbc8c24845be0e9f7596b46ef88b27a2",
+      "SHA1": "c8fcc8e1eb278de2ae4d0d058867ec561c4b38d3"
+    },
+    "keys": {
+      "2048": {
+        "key": "ad-cert-test-key-2048.pem",
+        "certificate": "ad-cert-test-cert-2048.pem"
+      },
+      "4096": {
+        "key": "ad-cert-test-key-4096.pem",
+        "certificate": "ad-cert-test-cert-4096.pem"
+      }
+    },
+    "variants": {
+      "ftk-ad-cert-e01": {
+        "format": "e01",
+        "key_bits": 2048,
+        "fragment_mb": 1,
+        "compression": 0,
+        "files": [
+          "ftk-ad-cert-e01.E01",
+          "ftk-ad-cert-e01.E02"
+        ]
+      },
+      "ftk-ad-cert4096-smart": {
+        "format": "smart",
+        "key_bits": 4096,
+        "fragment_mb": 1,
+        "compression": 0,
+        "files": [
+          "ftk-ad-cert4096-smart.s01",
+          "ftk-ad-cert4096-smart.s02"
+        ]
+      },
+      "ftk-ad-cert-ad1": {
+        "format": "ad1",
+        "key_bits": 2048,
+        "files": [
+          "ftk-ad-cert-ad1.ad1"
+        ],
+        "log": "ftk-ad-cert-ad1.ad1.txt",
+        "ftk_image_hash": {
+          "MD5": "82c5373b58d14d7afb419a763f55dae1",
+          "SHA1": "d57e9ae498cb78d024a4167ba64fb20a27cc127d"
+        },
+        "entries": {
+          "alpha.txt": {
+            "size": 48,
+            "sha256": "7ff049615ee98fae1eb1307fe20ac2b45b275aa5c7333fdc1eeae91304b8ebd9"
+          },
+          "bravo.bin": {
+            "size": 65536,
+            "sha256": "a9636ce6d0157b592983b5368fe90cf318d78f870578026bff1b7d67e6a8697b"
+          },
+          "charlie.txt": {
+            "size": 11,
+            "sha256": "7ebd9253943ba3a0e5a56cea696b802091218b49747fd5e9fea9604126eef25f"
+          }
+        }
+      }
+    }
   }
 }

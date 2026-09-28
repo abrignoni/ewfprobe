@@ -27,14 +27,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ewfprobe  # noqa: E402
 
 try:
-    from Crypto.Cipher import AES
+    from Crypto.Cipher import AES, PKCS1_v1_5
+    from Crypto.PublicKey import RSA
     from Crypto.Util import Counter
 except ImportError:
     try:
-        from Cryptodome.Cipher import AES
+        from Cryptodome.Cipher import AES, PKCS1_v1_5
+        from Cryptodome.PublicKey import RSA
         from Cryptodome.Util import Counter
     except ImportError:
-        AES = Counter = None
+        AES = Counter = PKCS1_v1_5 = RSA = None
 
 # A job that installs pycryptodome sets this, so these tests run there rather than
 # skip unseen.
@@ -55,20 +57,27 @@ def _ctr(key, data, first_block):
 
 
 def write_adcrypt(plain_files, out_files, password=PASSWORD, *, cipher=3, hash_id=2,
-                  iterations=4000, version=1, header_size=512, seed=7, mutate=None):
+                  iterations=4000, version=1, header_size=512, seed=7, mutate=None,
+                  public_key=None):
     """Encrypt each of ``plain_files`` into ``out_files`` as FTK Imager does: one key
     for the set, the header in the first file only, file i under counter i << 64.
-    ``mutate(header)`` may edit the header (a bytearray) before it is written."""
+    ``mutate(header)`` may edit the header (a bytearray) before it is written. With
+    ``public_key`` (an RSA key) the salt is sealed to it with PKCS#1 v1.5, and the key
+    is made from the empty password when ``password`` is None, as the white paper has
+    it and as FTK Imager's certificate sets measure."""
     r = random.Random(seed)
     key_bytes = {1: 16, 2: 24, 3: 32}.get(cipher, 32)
     file_key, salt = r.randbytes(key_bytes), r.randbytes(16)
-    digest = hashlib.new(HASHES.get(hash_id, "sha512"), password.encode("utf-8")).digest()
+    digest = (hashlib.new(HASHES.get(hash_id, "sha512"), password.encode("utf-8")).digest()
+              if password is not None else b"")
     made = hashlib.pbkdf2_hmac("sha1", digest, salt, iterations, key_bytes)
     wrapped = _ctr(made, file_key, 0)
     mac = hmac.new(made, wrapped, HASHES.get(hash_id, "sha512")).digest()
+    stored_salt = salt if public_key is None else PKCS1_v1_5.new(public_key).encrypt(salt)
     header = bytearray(HEADER.pack(b"ADCRYPT\x00", version, header_size, -1, -1, -1,
-                                   b"\x00\x00", cipher, hash_id, iterations, len(salt),
-                                   len(wrapped), len(mac)) + salt + wrapped + mac)
+                                   b"\x00\x00", cipher, hash_id, iterations,
+                                   len(stored_salt), len(wrapped), len(mac))
+                       + stored_salt + wrapped + mac)
     header += bytes(header_size - len(header))
     if mutate:
         mutate(header)
@@ -201,6 +210,43 @@ def test_no_password_and_a_wrong_one_are_told_apart(tmp_path):
         ewfprobe.open_ewf(out[0], password=PASSWORD + "x")
     with ewfprobe.open_ewf(out[0], password=PASSWORD.encode("utf-8")) as img:
         assert img.format == ewfprobe.FORMAT_RAW
+
+
+
+def _sealing_key():
+    with open(os.path.join(FIXTURES, "ad-cert-test-key-2048.pem"), "rb") as fh:
+        return RSA.import_key(fh.read())
+
+
+def test_a_raw_set_sealed_to_a_certificate_opens_with_its_private_key(tmp_path):
+    """Sealed as FTK Imager seals its certificate sets (tested on those in
+    test_reference_fixtures.py), by this writer's own RSA and CTR code."""
+    key = _sealing_key()
+    disk, plain, out = _raw_set(tmp_path, stem="sealed")
+    enc = write_adcrypt(plain, out, password=None, public_key=key.publickey())
+    with ewfprobe.open_ewf(enc[1], private_key=key.export_key()) as img:
+        assert _sha(img) == hashlib.sha256(disk).hexdigest()
+        assert img.encryption["opened_with"] == "private key of its certificate"
+    with pytest.raises(ewfprobe.EwfPasswordRequiredError) as caught:
+        ewfprobe.open_ewf(enc[0], password=PASSWORD)
+    assert caught.value.needs == "private key"
+
+
+def test_a_set_sealed_with_a_password_as_well_needs_both(tmp_path):
+    """The white paper makes the key from the password's hash when a password is given
+    beside the certificate. FTK Imager 4.7.3.61 offers one or the other, so this is a
+    constructed set only."""
+    key = _sealing_key()
+    disk, plain, out = _raw_set(tmp_path, stem="both")
+    enc = write_adcrypt(plain, out, public_key=key.publickey())
+    with ewfprobe.open_ewf(enc[0], private_key=key.export_key(), password=PASSWORD) as img:
+        assert _sha(img) == hashlib.sha256(disk).hexdigest()
+    with pytest.raises(ewfprobe.EwfWrongPasswordError):
+        ewfprobe.open_ewf(enc[0], private_key=key.export_key())
+    with pytest.raises(ewfprobe.EwfWrongPasswordError):
+        ewfprobe.open_ewf(enc[0], private_key=key.export_key(), password=PASSWORD + "x")
+    with pytest.raises(ewfprobe.EwfPasswordRequiredError):
+        ewfprobe.open_ewf(enc[0], password=PASSWORD)
 
 
 def test_the_password_is_its_utf8_bytes(tmp_path):

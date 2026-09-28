@@ -22,7 +22,10 @@ cipher package. The same holds for each set FTK Imager encrypted with AD encrypt
 "ad_encrypted", whose export must hash to the disk it was made from, and for each AFF
 AFFLIB encrypted, under "encrypted_aff", opened with its passphrase or, when it is sealed
 only to a certificate, the test private key (so the executable carries the RSA code too),
-whose export must hash to the source. For the AFF4
+whose export must hash to the source. So must each set FTK Imager sealed to a test
+certificate, under "ad_certificate", opened with the test private key: an E01 or SMART
+export must hash to the disk imaged, an AD1's file list must name every file imaged, and
+without the key both must refuse it. For the AFF4
 containers in AFF4_KNOWN (written by pyaff4 or by tools/make_aff4_fixtures.py, one Snappy,
 one LZ4, one deflate and a striped pair), `info`, `verify` and a full `export` must be
 byte-identical between the two and the export must hash to the content the container was
@@ -278,6 +281,38 @@ def main(argv: list[str]) -> int:
                   f"{len(out['exe'][3]):,} byte export identical; the export matches the disk "
                   f"FTK Imager imaged, and a wrong password is refused by both")
 
+        sealed = manifest.get("ad_certificate", {"variants": {}})
+        for name, variant in sorted(sealed["variants"].items()):
+            image = str(fixtures / variant["files"][0])
+            key = str(fixtures / sealed["keys"][str(variant["key_bits"])]["key"])
+            out = {}
+            for who, cmd in (("py", py), ("exe", exe)):
+                raw = work / f"{name}-{who}.raw"
+                listed = (run(cmd + ["files", "--private-key", key, image], work).stdout
+                          if variant["format"] == "ad1" else
+                          run(cmd + ["export", "-q", "--private-key", key, image, "-o",
+                                     str(raw)], work).stdout)
+                out[who] = (run(cmd + ["info", "--private-key", key, image], work).stdout,
+                            run(cmd + ["verify", "-q", "--private-key", key, image],
+                                work).stdout,
+                            listed,
+                            b"" if variant["format"] == "ad1" else raw.read_bytes())
+            assert out["py"] == out["exe"], f"{name}: the executable's output differs"
+            assert b"private key of its certificate" in out["exe"][0], name
+            if variant["format"] != "ad1":
+                assert hashlib.sha256(out["exe"][3]).hexdigest() == sealed["source"]["sha256"], name
+            else:
+                for entry in variant["entries"]:
+                    assert entry.encode() in out["exe"][2], (name, entry)
+            a = run(py + ["info", image], work, want=2).stderr
+            b = run(exe + ["info", image], work, want=2).stderr
+            assert a.replace(b"\r\n", b"\n") == b.replace(b"\r\n", b"\n"), (a, b)
+            checks += 1
+            print(f"{name}: AD encryption sealed to a certificate opened with its private "
+                  f"key, info, verify and {'files' if variant['format'] == 'ad1' else 'export'} "
+                  f"identical and matching what FTK Imager imaged; without the key both "
+                  f"refuse the image")
+
         for name, md5 in sorted(AFF4_KNOWN.items()):
             image = str(fixtures / name)
             out = {}
@@ -354,6 +389,7 @@ def main(argv: list[str]) -> int:
                       + len(manifest.get("ad_encrypted", {}).get("variants", {}))
                       + len(manifest.get("encrypted_aff", {}).get("variants", {}))
                       + len(manifest.get("certificate_dmg", {}).get("variants", {}))
+                      + len(manifest.get("ad_certificate", {}).get("variants", {}))
                       + len(AFF4_KNOWN) + len(AD1_KNOWN) + 1 + len(VIRTUAL_KNOWN)), checks
     print(f"{checks} checks: the executable wrote the same bytes as the source")
     return 0
