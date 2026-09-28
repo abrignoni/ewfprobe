@@ -60,8 +60,9 @@ encryption, or an encrypted AFF) needs its password. `--password-file FILE` read
 from the first line of a file and `--password-env NAME` from an environment
 variable; without either, ewfprobe asks for it at a terminal. It is never taken as
 an argument's value, which would put it in the process list and the shell history.
-An AFF sealed to a certificate opens instead with that certificate's RSA private key,
-given unencrypted, as PEM or DER, with `--private-key FILE`.
+An AFF, an Apple disk image or an AD-encrypted set sealed to a certificate opens
+instead with that certificate's RSA private key, given unencrypted, as PEM or DER,
+with `--private-key FILE`.
 
 ## What it reads
 
@@ -220,7 +221,8 @@ specification describes. None of the tested files sets them, so that part rests 
 the specification alone.
 
 Reads AD1, FTK Imager's logical image, in files named `.ad1`, `.ad2` and on, from any
-of them, and an AD-encrypted set with its password. Entries come through the same
+of them, and an AD-encrypted set with its password or the private key of the
+certificate it is sealed to. Entries come through the same
 interface as an L01's: `logical_entries` in the order the items lie in the image (each
 folder's children before its next sibling), `find_entry()`, `open_entry()`,
 `read_entry()`, and `ewfprobe files` and `export --entry`. The image's stream is its
@@ -416,8 +418,20 @@ seen) of the password's UTF-8 bytes, over the header's salt and iteration count
 (4,000); the header's HMAC of the encrypted file key, under that hash, checks the
 password; and the file key is decrypted from the header with AES-CTR from counter 0.
 `is_adcrypt()` tells whether a file begins with the header and `adcrypt_set()` lists
-the files of the set a path belongs to. An AD1 inside reads as described below, and
-an AD-encrypted image protected by a certificate rather than a password is refused.
+the files of the set a path belongs to. An AD1 inside reads as described below.
+
+Since 0.12.0 a set sealed to a certificate rather than a password opens with that
+certificate's RSA private key (`--private-key FILE`, or `private_key=` in
+`open_ewf()`); without it the error's `needs` is "private key". FTK Imager 4.7.3.61
+offers a password or a certificate, not both, and takes the certificate as a PEM
+file. Measured on an E01, a SMART set and an AD1 it wrote that way, from the same
+disk and files as the password sets: the header's salt field holds the 16-byte salt
+wrapped with the certificate's public key (RSA PKCS#1 v1.5), one RSA block of 256 or
+512 bytes (the header grows to 1,024 bytes for a 4096-bit key); the key is
+PBKDF2-HMAC-SHA1 of the empty password, not of its hash, over that salt; and the
+header's HMAC checks it as for a password. The header's three counts read -1 in
+password and certificate sets alike, so the salt's length (16 bytes in every password
+set seen) is what tells them apart.
 
 A sparse image longer than about a gigabyte of written bands carries more than one
 header. Measured on images `hdiutil` wrote, beyond what the format documentation
@@ -484,7 +498,8 @@ sparse bundle folders and the virtual disks above, which `virtual_disk_kind()` n
 AD1 alone, `ad1_segments()` for the files of its set), `is_ewf()` for EWF alone,
 and `apple_image_kind()` names an Apple disk image as `UDIF`, `SPARSEIMAGE`,
 `SPARSEBUNDLE` or `ENCRYPTED` (any encrypted one, which `is_image()` leaves out
-because it opens only with its password). `is_image()` leaves out an AD-encrypted
+because it opens only with its password or a certificate's private key).
+`is_image()` leaves out an AD-encrypted
 acquisition for the same reason; `is_adcrypt()` and `adcrypt_set()` answer for it.
 
 Refused with a message naming the reason rather than read wrongly:
@@ -778,6 +793,17 @@ counter; those files are AGPL and are not committed. Other ciphers and hashes, a
 later numbered file, damaged headers, an AD1 inside, and the wrapped EWF, SMART and
 Ex01 fixtures are tested on sets the test suite writes, with the cipher library's CTR
 mode rather than ewfprobe's.
+
+FTK Imager 4.7.3.61 also sealed an E01, a raw set and an AD1 to a 2048-bit test
+certificate and a SMART set to a 4096-bit one, from the same disk and, for the AD1,
+three small files. Each decrypts with its private key to what was imaged: the E01,
+SMART and raw sets to the disk (the E01 and SMART sets also match the MD5 and SHA-1
+stored in them), and the AD1 to the three files, with `verify` reproducing FTK
+Imager's image hash and every entry's MD5 and SHA-1. Another RSA key, one of the
+other size, or a password alone is refused. The E01, SMART and AD1 are committed with
+the test keys. A set sealed with a password as well, which the white paper describes
+and FTK Imager does not offer, is tested only on a set the test suite writes. Eleven
+deliberate breaks of the certificate code are each caught by the tests.
 
 **Segmented images and sparse bundles, against `hdiutil attach`.** 36 images `hdiutil`
 wrote from HFS+ and APFS test disks read byte for byte the same as the same image

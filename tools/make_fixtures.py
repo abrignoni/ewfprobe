@@ -60,6 +60,13 @@ password it records. FTK Imager cannot be driven from here, so the files are mad
 by hand and copied in; the known answer is that disk's hashes, which FTK Imager
 also recorded. Both modes keep that section as it is.
 
+The ``ad_certificate`` section describes sets FTK Imager 4.7.3.61 wrote with AD
+encryption sealed to a test certificate instead of a password (an E01 and an AD1 to
+a 2048-bit key, a SMART set to a 4096-bit one), the E01 and SMART from the same
+``ad_source()`` disk and the AD1 from three small files it records by hash. The
+RSA keys and certificates, made once with openssl, are kept beside them. Like
+``ad_encrypted`` it is made by hand, and both modes keep it as it is.
+
 The manifest's ``logical`` section describes an L01 EnCase wrote, copied from
 Digital Corpora with known answers taken from libewf's ewfexport. It has its own
 source rather than this tool's, so both modes keep that section as it is.
@@ -868,17 +875,20 @@ def main(argv):
         raw_path = rebuild_source(out, manifest)
         print(f"raw source rebuilt and matches the manifest: {manifest['sha256'][:16]}")
     else:
-        kept = kept_ad = None
+        kept = kept_ad = kept_adc = None
         if os.path.exists(os.path.join(out, "manifest.json")):
             with open(os.path.join(out, "manifest.json"), encoding="utf-8") as fh:
                 previous = json.load(fh)
             kept, kept_ad = previous.get("logical"), previous.get("ad_encrypted")
+            kept_adc = previous.get("ad_certificate")
         raw_path = os.path.join(out, "source.raw")
         manifest = build_raw(raw_path, size=(3 << 20) if small else (8 << 20))
         if kept:
             manifest["logical"] = kept
         if kept_ad:
             manifest["ad_encrypted"] = kept_ad
+        if kept_adc:
+            manifest["ad_certificate"] = kept_adc
         print(f"raw source: {manifest['size']:,} bytes, "
               f"{len(manifest['media'])} media items")
         manifest["variants"] = {}

@@ -549,6 +549,90 @@ def test_ad_encrypted_sets_read_back_the_disk_ftk_imager_imaged(name, variant):
         ewfprobe.open_ewf(files[0], password=section["password"] + "x")
 
 
+
+# -- AD encryption sealed to a certificate ------------------------------------------
+
+def _ad_certificate_sets():
+    section = _manifest().get("ad_certificate", {"variants": {}})
+    missing = (ewfprobe._AES is None or ewfprobe._RSA is None) and not _CRYPTO_REQUIRED  # pylint: disable=protected-access
+    marks = ([pytest.mark.skip(reason="an AD-encrypted set sealed to a certificate needs "
+                                      "the optional pycryptodome package")] if missing else [])
+    return [pytest.param(name, v, marks=marks, id=name)
+            for name, v in sorted(section["variants"].items())]
+
+
+def _ad_certificate_key(variant, bits=None):
+    section = _manifest()["ad_certificate"]
+    return os.path.join(FIXTURES, section["keys"][str(bits or variant["key_bits"])]["key"])
+
+
+@pytest.mark.parametrize("name,variant", _ad_certificate_sets())
+def test_ad_sets_sealed_to_a_certificate_open_with_its_private_key(name, variant):
+    """FTK Imager wrote each set with its certificate in place of a password: the
+    header's salt field holds one RSA block, and the set reads back what was imaged."""
+    section = _manifest()["ad_certificate"]
+    files = [os.path.join(FIXTURES, f) for f in variant["files"]]
+    with open(files[0], "rb") as fh:
+        head = fh.read(48)
+    header_size, salt_len = struct.unpack_from("<I", head, 12)[0], struct.unpack_from("<I", head, 36)[0]
+    assert salt_len == variant["key_bits"] // 8
+    assert header_size == (512 if variant["key_bits"] == 2048 else 1024)
+    assert struct.unpack_from("<hhh", head, 16) == (-1, -1, -1)
+    with ewfprobe.open_ewf(files[0], private_key=_ad_certificate_key(variant)) as img:
+        assert [os.path.basename(p) for p in img.paths] == variant["files"]
+        assert img.encryption["opened_with"] == "private key of its certificate"
+        assert img.encryption["kdf"] == "PBKDF2-HMAC-SHA1 of an empty password"
+        assert img.encryption["salt_wrap"] == "RSA PKCS#1 v1.5"
+        assert img.encryption["cipher"] == "AES-256-CTR"
+        if variant["format"] == "ad1":
+            assert img.format == ewfprobe.FORMAT_AD1
+            got = {e.name: {"size": e.size,
+                            "sha256": hashlib.sha256(img.read_entry(e)).hexdigest()}
+                   for e in img.logical_entries if e.size}
+            assert got == variant["entries"]
+            result = img.verify()
+            assert result["match"] is True
+            assert result["computed"] == variant["ftk_image_hash"]
+        else:
+            assert img.format == {"e01": ewfprobe.FORMAT_E01,
+                                  "smart": ewfprobe.FORMAT_S01}[variant["format"]]
+            assert img.media_size == section["source"]["size"]
+            assert _media_sha(img) == section["source"]["sha256"]
+            assert img.stored_hashes == section["ftk_recorded"]
+
+
+@pytest.mark.parametrize("name,variant", _ad_certificate_sets())
+def test_an_ad_set_sealed_to_a_certificate_asks_for_its_key_and_refuses_another(name, variant):
+    first = os.path.join(FIXTURES, variant["files"][0])
+    for password in (None, _manifest()["ad_encrypted"]["password"]):
+        with pytest.raises(ewfprobe.EwfPasswordRequiredError) as caught:
+            ewfprobe.open_ewf(first, password=password)
+        assert caught.value.needs == "private key"
+    # another certificate's key, the same size and not, is refused as a wrong key
+    stranger = os.path.join(FIXTURES, "dmg-cert-test-key-2048.pem")
+    other_size = _ad_certificate_key(variant, 4096 if variant["key_bits"] == 2048 else 2048)
+    for key in (stranger, other_size):
+        with pytest.raises(ewfprobe.EwfWrongPasswordError):
+            ewfprobe.open_ewf(first, private_key=key)
+    # a password given beside the right key does not stop it opening
+    with ewfprobe.open_ewf(first, private_key=_ad_certificate_key(variant),
+                           password="also given") as img:
+        assert img.encryption["opened_with"] == "private key of its certificate"
+
+
+@pytest.mark.parametrize("name,variant", _ad_sets())
+def test_an_ad_set_with_a_password_still_needs_it_when_a_key_is_given(name, variant):
+    section = _manifest()["ad_encrypted"]
+    first = os.path.join(FIXTURES, variant["files"][0])
+    key = os.path.join(FIXTURES, _manifest()["ad_certificate"]["keys"]["2048"]["key"])
+    with pytest.raises(ewfprobe.EwfPasswordRequiredError) as caught:
+        ewfprobe.open_ewf(first, private_key=key)
+    assert caught.value.needs == "password"
+    with ewfprobe.open_ewf(first, password=section["password"], private_key=key) as img:
+        assert _media_sha(img) == section["source"]["sha256"]
+        assert "opened_with" not in img.encryption
+
+
 # -- encrypted AFF -----------------------------------------------------------------
 
 def _encrypted_aff():

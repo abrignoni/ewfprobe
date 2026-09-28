@@ -63,15 +63,15 @@ EWF-L01 logical evidence, FTK Imager's AD1 (version 4), and UDIF, sparse image a
 sparse bundle Apple disk images, encrypted with a password or not, AD-encrypted E01,
 SMART, raw and AD1 sets, AFF4 containers, standard and pre-standard, striped or
 not, and VHD, VHDX, VMDK and QCOW virtual disks. It does not read Lx01 logical evidence, encrypted AFF4 or AFF4-L, an AD1 other
-than version 4, an AD-encrypted image protected by a certificate, an Apple disk
+than version 4, an Apple disk
 image unlocked by a keybag rather than a password or a certificate, or one in the
 older version 1 encrypted format (cdsaencr), an encrypted QCOW, a VMDK SESPARSE
 extent, a VHD split into .v01 files, encrypted Ex01 images (the encryption
 is not publicly documented), or Ex01 images compressed with bzip2 (no sample exists to
 validate against), and it never writes.
 An encrypted AFF opens with its passphrase or with the private key of a certificate
-it is sealed to, and an Apple disk image sealed to a certificate with that
-certificate's private key.
+it is sealed to, and an Apple disk image or an AD-encrypted set sealed to a
+certificate with that certificate's private key.
 
 An image whose content is encrypted at rest, by BitLocker or FileVault or an
 encrypted APFS volume, reads back as the ciphertext that was acquired: the
@@ -108,7 +108,7 @@ try:
 except ImportError:
     lzma = None
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 # ---------------------------------------------------------------- constants
 
@@ -409,14 +409,23 @@ FORMAT_UDRW = "UDRW"
 # password is its UTF-8 bytes. Also measured, on sets FTK Imager 4.7.3.61 wrote:
 # E01, SMART and raw (dd) output can be AD-encrypted (AFF has its own, different
 # encryption), every file of a set is encrypted, and only the first carries the
-# header, so a raw set's first file is its first fragment's bytes plus 512. A
-# container unlocked by a certificate keeps the salt encrypted with the
-# certificate's key; ewfprobe does not read those.
+# header, so a raw set's first file is its first fragment's bytes plus 512.
+# Sealed to a certificate instead of a password, measured on four images FTK Imager
+# 4.7.3.61 wrote (E01, raw, SMART and AD1; 2048 and 4096-bit RSA keys given to it as a
+# PEM certificate): the salt, 16 bytes, is wrapped with the certificate's RSA public
+# key (PKCS#1 v1.5), so the header's salt field holds one RSA block (256 or 512 bytes;
+# the header grows to 1,024 bytes for the larger), and the key made from it is
+# PBKDF2-HMAC-SHA1 of the empty password, not of its hash. FTK Imager offers a
+# password or a certificate, not both. The password images seen (7) carry the 16-byte
+# salt as is, and all three kinds of image read -1 in the header's three counts, so
+# the salt's length is what tells a sealed image from a password one.
 ADCRYPT_SIGNATURE = b"ADCRYPT\x00"
 _ADCRYPT_HEADER = struct.Struct("<8sIIhhh2sIIIIII")  # through the HMAC length
 _ADCRYPT_CIPHERS = {1: 128, 2: 192, 3: 256}
 _ADCRYPT_HASHES = {1: "sha256", 2: "sha512"}
 _ADCRYPT_MAX_ITERATIONS = 50_000_000            # the images seen use 4,000
+_ADCRYPT_SEALED_SALT = 64                       # a salt this long is an RSA block (512-bit
+                                                # RSA and up); a plain one is 16 bytes
 AD1_SIGNATURE = b"ADSEGMENTEDFILE\x00"
 # An AD-encrypted raw (dd) image decrypts to the disk itself, in numbered files.
 FORMAT_RAW = "RAW"
@@ -496,7 +505,8 @@ class EwfPasswordError(EwfFormatError):
 
 class EwfPasswordRequiredError(EwfPasswordError):
     """The image is encrypted and no password was given. ``needs`` is "password", or
-    "private key" for an AFF that is sealed only to a certificate."""
+    "private key" for an AFF, an Apple disk image or an AD-encrypted set sealed only
+    to a certificate."""
 
     def __init__(self, message, needs="password"):
         super().__init__(message)
@@ -877,14 +887,16 @@ class _EncryptedFile:
 
 class _AdcryptKey:
     """What opens an AD-encrypted acquisition: the file key, where the first file's
-    data starts, and what the header recorded about how it was made."""
+    data starts, what the header recorded about how it was made, and whether a
+    certificate's private key (``sealed``) or a password opened it."""
 
-    def __init__(self, key, start, key_bits, hash_name, iterations):
+    def __init__(self, key, start, key_bits, hash_name, iterations, sealed=False):
         self.key = key
         self.start = start
         self.key_bits = key_bits
         self.hash_name = hash_name
         self.iterations = iterations
+        self.sealed = sealed
 
 
 class _AdcryptSegment:
@@ -975,8 +987,10 @@ def adcrypt_set(path):
     return None
 
 
-def _adcrypt_unlock(fh, name, password):
-    """The key of the AD-encrypted set whose first file is open in ``fh``."""
+def _adcrypt_unlock(fh, name, password, private_key=None):
+    """The key of the AD-encrypted set whose first file is open in ``fh``: from its
+    password, or, for a set sealed to a certificate, from that certificate's RSA
+    private key (``private_key``, a path or PEM or DER bytes)."""
     head = fh.read(_ADCRYPT_HEADER.size)
     if len(head) != _ADCRYPT_HEADER.size or not head.startswith(ADCRYPT_SIGNATURE):
         raise EwfFormatError(f"{name} has no AD encryption header")
@@ -1008,18 +1022,49 @@ def _adcrypt_unlock(fh, name, password):
     if _AES is None:
         raise EwfFormatError(f"{name} is encrypted with FTK Imager's AD encryption; "
                              f"reading it needs the pycryptodome package")
-    if password is None:
-        raise EwfPasswordRequiredError(f"{name} is encrypted with FTK Imager's AD "
-                                       f"encryption and opens only with its password")
     if isinstance(password, str):
         password = password.encode("utf-8")
-    made = hashlib.pbkdf2_hmac("sha1", hashlib.new(hash_name, password).digest(), salt,
-                               iterations, key_len)
-    if not hmac.compare_digest(hmac.digest(made, wrapped, hash_name), stored_hmac):
-        raise EwfWrongPasswordError(f"the password does not open {name} (an image "
-                                    f"protected by a certificate is not read)")
+
+    def opens(secret, plain_salt):
+        made = hashlib.pbkdf2_hmac("sha1", secret, plain_salt, iterations, key_len)
+        if hmac.compare_digest(hmac.digest(made, wrapped, hash_name), stored_hmac):
+            return made
+        return None
+
+    sealed = salt_len >= _ADCRYPT_SEALED_SALT
+    made = None
+    if sealed:
+        if private_key is None:
+            raise EwfPasswordRequiredError(f"{name} is encrypted with FTK Imager's AD "
+                                           f"encryption and sealed to a certificate; it "
+                                           f"opens with that certificate's private key",
+                                           needs="private key")
+        rsa = _private_key(private_key)
+        plain = None
+        if rsa.size_in_bytes() == salt_len:
+            try:
+                plain = _PKCS1.new(rsa).decrypt(salt, None)
+            except (ValueError, TypeError):
+                plain = None
+        if plain:
+            made = opens(b"", plain)
+            if made is None and password is not None:
+                # the white paper makes the key from the password's hash when one is
+                # given beside the certificate; FTK Imager offers one or the other,
+                # so no image seen does this
+                made = opens(hashlib.new(hash_name, password).digest(), plain)
+        if made is None:
+            raise EwfWrongPasswordError(f"the private key does not open {name}")
+    else:
+        if password is None:
+            raise EwfPasswordRequiredError(f"{name} is encrypted with FTK Imager's AD "
+                                           f"encryption and opens only with its "
+                                           f"password")
+        made = opens(hashlib.new(hash_name, password).digest(), salt)
+        if made is None:
+            raise EwfWrongPasswordError(f"the password does not open {name}")
     key = _ctr_le(_AES.new(made, _AES.MODE_ECB), wrapped, 0)
-    return _AdcryptKey(key, header_size, key_bits, hash_name, iterations)
+    return _AdcryptKey(key, header_size, key_bits, hash_name, iterations, sealed)
 
 
 class _AdcryptFile:
@@ -4321,7 +4366,7 @@ class EwfImage:
         path = self.paths[0]
         name = os.path.basename(path)
         with open(path, "rb") as fh:
-            key = _adcrypt_unlock(fh, name, self._password)
+            key = _adcrypt_unlock(fh, name, self._password, self._private_key)
         for i, segment in enumerate(self.paths):
             self._keys[segment] = _AdcryptSegment(key, i)
         self.encryption = {"container": "AD encryption (FTK Imager)",
@@ -4329,6 +4374,10 @@ class EwfImage:
                            "key_wrap": f"AES-{key.key_bits}-CTR",
                            "kdf": f"PBKDF2-HMAC-SHA1 of {key.hash_name.upper()}",
                            "kdf_rounds": key.iterations}
+        if key.sealed:
+            self.encryption.update(kdf="PBKDF2-HMAC-SHA1 of an empty password",
+                                   salt_wrap="RSA PKCS#1 v1.5",
+                                   opened_with="private key of its certificate")
         fh, _size = self._content(path)
         with fh:
             inner = fh.read(len(AD1_SIGNATURE))
@@ -6981,8 +7030,9 @@ def open_ewf(path, segments=None, password=None, private_key=None) -> EwfImage:
     with ``password`` (a str, used as UTF-8, or bytes); without one it raises
     EwfPasswordRequiredError, and with one that does not open it
     EwfWrongPasswordError. An encrypted AFF opens with its passphrase as
-    ``password``, or with ``private_key`` (a path, or the bytes, of an unencrypted
-    PEM or DER RSA key) when it is sealed to a certificate."""
+    ``password``. An AFF, Apple disk image or AD-encrypted set sealed to a
+    certificate opens with ``private_key`` (a path, or the bytes, of an unencrypted
+    PEM or DER RSA key); without it the error's ``needs`` is "private key"."""
     return EwfImage(path, segments=segments, password=password, private_key=private_key)
 
 
@@ -7456,8 +7506,9 @@ def main(argv=None):
                             "variable NAME. "
                             "Without either, ewfprobe asks for it at a terminal")
         s.add_argument("--private-key", metavar="FILE", default=None,
-                       help="for an encrypted AFF or Apple disk image sealed to a "
-                            "certificate: the certificate's RSA private key, "
+                       help="for an encrypted AFF, Apple disk image or AD-encrypted "
+                            "set sealed to a certificate: the certificate's RSA "
+                            "private key, "
                             "unencrypted, as PEM or DER")
     args = ap.parse_args(argv)
     try:
