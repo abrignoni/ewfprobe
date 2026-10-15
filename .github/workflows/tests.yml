@@ -95,7 +95,13 @@ jobs:
           mkdir -p vmdk-reference
           curl -sSfL --retry 3 -o vmdk-reference/photon.ova \
             "https://packages.vmware.com/photon/2.0/GA/ova/photon-custom-hw11-2.0-304b817.ova"
-      - run: python -m pytest tests -q -rs
+      - name: Install a virtual display for the window test
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tk xvfb
+      - name: Run the tests (under a virtual display on Linux)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then xvfb-run -a python -m pytest tests -q -rs; else python -m pytest tests -q -rs; fi
         env:
           EWFPROBE_AFF4_REFERENCE: aff4-reference
           EWFPROBE_REQUIRE_AFF4_REFERENCE: "1"

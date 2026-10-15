@@ -35,7 +35,15 @@ ewfprobe, built as a standalone executable
                       certificate's RSA private key, unencrypted, as PEM
                       or DER).
 
-  SHA256SUMS.txt      the hash of the executable as built. Check it with
+  ewfprobe_gui        the same tool in a window (ewfprobe_gui.exe on Windows,
+                      ewfprobe_gui.app on macOS). Choose an image (or an image
+                      folder such as a .sparsebundle), give a password or
+                      private key if it is encrypted, then Info, Verify, List
+                      entries (L01 and AD1) or Export. A password typed there
+                      reaches the tool in its environment, not on its command
+                      line.
+
+  SHA256SUMS.txt      the hashes of the executables as built. Check them with
                           certutil -hashfile ewfprobe.exe SHA256     (Windows)
                           shasum -a 256 -c SHA256SUMS.txt            (macOS)
                           sha256sum -c SHA256SUMS.txt                (Linux)
