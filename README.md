@@ -64,6 +64,20 @@ An AFF, an Apple disk image or an AD-encrypted set sealed to a certificate opens
 instead with that certificate's RSA private key, given unencrypted, as PEM or DER,
 with `--private-key FILE`.
 
+## In a window
+
+```
+python3 ewfprobe_gui.py
+```
+
+`ewfprobe_gui.py` is an optional tkinter window over the same command line, standard
+library only. Choose an image file or folder, give a password or private key if it is
+encrypted, then **Info**, **Verify** (with a progress bar), **List entries** for an L01 or
+AD1, or **Export...** for the raw disk or, with an entry selected, that entry. The window
+runs `ewfprobe.py` and shows what it prints, so the results are the same either way. A
+password typed into the window reaches `ewfprobe.py` in an environment variable, not on
+its command line.
+
 ## What it reads
 
 Reads EWF-E01, which is what EnCase 6 and 7, FTK Imager and `ewfacquire` write,
@@ -842,7 +856,7 @@ tests.
 
 ## Standalone executables
 
-Each release carries `ewfprobe` built as a single executable with PyInstaller on
+Each release carries `ewfprobe` and its window `ewfprobe_gui` built as single executables with PyInstaller on
 Python 3.14, for Windows x64 and arm64, macOS on Apple silicon and Intel, and Linux x64
 and arm64, beside `ewfprobe.py` itself. The workflow that builds them
 (`.github/workflows/build-executables.yml`) runs each executable on the reference images
@@ -854,7 +868,9 @@ known answers taken from libewf. The executables do not include `pyliblzfse`, so
 refuse an LZFSE-compressed `.dmg`, naming the package, and the workflow checks that. They
 do include `pycryptodome`, and on every encrypted fixture the workflow requires the
 executable's output to match the source's, the export to match the disk `hdiutil`
-read back, and a wrong password to be refused the same way. The
+read back, and a wrong password to be refused the same way. The window re-enters itself
+with `--cli` to run the tool, and the workflow runs that same comparison through it and
+checks the window starts and stays up. The
 executables are not code signed; the README inside each archive says what Windows
 SmartScreen and macOS Gatekeeper will ask.
 

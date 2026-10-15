@@ -74,6 +74,10 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
               fh.write(f"version={version}\n")
 
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tk xvfb
+
       - name: Install PyInstaller and pycryptodome
         run: |
           python -m pip install --upgrade pip
@@ -85,11 +89,41 @@ jobs:
         working-directory: src
         run: pyinstaller --noconfirm --clean --onefile --console --name ewfprobe ewfprobe.py
 
+      - name: Build the window executable
+        working-directory: src
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name ewfprobe_gui --hidden-import ewfprobe ewfprobe_gui.py
+
       - name: Check the executable writes what the source writes
         shell: bash
         run: |
           ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
           python ci/tools/smoke_frozen.py src "src/dist/ewfprobe$ext"
+
+      - name: Check the window's --cli writes what the source writes
+        shell: bash
+        run: |
+          # the window starts the tool by re-entering itself with --cli; this runs the
+          # same comparison through exactly that call
+          ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          python ci/tools/smoke_frozen.py src "src/dist/ewfprobe_gui$ext" --cli
+
+      - name: Check the window starts and stays up
+        shell: python
+        run: |
+          import os, subprocess, sys, time
+          ext = ".exe" if os.name == "nt" else ""
+          cmd = [os.path.join("src", "dist", "ewfprobe_gui" + ext)]
+          if sys.platform.startswith("linux"):
+              cmd = ["xvfb-run", "-a"] + cmd
+          p = subprocess.Popen(cmd)
+          time.sleep(20)
+          alive = p.poll() is None
+          if alive:
+              p.terminate()
+          print("gui process alive after 20 s:", alive, "| exit code:", p.poll())
+          assert alive, "ewfprobe_gui exited early"
 
       - name: Package
         shell: bash
@@ -101,16 +135,17 @@ jobs:
           mkdir -p "pkg/$name"
           cp ci/packaging/README.txt src/LICENSE "pkg/$name/"
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cp src/dist/ewfprobe.exe "pkg/$name/"
-            (cd "pkg/$name" && sha256sum ewfprobe.exe > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            cp src/dist/ewfprobe.exe src/dist/ewfprobe_gui.exe "pkg/$name/"
+            (cd "pkg/$name" && sha256sum ewfprobe.exe ewfprobe_gui.exe > SHA256SUMS.txt && cat SHA256SUMS.txt)
             (cd pkg && 7z a -bd "../$name.zip" "$name" > /dev/null)
           elif [ "$RUNNER_OS" = "macOS" ]; then
             cp src/dist/ewfprobe "pkg/$name/"
-            (cd "pkg/$name" && shasum -a 256 ewfprobe > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            cp -R src/dist/ewfprobe_gui.app "pkg/$name/"
+            (cd "pkg/$name" && shasum -a 256 ewfprobe ewfprobe_gui.app/Contents/MacOS/ewfprobe_gui > SHA256SUMS.txt && cat SHA256SUMS.txt)
             (cd pkg && ditto -c -k --keepParent "$name" "../$name.zip")
           else
-            cp src/dist/ewfprobe "pkg/$name/"
-            (cd "pkg/$name" && sha256sum ewfprobe > SHA256SUMS.txt && cat SHA256SUMS.txt)
+            cp src/dist/ewfprobe src/dist/ewfprobe_gui "pkg/$name/"
+            (cd "pkg/$name" && sha256sum ewfprobe ewfprobe_gui > SHA256SUMS.txt && cat SHA256SUMS.txt)
             (cd pkg && tar -czf "../$name.tar.gz" "$name")
           fi
           ls -la "$name".*
@@ -149,9 +184,9 @@ jobs:
 
       - name: Checksums of the archives and the source file
         run: |
-          cp src/ewfprobe.py artifacts/
-          cd artifacts && sha256sum ewfprobe-* ewfprobe.py > SHA256SUMS.txt && cat SHA256SUMS.txt
-          test "$(wc -l < SHA256SUMS.txt)" -eq 7
+          cp src/ewfprobe.py src/ewfprobe_gui.py artifacts/
+          cd artifacts && sha256sum ewfprobe-* ewfprobe.py ewfprobe_gui.py > SHA256SUMS.txt && cat SHA256SUMS.txt
+          test "$(wc -l < SHA256SUMS.txt)" -eq 8
 
       - name: Create the release
         env:
