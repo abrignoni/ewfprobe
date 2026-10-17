@@ -226,3 +226,12 @@ def test_declared_sizes_are_bounded_before_any_output():
     # an undefined LZVN opcode
     with pytest.raises(ewfprobe.DecompressError, match="undefined LZVN opcode"):
         ewfprobe.lzvn_decompress(b"\x70" + b"\x06" + bytes(7), 100)
+
+
+def test_a_crlf_checkout_gives_the_same_pieces_and_digest():
+    """Git on Windows may check the file out with CRLF line endings; the shared
+    pieces and their digest must not depend on that."""
+    text = _source()
+    crlf = text.replace("\r\n", "\n").replace("\n", "\r\n")
+    assert shared_lzfse.pieces(crlf) == shared_lzfse.pieces(text)
+    assert shared_lzfse.digest(crlf) == SHARED_DIGEST

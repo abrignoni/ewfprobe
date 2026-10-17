@@ -49,7 +49,10 @@ def _piece(text, start_marker, last_def):
 
 
 def pieces(text):
-    """The two shared pieces of ``text``, as strings."""
+    """The two shared pieces of ``text``, as strings, with line endings read as
+    ``\n`` so a checkout with CRLF line endings (Git on Windows) gives the same
+    pieces and the same digest."""
+    text = text.replace("\r\n", "\n")
     return [text[slice(*_piece(text, *spec))] for spec in (FIRST, SECOND)]
 
 
