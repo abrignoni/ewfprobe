@@ -37,7 +37,7 @@ def _checksum(value):
 
 def write_udif(path, data, *, chunks=None, tables=None, segment=(1, 1), xml=True,
                trailer_sectors=None, mutate=None, relative=False, part_size=None,
-               ident=b"\x11" * 16, part_mutate=None):
+               ident=b"\x11" * 16, part_mutate=None, encode=None):
     """Write data as a UDIF image. ``tables`` is a list of block tables, each a
     list of (kind, sector count) chunks; the default is one table of zlib chunks of
     8 sectors. ``mutate`` may edit the list of entries before they are packed.
@@ -46,7 +46,9 @@ def write_udif(path, data, *, chunks=None, tables=None, segment=(1, 1), xml=True
     offsets relative to it, as hdiutil segment does. ``part_size`` splits the data
     fork into segments of that many bytes, the first in ``path`` and the rest in
     .dmgpart files beside it named as hdiutil names them; ``part_mutate(number,
-    trailer)`` may edit a segment's trailer (a bytearray) before it is written."""
+    trailer)`` may edit a segment's trailer (a bytearray) before it is written.
+    ``encode(kind, piece)``, when given, makes the stored bytes of every chunk that is
+    neither raw nor unstored, for chunk kinds and contents the writer cannot make."""
     sectors = len(data) // 512
     if tables is None:
         per = chunks or 8
@@ -62,6 +64,8 @@ def write_udif(path, data, *, chunks=None, tables=None, segment=(1, 1), xml=True
             piece = data[at * 512:(at + count) * 512]
             if kind == RAW:
                 blob = piece
+            elif encode and kind not in (ZERO, IGNORE):
+                blob = encode(kind, piece)
             elif kind == ZLIB:
                 blob = zlib.compress(piece)
             else:
@@ -283,15 +287,6 @@ def test_an_image_with_no_trailer_is_not_udif(tmp_path):
     path.write_bytes(_disk(8))
     assert ewfprobe.apple_image_kind(str(path)) is None
     assert not ewfprobe.is_image(str(path))
-
-
-def test_lzfse_without_its_package_is_refused_by_name(monkeypatch):
-    path = os.path.join(FIXTURES, "dmg-ulfo.dmg")
-    if not os.path.exists(path):
-        pytest.skip("reference fixtures absent")
-    monkeypatch.setattr(ewfprobe, "liblzfse", None)
-    with pytest.raises(ewfprobe.EwfFormatError, match="pyliblzfse"):
-        ewfprobe.open_ewf(path)
 
 
 def test_the_cli_describes_a_udif_image(tmp_path, capsys):

@@ -144,11 +144,11 @@ def test_a_missing_bevy_is_refused_rather_than_read_as_empty(tmp_path):
 def test_snappy_examples_from_its_format_description():
     # "xababab": the literal "xab", then a copy of 4 from 2 back (a 2-byte offset copy)
     stream = bytes([7, (3 - 1) << 2]) + b"xab" + bytes([((4 - 1) << 2) | 2, 2, 0])
-    assert ewfprobe._snappy_decompress(stream) == b"xababab"
+    assert ewfprobe._snappy_decompress(stream, 1 << 16) == b"xababab"
     # a 1-byte offset copy, and a literal whose length takes a following byte
     lit = bytes(range(70))
     stream = bytes([74, 60 << 2, 69]) + lit + bytes([((4 - 4) << 2) | 1, 70])
-    assert ewfprobe._snappy_decompress(stream) == lit + lit[:4]
+    assert ewfprobe._snappy_decompress(stream, 1 << 16) == lit + lit[:4]
 
 
 @pytest.mark.parametrize("bad", [
@@ -159,28 +159,28 @@ def test_snappy_examples_from_its_format_description():
 ])
 def test_snappy_refuses_what_its_format_rules_out(bad):
     with pytest.raises(ewfprobe.EwfFormatError):
-        ewfprobe._snappy_decompress(bad)
+        ewfprobe._snappy_decompress(bad, 1 << 16)
 
 
 def test_lz4_examples_from_its_block_format():
     # "abcd" then a match of 8 from 4 back, then 5 closing literals
     block = bytes([0x44]) + b"abcd" + bytes([4, 0]) + bytes([0x50]) + b"vwxyz"
-    assert ewfprobe._lz4_block_decompress(block) == b"abcd" + b"abcdabcd" + b"vwxyz"
+    assert ewfprobe._lz4_block_decompress(block, 1 << 16) == b"abcd" + b"abcdabcd" + b"vwxyz"
     # a literal length of 48: 15 in the token, then 33
     block = bytes([0xF0, 33]) + bytes(range(48))
-    assert ewfprobe._lz4_block_decompress(block) == bytes(range(48))
+    assert ewfprobe._lz4_block_decompress(block, 1 << 16) == bytes(range(48))
     with pytest.raises(ewfprobe.EwfFormatError):
-        ewfprobe._lz4_block_decompress(bytes([0x14]) + b"a" + bytes([0, 0]))   # offset 0
+        ewfprobe._lz4_block_decompress(bytes([0x14]) + b"a" + bytes([0, 0]), 1 << 16)   # offset 0
 
 
 def test_inflate_takes_a_zlib_stream_a_raw_one_and_ignores_what_follows():
     data = b"deflate me " * 400
     raw = zlib.compressobj(9, zlib.DEFLATED, -15)
     raw = raw.compress(data) + raw.flush()
-    assert ewfprobe._aff4_inflate(zlib.compress(data) + bytes(17)) == data
-    assert ewfprobe._aff4_inflate(raw) == data
+    assert ewfprobe._aff4_inflate(zlib.compress(data) + bytes(17), 1 << 16) == data
+    assert ewfprobe._aff4_inflate(raw, 1 << 16) == data
     with pytest.raises(ewfprobe.EwfFormatError):
-        ewfprobe._aff4_inflate(b"\x00\x01not deflate at all")
+        ewfprobe._aff4_inflate(b"\x00\x01not deflate at all", 1 << 16)
 
 
 def test_turtle_reads_what_the_writers_produce():

@@ -40,30 +40,14 @@ def _manifest():
         return json.load(fh)
 
 
-# A job that installs pyliblzfse sets this, so the LZFSE fixture has to run there
-# rather than skip unseen.
-_LZFSE_REQUIRED = bool(os.environ.get("EWFPROBE_REQUIRE_LZFSE"))
-
-
 def _variants():
     man = _manifest()
-    out = []
-    for name, v in sorted(man["variants"].items()):
-        missing = v.get("needs") == "liblzfse" and ewfprobe.liblzfse is None
-        marks = ([pytest.mark.skip(reason="LZFSE needs the optional pyliblzfse package")]
-                 if missing and not _LZFSE_REQUIRED else [])
-        out.append(pytest.param(name, v, marks=marks, id=name))
-    return out
+    return [pytest.param(name, v, id=name) for name, v in sorted(man["variants"].items())]
 
 
 def _readable():
     """The variants this Python can read, as (name, variant) pairs."""
     return [p.values for p in _variants() if not p.marks]
-
-
-def test_the_lzfse_fixture_runs_where_it_is_required():
-    if _LZFSE_REQUIRED:
-        assert ewfprobe.liblzfse is not None, "EWFPROBE_REQUIRE_LZFSE is set and pyliblzfse is not installed"
 
 
 def _first(variant):
@@ -372,10 +356,7 @@ def test_apple_disk_images_read_as_hdiutil_wrote_them():
         assert all(c["match"] for c in checks), (name, [c for c in checks if not c["match"]])
         expected = "MD5" if fmt == "UFBI" else "CRC32"
         assert {c["algorithm"] for c in checks} == {expected}, name
-    expected_formats = set(codecs) | {"UDSP", "UDSB"}
-    if ewfprobe.liblzfse is None and not _LZFSE_REQUIRED:
-        expected_formats.discard("ULFO")
-    assert seen == expected_formats
+    assert seen == set(codecs) | {"UDSP", "UDSB"}
 
 
 def test_segmented_images_hdiutil_wrote_from_a_gpt_disk():
