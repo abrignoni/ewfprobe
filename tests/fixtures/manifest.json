@@ -252,8 +252,7 @@
         "dmg-ulfo.dmg"
       ],
       "writer": "hdiutil, macOS 26.6.2",
-      "stores_no_hash": true,
-      "needs": "liblzfse"
+      "stores_no_hash": true
     },
     "dmg-udco": {
       "format": "udif",

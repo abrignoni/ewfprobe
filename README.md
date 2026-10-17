@@ -2,9 +2,8 @@
 
 A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`), AFF (`.aff`, `.afd`) and AFF4 (`.aff4`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.sparsebundle`), virtual machine disks (`.vhd`, `.vhdx`, `.vmdk`, `.qcow2`), and logical evidence, EnCase's (`.L01`) and FTK Imager's (`.ad1`). One file, pure
 Python, standard library only. No compiler, no network, nothing to install (an
-LZFSE-compressed `.dmg` needs the optional `pyliblzfse` package, and an encrypted Apple
-disk image or an acquisition FTK Imager encrypted with AD encryption the optional
-`pycryptodome` package).
+encrypted Apple disk image or an acquisition FTK Imager encrypted with AD encryption
+needs the optional `pycryptodome` package).
 
 It opens an acquisition, joins its segments, and presents the acquired disk as
 an ordinary seekable file object, so anything that can read a raw image can read
@@ -54,6 +53,25 @@ ewfprobe verify  --private-key examiner.pem sealed.aff  # AFF sealed to a certif
 
 `verify` exits non-zero when the recomputed hash does not match the one the
 acquisition recorded.
+
+Some damage is read rather than refused, as earlier versions read it: an E01, SMART or
+Ex01 chunk whose zlib stream is cut or gives fewer bytes than the chunk covers, a stored
+(uncompressed) E01 or SMART chunk cut by the end of its segment file, a VMDK grain or a
+QCOW cluster whose stream gives fewer bytes than it covers. Zeros are read where its
+data ran out. That is no longer silent. Each such chunk, grain or cluster is listed
+once in the image object's `padded_chunks`, in disk order, as a dict: `unit`
+(`chunk`, `grain` or `cluster`), `index`, `offset` (the byte of the disk where it
+starts), `length` (the bytes of the disk it covers), `decoded` (the bytes its data
+gave), `zeros` (the zeros read after them), `cut` (its stream stopped before its end
+marker) and, for a VMDK, `file`. It lists what has been read so far, so a caller that
+reads part of the disk, as a filesystem walker does, sees the damage in what it read,
+and `verify()` and `ewfprobe verify`, which read every chunk, list all of it; `info()`
+carries the same list. The last chunk of an E01 whose disk is not a whole number of
+chunks covers only the bytes up to the end of the disk and is not listed for being
+shorter than a chunk. The bytes read are unchanged: on the damaged E01, VMDK and QCOW
+images `tests/test_padded_chunks.py` builds, ewfprobe 0.13.0 read the same bytes, by
+SHA-256, and so it did on the 37 committed virtual disks it reads (the LUKS-encrypted
+QCOW is refused by both) and the 28 reference fixtures the manifest lists as variants.
 
 An encrypted image (an Apple disk image, an acquisition FTK Imager wrote with AD
 encryption, or an encrypted AFF) needs its password. `--password-file FILE` reads it
@@ -323,7 +341,7 @@ method writes a zip instead.
 | UDBZ | bzip2 | the standard library |
 | ULMO | LZMA | the standard library |
 | UDCO | ADC | this file (ADC is short and documented) |
-| ULFO | LZFSE | the optional `pyliblzfse` package; without it the image is refused, saying so |
+| ULFO | LZFSE, whose streams may hold LZVN blocks | this file (the decoder qnxprobe carries; see below) |
 | UDRO, UFBI | stored, not compressed | this file |
 | UDSP (`.sparseimage`) | 1 MiB bands, stored in the order they were written | this file |
 | UDSB (`.sparsebundle`) | a folder of band files, 8 MiB by default | this file |
@@ -333,6 +351,68 @@ A UDIF image is recognised by the 512-byte `koly` trailer at the end of the file
 by its name. An uncompressed read-write image (UDRW) and a `.cdr` have no trailer:
 they are the disk's bytes as they are and read as a raw image, so they need no
 reader. Runs of the disk that were never written are not stored and read as zeros.
+
+LZFSE is not in the standard library, so `ewfprobe.py` carries a pure-Python LZFSE
+and LZVN decoder. It is the one
+[qnxprobe](https://github.com/abrignoni/qnxprobe) carries for macOS file compression,
+copied from [qnxprobe v1.74 (`dffd27a`)](https://github.com/abrignoni/qnxprobe/blob/dffd27ab242c16100b40114f248e816fb302cc52/qnxprobe.py),
+written there from Apple's reference implementation,
+[lzfse/lzfse at `e634ca5`](https://github.com/lzfse/lzfse/tree/e634ca58b4821d9f3d560cdc6df5dec02ffc93fd)
+(BSD-3-Clause), by reading the C rather than translating it, with each rule cited by
+file and line. qnxprobe is where it is maintained: the two copies are byte-identical,
+`tools/shared_lzfse.py` compares them and copies a fix across, and a test pins this
+copy so that editing it here alone fails. UDIF has no LZVN chunk type (the chunk types
+are listed in libmodi's *Mac OS disk image types*, lines 367 to 373 at `8fc5088`), but
+an LZFSE stream may hold LZVN blocks, and the ULFO images measured here do: `hdiutil`
+gave 7 of the 64 LZFSE chunks of two small test images an LZVN block, and 3 of the
+16,886 chunks of a 22 GB one.
+
+The decoder is stricter than the reference. A stream must end with its end marker,
+each block must decode to exactly the bytes its header gives, no match may reach
+before the first byte, and a chunk may not decode to more than its block table says,
+which is checked before a block is decoded. A chunk that fails any of these is
+refused, naming its sector, and is never read as zeros or as a short chunk. It is
+slower than C: about 8 MiB of output a second on an Apple M2 Max, against about
+340 MiB for the reference implementation, so an image of mostly compressed data takes
+two to three minutes per gigabyte (the 22 GB image below, 16.4 GiB of it in LZFSE
+chunks, took 37 minutes to read whole).
+
+The other codecs are bounded the same way. A zlib, bzip2 or LZMA chunk of a `.dmg` is
+decompressed into at most one byte more than its block table gives it, and a chunk
+that decodes to more or less, stops before its own end, or (bzip2 and LZMA) has bytes
+after it, is refused, naming its sector. That includes a bzip2 or LZMA chunk holding
+two streams one after the other, which the standard library's one-shot functions
+decoded and joined; `hdiutil` does not write one. The same cap holds for an E01 or Ex01 chunk,
+an AFF page, an AD1 chunk, an AFF4 chunk (zlib, deflate, Snappy and LZ4, whose
+literals and copies are checked before they are made), a VMDK grain and a QCOW
+cluster, each at the size its container gives it, and for an EWF metadata section at
+16 MiB. An LZMA decoder may use at most 256 MiB, whatever dictionary its stream's
+header asks for. `tests/test_decompression_bounds.py` builds zlib, bzip2, LZMA,
+deflate, Snappy and LZ4 bombs of up to 16 MiB and checks each is refused (the `.dmg`,
+E01 and AFF ones through the reader) and, for the 16 MiB `.dmg` bombs and the LZ4 one,
+that refusing it allocated under 2 MiB.
+
+Earlier versions read LZFSE through the optional `pyliblzfse` package, the reference
+implementation's Python binding. It is no longer used, even when it is installed. On
+the undamaged chunks measured it gives the same bytes. On damaged chunks the two
+differ, and this was measured with every single-bit flip in the first 64 bytes of
+chunks of three ULFO images (the committed fixture and the two test images below).
+In every case where both returned a chunk, it was the same bytes, and this decoder
+never returned a chunk where `pyliblzfse` refused one. The other way round,
+`pyliblzfse` sometimes returned a chunk of the right size with wrong bytes where this
+decoder refuses, and this decoder also refuses some damaged chunks `pyliblzfse`
+decodes correctly; that refusal names the chunk and is never silent. As one example,
+the first three LZFSE chunks of at least 64 stored bytes in `tests/fixtures/dmg-ulfo.dmg`
+(41,755, 66,937 and 759 bytes) give 1,536 flips: 13 where `pyliblzfse` gave wrong bytes
+and this decoder refuses, 97 where it gave the right bytes and this decoder refuses,
+83 where both gave the same wrong bytes, 100 where both gave the right bytes, and
+1,243 where both refuse (counting a chunk of the wrong size as refused, as the reader
+does). The counts change with the image and the chunks chosen. Which bytes are
+reported must not depend on which packages are installed, so there is one path.
+Neither decoder can catch every change, since LZFSE carries no checksum. That is what
+the image's own checksums are for: a bit flipped in one chunk's payload of the ULFO
+fixture, which still decoded, failed `verify` on the data fork's checksum and on its
+block table's.
 
 `verify` also checks what a UDIF image records about itself: the checksum of its
 stored data, each block table's checksum, and the master checksum over the
@@ -833,6 +913,22 @@ offsets. The private sample above, converted by `hdiutil` into a sparse bundle a
 split by `hdiutil segment` into 2 GB parts, read to the same SHA-256 across the whole
 disk in both forms as the original `.dmg` does.
 
+**LZFSE, against `hdiutil attach` and the files it was made from.** With no LZFSE
+package installed, on Python 3.14 and on macOS's own Python 3.9, ULFO images
+`hdiutil` wrote on macOS 27.0.1 from a known folder of 205 files (random bytes, text,
+zeros, empty and one-byte files, 200 small files), one HFS+ and one APFS, read through
+qnxprobe's extraction to the SHA-256 of every source file, as UDZO and ULMO images of
+the same folder did. Copies of those two images and of the committed ULFO fixture,
+attached read-only with no mount, matched the raw device run by run and across the whole disk.
+A public image from the corpus (`evidencelocker_macos14`, a 22 GB raw GPT disk) was
+converted by `hdiutil convert -format ULFO` from a copy whose SHA-256 matched the
+registry. Its 16,886 LZFSE chunks read to the same 22,000,000,000 bytes, by SHA-256,
+as the image attached read-only, and every LZFSE chunk also matched the bytes at the
+same place in the raw source. The rest of the disk is 163 runs of free space between
+partitions, which `hdiutil convert` does not store: both read them as zeros, and 161 of
+them held data in the source, so the converted disk is not the source disk.
+`pyliblzfse` decoded every one of those chunks to the same bytes as well.
+
 **AFF4, against the reference images and two other writers.** The ten AFF4 reference
 images ([aff4/ReferenceImages](https://github.com/aff4/ReferenceImages) at `84773b0`:
 Evimetry 2.x and 3.x, standard and pre-standard, allocated blocks only, with a read
@@ -864,9 +960,8 @@ in `tests/fixtures`. It requires `info`, `verify` and `export` to write the same
 `python ewfprobe.py`, the export to match the source disk's SHA-256, and a set missing a
 segment to be refused, before it is packaged with `SHA256SUMS.txt` and a README. On the
 L01 it also requires `files` and `export --entry` to match, and the exports to match the
-known answers taken from libewf. The executables do not include `pyliblzfse`, so they
-refuse an LZFSE-compressed `.dmg`, naming the package, and the workflow checks that. They
-do include `pycryptodome`, and on every encrypted fixture the workflow requires the
+known answers taken from libewf. The ULFO fixture is among the reference images, so
+the same comparison covers LZFSE. They do include `pycryptodome`, and on every encrypted fixture the workflow requires the
 executable's output to match the source's, the export to match the disk `hdiutil`
 read back, and a wrong password to be refused the same way. The window re-enters itself
 with `--cli` to run the tool, and the workflow runs that same comparison through it and
@@ -879,6 +974,22 @@ SmartScreen and macOS Gatekeeper will ask.
 ```
 python -m pytest tests -q
 ```
+
+The LZFSE decoder is qnxprobe's, so it is checked against qnxprobe rather than
+changed here. `tests/test_lzfse.py` pins its SHA-256 and, with `EWFPROBE_QNXPROBE`
+naming a `qnxprobe.py`, compares the two copies. A fix made in qnxprobe is copied with:
+
+```
+python tools/shared_lzfse.py check ewfprobe.py /path/to/qnxprobe.py
+python tools/shared_lzfse.py sync /path/to/qnxprobe.py ewfprobe.py
+python tools/shared_lzfse.py digest ewfprobe.py    # the new value for the test
+```
+
+Its test streams, `tests/fixtures/lzfse-streams.json`, are qnxprobe's
+[`tests/fixtures/decmpfs-streams.json`](https://github.com/abrignoni/qnxprobe/blob/dffd27ab242c16100b40114f248e816fb302cc52/tests/fixtures/decmpfs-streams.json) at
+v1.74 (`dffd27a`), byte for byte, written by its `tools/make_decmpfs_streams.py`: Apple's libcompression encoded each one and
+decoded it back before it was kept, and between them they hold every LZFSE block kind
+(raw, LZVN, and the v1 and v2 compressed blocks) and two plain LZVN streams.
 
 The reference fixtures are regenerated with:
 
@@ -899,9 +1010,7 @@ The Apple disk image variants (`dmg-*`) are written by `hdiutil`, so on macOS on
 `--add dmg-gpt` rebuilds the segmented images of a small GPT disk, which carry the
 block-table base offsets the unpartitioned source cannot.
 `--add dmg-encrypted` rebuilds the encrypted images, attaching each with `hdiutil`
-before keeping it. The LZFSE one is skipped where `pyliblzfse` is not installed; set
-`EWFPROBE_REQUIRE_LZFSE=1` to make that a failure instead, as the CI jobs that
-install it do. The encrypted ones are skipped where neither `pycryptodome` nor
+before keeping it. The encrypted ones are skipped where neither `pycryptodome` nor
 `pycryptodomex` is installed; `EWFPROBE_REQUIRE_CRYPTO=1` makes that a failure. CI runs
 most jobs with `pycryptodome`, one with `pycryptodomex`, and one with neither, where
 the refusal that names the package is what runs.

@@ -20,10 +20,7 @@ ewfprobe, built as a standalone executable
                       FTK Imager .ad1. For a split
                       set, keep every segment (.E01, .E02, ..., .ad1, .ad2,
                       ..., a .dmg and its .dmgpart files, or the files of a
-                      striped .aff4) in one folder and name the first. Name a .sparsebundle folder itself. An
-                      LZFSE-compressed .dmg needs the Python package
-                      pyliblzfse, which this executable does not include;
-                      run python3 ewfprobe.py with it installed.
+                      striped .aff4) in one folder and name the first. Name a .sparsebundle folder itself.
                       An encrypted .dmg, .sparseimage or .sparsebundle, and
                       an E01, SMART, raw or .ad1 set FTK Imager encrypted
                       with AD encryption, opens with its password: ewfprobe asks for it, or give it

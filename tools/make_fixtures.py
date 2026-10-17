@@ -101,8 +101,7 @@ HDIUTIL = os.environ.get("HDIUTIL", "hdiutil")
 # Apple disk image variants, written by hdiutil (so macOS only) from the same
 # source. Between them they cover every chunk codec a UDIF image can use, stored
 # chunks with and without compression, a sparse image, a sparse bundle, and the
-# UDZO image split by hdiutil segment into .dmgpart files. ULFO needs the optional
-# pyliblzfse package to read, and the tests skip it where that is absent.
+# UDZO image split by hdiutil segment into .dmgpart files.
 DMG_VARIANTS = [
     # name,              hdiutil format
     ("dmg-udzo",         "UDZO"),        # zlib
@@ -935,8 +934,6 @@ def main(argv):
             manifest["variants"][name]["hdiutil_segment_size"] = segment
         if image != made[0]:
             manifest["variants"][name]["image"] = image
-        if fmt == "ULFO":
-            manifest["variants"][name]["needs"] = "liblzfse"
         size = sum(os.path.getsize(os.path.join(out, f)) for f in made)
         print(f"  {name:<20} {fmt:<9} {size:>10,} bytes")
 
