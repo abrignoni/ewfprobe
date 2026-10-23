@@ -3953,6 +3953,9 @@ class EwfImage:
         # how many of them read() has handed out; see padded_zeros_read.
         self._padded_zeros: list[tuple[int, int]] = []
         self._padded_zeros_read = 0
+        # E01/L01 chunk tables that failed their Adler-32, and whether the table2
+        # copy was read in their place; see _add_table.
+        self.table_errors: list[dict] = []
         self.chunk_size = 0
         self.media_size = 0
         self.size = 0
@@ -4097,12 +4100,20 @@ class EwfImage:
             size_on_disk = (os.path.getsize(path) if self.encryption is None
                             else self._content_size(path))
             expect_segment = i + 1
+            # A table is indexed once the section after it is known: a table2
+            # there is its copy, read only when the table fails a checksum.
+            pending = None
             for segno, name, offset, size, _next in _sections(fh, path):
                 if segno != expect_segment:
                     raise EwfFormatError(
                         f"{os.path.basename(path)} says it is segment {segno}, "
                         f"but it sits at position {expect_segment} of the set")
                 last_name = name
+                if pending is not None:
+                    copy = (self._read_table(fh, name, offset, size)
+                            if name == "table2" and pending["failed"] else None)
+                    chunks += self._add_table(i, pending, chunks, size_on_disk, copy)
+                    pending = None
                 if name in ("header", "header2") and not self.metadata:
                     fh.seek(offset)
                     raw = _inflate(_read_exactly(fh, size), _SECTION_TEXT_MAX)
@@ -4116,13 +4127,15 @@ class EwfImage:
                     self._parse_volume(_read_exactly(fh, min(size, 1052)))
                     volume_seen = True
                 elif name == "table":
-                    chunks += self._parse_table(fh, i, offset, size, chunks, size_on_disk)
+                    pending = self._read_table(fh, name, offset, size)
                 elif name in ("hash", "digest"):
                     fh.seek(offset)
                     self._parse_hashes(name, _read_exactly(fh, size))
                 elif name == "ltree" and logical and self.logical_root is None:
                     fh.seek(offset)
                     self._parse_ltree(_read_exactly(fh, size))
+            if pending is not None:
+                chunks += self._add_table(i, pending, chunks, size_on_disk)
 
             if last_name == "next" and i == len(self.paths) - 1:
                 raise EwfIncompleteSetError(
@@ -7316,21 +7329,59 @@ class EwfImage:
         self.sector_size = bytes_per_sector
         self.sector_count = sector_count
 
-    def _parse_table(self, fh, segment_index, offset, size, first_chunk, size_on_disk):
+    def _read_table(self, fh, name, offset, size):
+        """One table or table2 section: its count, base offset and raw entries, and
+        which of its checksums failed ("header", "entries" or None).
+
+        The header's Adler-32 covers its first 20 bytes in every writer measured
+        (EnCase 1 to 7, FTK, Linen, EWFX, SMART, as libewf and the fixtures write
+        them). The entries' own Adler-32 follows them in a section that holds
+        nothing else; in one that goes on with chunk data (EnCase 1, libewf's
+        "ewf", SMART) the bytes after the entries are not one, so it is not read."""
         fh.seek(offset)
         header = _read_exactly(fh, TABLE_HEADER_SIZE)
-        count, _pad1, base, _pad2, _checksum = _TABLE_HEADER.unpack(header)
+        count, _pad1, base, _pad2, checksum = _TABLE_HEADER.unpack(header)
         if self.format == FORMAT_S01:
             # The original table header is a count and 16 bytes of padding, with
             # no base offset: the entries count from the start of the file.
             base = 0
-        if count == 0:
+        failed = None if zlib.adler32(header[:20]) == checksum else "header"
+        if failed and count * 4 > size - TABLE_HEADER_SIZE:
+            # a damaged count that runs past its own section: nothing to read
+            return {"name": name, "offset": offset, "count": count, "base": base,
+                    "raw": None, "failed": failed}
+        raw = _read_exactly(fh, count * 4) if count else b""
+        if failed is None and count and size == TABLE_HEADER_SIZE + count * 4 + 4:
+            if struct.unpack("<I", _read_exactly(fh, 4))[0] != zlib.adler32(raw):
+                failed = "entries"
+        return {"name": name, "offset": offset, "count": count, "base": base, "raw": raw,
+                "failed": failed}
+
+    def _add_table(self, segment_index, table, first_chunk, size_on_disk, copy=None):
+        """Index one segment's chunk table, from its table2 ``copy`` when the table
+        fails a checksum and the copy passes. A failure is recorded in
+        ``table_errors`` either way. Returns the chunks it covers."""
+        used = table
+        if table["failed"]:
+            good = copy is not None and copy["failed"] is None
+            if good:
+                used = copy
+            self.table_errors.append({
+                "file": os.path.basename(self.paths[segment_index]),
+                "section": table["name"], "offset": table["offset"],
+                "failed": table["failed"],
+                "used": "table2" if good else "table as stored"})
+            if used["raw"] is None:
+                raise EwfFormatError(
+                    f"{os.path.basename(self.paths[segment_index])}: its chunk table "
+                    f"fails its checksum, counts {used['count']:,} entries, more than "
+                    f"its section holds, and has no table2 copy that passes")
+        if used["count"] == 0:
             return 0
-        raw = _read_exactly(fh, count * 4)
-        table = _Table(segment_index, base, raw, first_chunk, size_on_disk)
         self._table_starts.append(first_chunk)
-        self._tables.append(table)
-        return count
+        self._tables.append(_Table(segment_index, used["base"], used["raw"], first_chunk,
+                                   size_on_disk))
+        return used["count"]
 
     def _parse_hashes(self, name, data):
         if name == "hash" and len(data) >= 16:
@@ -7667,6 +7718,7 @@ class EwfImage:
             "match": match,
             "bytes": done,
             "checksum_errors": list(self.checksum_errors),
+            "table_errors": [dict(e) for e in self.table_errors],
             "padded_chunks": self.padded_chunks,
             "missing_page_count": self.missing_page_count,
             "missing_page_ranges": list(self.missing_page_ranges),
@@ -7682,6 +7734,7 @@ class EwfImage:
         return {
             # only what has been read so far; verify() reads every chunk
             "padded_chunks": self.padded_chunks,
+            "table_errors": [dict(e) for e in self.table_errors],
             "segments": [os.path.basename(p) for p in self.paths],
             "segment_count": len(self.paths),
             "format": self.format,
@@ -8054,6 +8107,15 @@ def _cmd_verify(args):
                 print(f"{name:<6}{value}   DOES NOT MATCH stored {stored}")
         if result["checksum_errors"]:
             print(f"chunk checksum mismatches: {len(result['checksum_errors'])}")
+        tables = result["table_errors"]
+        if tables:
+            print(f"chunk tables that fail their checksum: {len(tables):,}")
+            for t in tables[:5]:
+                how = ("read from its table2 copy" if t["used"] == "table2" else
+                       "read as stored: no table2 copy passes")
+                print(f"  {t['file']} at byte {t['offset']:,} ({t['failed']}): {how}")
+            if len(tables) > 5:
+                print(f"  and {len(tables) - 5:,} more")
         padded = result["padded_chunks"]
         if padded:
             zeros = sum(p["zeros"] for p in padded)

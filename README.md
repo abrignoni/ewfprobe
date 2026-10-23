@@ -81,6 +81,19 @@ and after each file and know whether that file holds such zeros. A differencing 
 (a QCOW with a backing file, a VHD, VHDX or VMDK child) counts what it read from its
 parent too.
 
+An E01 or L01 segment written since EnCase 2 carries its chunk table twice, as
+`table` and `table2`, each with an Adler-32 over its header and another over its
+entries. A table that fails either is read from its `table2` copy when that copy
+passes, as libewf does; earlier versions read the damaged table, so one bad entry
+pointed a chunk at another chunk's data with no error. Each failure is listed in
+`table_errors` (`file`, `section`, `offset`, `failed`: `header` or `entries`, and
+`used`: `table2` or `table as stored` when no copy passes), and by `verify()`,
+`info()` and `ewfprobe verify`. The header's checksum is checked in every format;
+the entries' only where the section holds nothing after them, since EnCase 1,
+libewf's `ewf` format and SMART go on with chunk data there. On the libewf writer's
+14 formats and every committed EWF fixture no table fails, and the bytes read are
+the ones `ewfexport` writes.
+
 An encrypted image (an Apple disk image, an acquisition FTK Imager wrote with AD
 encryption, or an encrypted AFF) needs its password. `--password-file FILE` reads it
 from the first line of a file and `--password-env NAME` from an environment
