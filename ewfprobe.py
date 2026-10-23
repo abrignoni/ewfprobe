@@ -112,7 +112,7 @@ try:
 except ImportError:
     lzma = None
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 # ---------------------------------------------------------------- constants
 
@@ -3944,6 +3944,10 @@ class EwfImage:
         # Chunks, grains and clusters read with zeros put where their data ran out,
         # keyed by (unit, index); see padded_chunks and _note_padded.
         self._padded: dict[tuple[str, int], dict] = {}
+        # Where on the disk those zeros sit, as sorted (start, end) byte ranges, and
+        # how many of them read() has handed out; see padded_zeros_read.
+        self._padded_zeros: list[tuple[int, int]] = []
+        self._padded_zeros_read = 0
         self.chunk_size = 0
         self.media_size = 0
         self.size = 0
@@ -7437,7 +7441,15 @@ class EwfImage:
         """Record a chunk, grain or cluster whose data ran out before the bytes it
         covers did, or whose compressed stream stopped before its end marker. It is
         still read as before, with zeros where its data ran out; this only makes
-        that visible. Recorded once per unit, however often it is read."""
+        that visible. Recorded once per unit, however often it is read.
+
+        The zeros' place on the disk is kept apart, by offset rather than by
+        ``(unit, index)``, for padded_zeros_read."""
+        span = (offset + decoded, offset + covers)
+        if span[1] > span[0]:
+            at = bisect.bisect_left(self._padded_zeros, span)
+            if at == len(self._padded_zeros) or self._padded_zeros[at] != span:
+                self._padded_zeros.insert(at, span)
         key = (unit, index)
         if key not in self._padded:
             entry = {"unit": unit, "index": index, "offset": offset, "length": covers,
@@ -7461,6 +7473,27 @@ class EwfImage:
         Only the units read are known: ``verify()`` reads them all."""
         return sorted((dict(v) for v in self._padded.values()),
                       key=lambda e: (e["offset"], e["unit"], e["index"]))
+
+    @property
+    def padded_zeros_read(self):
+        """The bytes read() has handed out that are zeros put where a unit's data
+        ran out, counted on every read, a unit read again from a cache included,
+        where ``padded_chunks`` lists each unit once. A caller that reads a file out
+        of the disk can take the count before and after and know, per file, whether
+        what it read holds such zeros. A differencing disk's count includes what it
+        read from its parent."""
+        return self._padded_zeros_read + getattr(self.parent, "padded_zeros_read", 0)
+
+    def _count_padded_zeros(self, start, end):
+        """Add the bytes of [start, end) that are zeros put where a unit's data ran
+        out to padded_zeros_read."""
+        zeros = self._padded_zeros
+        at = max(bisect.bisect_right(zeros, (start, float("inf"))) - 1, 0)
+        while at < len(zeros) and zeros[at][0] < end:
+            low, high = max(start, zeros[at][0]), min(end, zeros[at][1])
+            if high > low:
+                self._padded_zeros_read += high - low
+            at += 1
 
     def _keep(self, n, data, want):
         """Fit a decoded chunk to the size it covers and cache it."""
@@ -7520,6 +7553,9 @@ class EwfImage:
                          else chunk)
             pos += take
             n -= take
+        if self._padded_zeros:
+            # after the reads, so a unit first decoded by this read is counted too
+            self._count_padded_zeros(self._pos, pos)
         self._pos = pos
         return b"".join(parts)
 

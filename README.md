@@ -73,6 +73,14 @@ images `tests/test_padded_chunks.py` builds, ewfprobe 0.13.0 read the same bytes
 SHA-256, and so it did on the 37 committed virtual disks it reads (the LUKS-encrypted
 QCOW is refused by both) and the 28 reference fixtures the manifest lists as variants.
 
+`padded_chunks` lists a unit once, so it cannot say which later reads handed out the
+same zeros again. `padded_zeros_read` can: it counts the zeros `read()` hands out
+where a unit's data ran out, on every read, a unit served again from the cache
+included. A caller that reads one file at a time out of the disk can take it before
+and after each file and know whether that file holds such zeros. A differencing disk
+(a QCOW with a backing file, a VHD, VHDX or VMDK child) counts what it read from its
+parent too.
+
 An encrypted image (an Apple disk image, an acquisition FTK Imager wrote with AD
 encryption, or an encrypted AFF) needs its password. `--password-file FILE` reads it
 from the first line of a file and `--password-env NAME` from an environment
