@@ -495,6 +495,34 @@ def test_zstd_clusters_without_a_decompressor_are_refused(tmp_path, monkeypatch)
         ewfprobe.open_ewf(path)
 
 
+def _zstandard_only(monkeypatch):
+    """Hide the standard library's and backports.zstd's decoders, so ewfprobe falls
+    back to the zstandard package; skip when that package is not installed."""
+    pytest.importorskip("zstandard")
+    monkeypatch.setitem(sys.modules, "compression.zstd", None)
+    monkeypatch.setitem(sys.modules, "backports.zstd", None)
+
+
+def test_the_zstandard_fallback_stops_at_the_end_of_a_frame(monkeypatch):
+    # qemu packs compressed clusters end to end, so the bytes handed over for one
+    # cluster can hold the start of the next cluster's frame after its own
+    _zstandard_only(monkeypatch)
+    import zstandard
+    decode = ewfprobe._zstd_decompressor()
+    first = bytes(range(256)) * 256
+    blob = (zstandard.ZstdCompressor().compress(first)
+            + zstandard.ZstdCompressor().compress(b"next" * 16384)[:64])
+    assert decode(blob, len(first) + 1) == first
+    assert decode(blob, 1000) == first[:1000]                # still bounded
+
+
+def test_a_zstd_qcow_reads_with_the_zstandard_fallback(tmp_path, monkeypatch):
+    _zstandard_only(monkeypatch)
+    case = BY_NAME["qemu-qcow2-zstd"]
+    with ewfprobe.open_ewf(_unpack(case, str(tmp_path))) as img:
+        assert _digest(img) == case["sha256"]
+
+
 def test_a_qcow_needs_its_backing_file_and_its_data_file(tmp_path):
     for name, gone in (("qemu-qcow2-overlay", "qcow2-base.qcow2"),
                        ("qemu-qcow2-extdata", "qcow2-extdata.data")):

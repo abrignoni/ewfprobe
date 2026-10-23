@@ -3813,13 +3813,18 @@ def _zstd_decompressor():
         return None
 
     def bounded(blob, most):
-        reader = zstandard.ZstdDecompressor().stream_reader(blob)
+        # One frame, as the other two decode: the reader goes on into a frame that
+        # follows (the start of the next QCOW cluster, packed after this one) unless
+        # told not to, and even then a second read starts the next frame, so a read
+        # that comes back short ends it.
+        reader = zstandard.ZstdDecompressor().stream_reader(blob, read_across_frames=False)
         out = bytearray()
         while len(out) < most:
-            piece = reader.read(most - len(out))
-            if not piece:
-                break
+            want = most - len(out)
+            piece = reader.read(want)
             out += piece
+            if len(piece) < want:
+                break
         return bytes(out)
     return bounded
 
