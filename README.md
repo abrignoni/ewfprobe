@@ -57,10 +57,12 @@ acquisition recorded.
 Some damage is read rather than refused, as earlier versions read it: an E01, SMART or
 Ex01 chunk whose zlib stream is cut or gives fewer bytes than the chunk covers, a stored
 (uncompressed) E01 or SMART chunk cut by the end of its segment file, a VMDK grain or a
-QCOW cluster whose stream gives fewer bytes than it covers. Zeros are read where its
-data ran out. That is no longer silent. Each such chunk, grain or cluster is listed
-once in the image object's `padded_chunks`, in disk order, as a dict: `unit`
-(`chunk`, `grain` or `cluster`), `index`, `offset` (the byte of the disk where it
+QCOW cluster whose stream gives fewer bytes than it covers, and an AFF or AFD page
+stored, inflated or counted shorter than the page (AFFLIB's `af_read` returns nothing
+past such a page's end). Zeros are read where its data ran out. That is no longer
+silent. Each such chunk, grain, cluster or page is listed once in the image object's
+`padded_chunks`, in disk order, as a dict: `unit` (`chunk`, `grain`, `cluster` or
+`page`), `index`, `offset` (the byte of the disk where it
 starts), `length` (the bytes of the disk it covers), `decoded` (the bytes its data
 gave), `zeros` (the zeros read after them), `cut` (its stream stopped before its end
 marker) and, for a VMDK, `file`. It lists what has been read so far, so a caller that
@@ -72,6 +74,27 @@ shorter than a chunk. The bytes read are unchanged: on the damaged E01, VMDK and
 images `tests/test_padded_chunks.py` builds, ewfprobe 0.13.0 read the same bytes, by
 SHA-256, and so it did on the 37 committed virtual disks it reads (the LUKS-encrypted
 QCOW is refused by both) and the 28 reference fixtures the manifest lists as variants.
+
+`padded_chunks` lists a unit once, so it cannot say which later reads handed out the
+same zeros again. `padded_zeros_read` can: it counts the zeros `read()` hands out
+where a unit's data ran out, on every read, a unit served again from the cache
+included. A caller that reads one file at a time out of the disk can take it before
+and after each file and know whether that file holds such zeros. A differencing disk
+(a QCOW with a backing file, a VHD, VHDX or VMDK child) counts what it read from its
+parent too.
+
+An E01 or L01 segment written since EnCase 2 carries its chunk table twice, as
+`table` and `table2`, each with an Adler-32 over its header and another over its
+entries. A table that fails either is read from its `table2` copy when that copy
+passes, as libewf does; earlier versions read the damaged table, so one bad entry
+pointed a chunk at another chunk's data with no error. Each failure is listed in
+`table_errors` (`file`, `section`, `offset`, `failed`: `header` or `entries`, and
+`used`: `table2` or `table as stored` when no copy passes), and by `verify()`,
+`info()` and `ewfprobe verify`. The header's checksum is checked in every format;
+the entries' only where the section holds nothing after them, since EnCase 1,
+libewf's `ewf` format and SMART go on with chunk data there. On the libewf writer's
+14 formats and every committed EWF fixture no table fails, and the bytes read are
+the ones `ewfexport` writes.
 
 An encrypted image (an Apple disk image, an acquisition FTK Imager wrote with AD
 encryption, or an encrypted AFF) needs its password. `--password-file FILE` reads it
@@ -565,9 +588,12 @@ these were measured on disks the programs themselves wrote:
   parent's time stamp field, which is shown as not recorded. It writes a VHDX's
   parent_linkage2 as an all-zero GUID, which is taken to name no parent.
 - **A VHDX whose log holds entries is read as it would be after replay**, with the
-  replayed updates kept in memory; the file is not changed. A qemu-io killed after its
-  writes had returned left the log empty, so the replay is tested on a file built to
-  need one.
+  replayed updates kept in memory; the file is not changed. The updates are laid over
+  every read, the disk's own blocks included, since MS-VHDX lets a log entry name any
+  4 KiB of the file, and the file is taken to be as long as the log's last file
+  offset, so a block the log places past its current end is read rather than refused.
+  A qemu-io killed after its writes had returned left the log empty, so the replay is
+  tested on a file built to need one.
 - **VMware's own tools and qemu-img both store stream-optimized grains as zlib streams**,
   although VMware's note names raw deflate; both are read. VMware's tools put the grain
   directory in a footer and name the extent `generated-stream.vmdk` in the embedded
@@ -576,8 +602,11 @@ these were measured on disks the programs themselves wrote:
   the header, and leaves the descriptor area of a twoGbMaxExtentSparse extent empty, so
   an extent opened on its own is read through the descriptor file beside it.
 - **QCOW keeps no identity for its backing file**, so the file of that name is used and
-  `info` says only the name ties them. Internal snapshots are listed with their names
-  and times; the disk read is the active one.
+  `info` says only the name ties them. It is looked for relative to the image, then by
+  its file name beside it, and only then at an absolute name the image records, so a
+  file of that name elsewhere on the examiner's machine is not read ahead of the one
+  that came with the evidence; `info` says when the absolute name was used. Internal
+  snapshots are listed with their names and times; the disk read is the active one.
 
 A differencing disk is only as right as its parent, so a parent that is not the one
 recorded is refused rather than read: a VHD whose disk id, a VHDX whose DataWriteGuid,

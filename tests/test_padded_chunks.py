@@ -61,6 +61,7 @@ def test_a_clean_e01_with_a_partial_last_chunk_lists_nothing(tmp_path):
         assert img.media_size % img.chunk_size
         _read_all(img)
         assert img.padded_chunks == []
+        assert img.padded_zeros_read == 0
         assert img.verify()["padded_chunks"] == []
         assert img.info()["padded_chunks"] == []
 
@@ -87,6 +88,35 @@ def test_a_cut_e01_chunk_reads_as_before_and_is_listed(tmp_path, monkeypatch, ca
     assert "chunk 1 at byte 1,024" in out and "stream cut" in out
 
 
+def test_zeros_read_are_counted_on_every_read_cached_or_not(tmp_path, monkeypatch):
+    # padded_chunks lists a chunk once, so it cannot say that a second read, from the
+    # cache, handed out the same zeros again; padded_zeros_read counts every time
+    chunk = bytes(range(256)) * 4
+    whole = zlib.compress(chunk, 6)
+    cut = whole[:len(whole) // 2]
+    decoded = len(zlib.decompressobj().decompress(cut))
+    zeros = 1024 - decoded
+    path, _data = _e01_with(tmp_path, monkeypatch, chunk, cut)
+    with ewfprobe.open_ewf(path) as img:
+        assert img.padded_zeros_read == 0
+        img.seek(0)
+        img.read(1024)                            # the clean chunk before it
+        assert img.padded_zeros_read == 0
+        _read_all(img)
+        assert img.padded_zeros_read == zeros
+        _read_all(img)                            # the chunk now comes from the cache
+        assert img.padded_zeros_read == 2 * zeros
+        img.seek(1024 + decoded - 10)             # 10 decoded bytes, then 25 zeros
+        img.read(35)
+        assert img.padded_zeros_read == 2 * zeros + 25
+        img.seek(1024)                            # the decoded part only
+        img.read(decoded)
+        img.seek(2048)                            # the clean chunks after it
+        img.read()
+        assert img.padded_zeros_read == 2 * zeros + 25
+        assert len(img.padded_chunks) == 1
+
+
 def test_a_complete_e01_stream_that_is_short_is_listed(tmp_path, monkeypatch):
     chunk = b"B" * 1024
     path, data = _e01_with(tmp_path, monkeypatch, chunk, zlib.compress(b"B" * 300))
@@ -94,6 +124,38 @@ def test_a_complete_e01_stream_that_is_short_is_listed(tmp_path, monkeypatch):
         assert _read_all(img) == data[:1024] + b"B" * 300 + bytes(724) + data[2048:]
         assert [(p["index"], p["decoded"], p["zeros"], p["cut"])
                 for p in img.padded_chunks] == [(1, 300, 724, False)]
+
+
+# ---------------------------------------------------------------- AFF
+
+@pytest.mark.parametrize("form", ["stored", "zlib", "zero"])
+def test_a_short_aff_page_reads_as_before_and_is_listed(tmp_path, form):
+    # AFFLIB's af_read returns nothing past a short page's end; ewfprobe reads zeros
+    # there, as it always has, and now lists the page
+    data = ewf.aff_sample(n_pages=5, page_size=1024)
+    short = 300
+    body = {"stored": (data[2048:2048 + short], 0x00),
+            "zlib": (zlib.compress(data[2048:2048 + short]), 0x01),
+            "zero": (struct.pack(">I", short), 0x33)}[form]
+    if form == "zero":
+        data = data[:2048] + bytes(1024) + data[3072:]
+    path = ewf.write_aff(str(tmp_path / "short.aff"), data, drop=(2,),
+                         extra=[("page2", body[0], body[1])], hashes=False)
+    with ewfprobe.open_ewf(path) as img:
+        got = _read_all(img)
+        assert got == data[:2048 + short] + bytes(1024 - short) + data[3072:]
+        assert img.padded_chunks == [{
+            "unit": "page", "index": 2, "offset": 2048, "length": 1024,
+            "decoded": short, "zeros": 1024 - short, "cut": False}]
+        assert img.padded_zeros_read == 1024 - short
+
+
+def test_a_whole_aff_lists_nothing(tmp_path):
+    data = ewf.aff_sample(n_pages=5, page_size=1024) + b"tail"
+    path = ewf.write_aff(str(tmp_path / "whole.aff"), data)
+    with ewfprobe.open_ewf(path) as img:
+        assert _read_all(img) == data              # its short last page is the disk's end
+        assert img.padded_chunks == []
 
 
 # ---------------------------------------------------------------- VMDK
@@ -129,6 +191,7 @@ def test_a_short_vmdk_grain_reads_as_before_and_is_listed(tmp_path):
         assert got == (clean[:start] + decoded[:grain // 2] + bytes(grain - grain // 2)
                        + clean[start + grain:])
         listed = img.padded_chunks
+        assert img.padded_zeros_read == grain - grain // 2
     assert len(listed) == 1
     assert {k: listed[0][k] for k in ("unit", "index", "offset", "length", "decoded",
                                       "zeros", "cut")} == {
@@ -187,6 +250,42 @@ def test_a_short_qcow_cluster_reads_as_before_and_is_listed(tmp_path):
         assert img.padded_chunks == [{
             "unit": "cluster", "index": index, "offset": start, "length": cluster,
             "decoded": cluster // 2, "zeros": cluster - cluster // 2, "cut": False}]
+        assert img.padded_zeros_read == cluster - cluster // 2
+
+
+def test_an_overlay_counts_the_zeros_it_read_from_its_backing_file(tmp_path):
+    # qcow2-overlay names qcow2-base.qcow2 as its backing file; a compressed disk of
+    # the same size stands in for it, with one cluster cut to half, so the zeros are
+    # read through the overlay from its parent
+    base = os.path.join(str(tmp_path), "qcow2-base.qcow2")
+    os.rename(_unpack("qemu-compact", "qcow2-zlib.qcow2", str(tmp_path)), base)
+    with ewfprobe.open_ewf(base) as img:
+        cluster = img.qcow["cluster_size"]
+        found = list(_compressed_clusters(img))
+    overlay = _unpack("qemu-compact", "qcow2-overlay.qcow2", str(tmp_path))
+    with ewfprobe.open_ewf(overlay) as img:
+        own = {index for index in range(img.media_size // cluster)
+               if img._qcow_l1 and img._qcow_l2_table(index // img._qcow_l2_entries)
+               and img._qcow_l2_table(index // img._qcow_l2_entries)
+               [index % img._qcow_l2_entries]}
+    data = bytearray(open(base, "rb").read())
+    for index, offset, length in found:
+        decoded = zlib.decompressobj(-15).decompress(bytes(data[offset:offset + length]))
+        if index not in own and any(decoded[cluster // 2:]):
+            break
+    else:
+        raise AssertionError("no compressed cluster the overlay reads from its parent")
+    c = zlib.compressobj(9, zlib.DEFLATED, -15)
+    half = c.compress(decoded[:cluster // 2]) + c.flush()
+    assert len(half) <= length
+    data[offset:offset + len(half)] = half        # the next cluster may start in its sectors
+    open(base, "wb").write(bytes(data))
+    with ewfprobe.open_ewf(overlay) as img:
+        assert img.parent is not None
+        _read_all(img)
+        assert img.padded_chunks == []            # the overlay's own clusters are whole
+        assert img.parent.padded_zeros_read == cluster - cluster // 2
+        assert img.padded_zeros_read == cluster - cluster // 2
 
 
 @pytest.mark.parametrize("folder, name", [("qemu-compact", "qcow2-zlib.qcow2"),
@@ -195,3 +294,4 @@ def test_clean_compressed_virtual_disks_list_nothing(tmp_path, folder, name):
     with ewfprobe.open_ewf(_unpack(folder, name, str(tmp_path))) as img:
         _read_all(img)
         assert img.padded_chunks == []
+        assert img.padded_zeros_read == 0
