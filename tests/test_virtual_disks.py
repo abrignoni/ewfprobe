@@ -343,6 +343,70 @@ def test_a_vhdx_log_entry_that_fails_its_crc_is_not_replayed(tmp_path):
         ewfprobe.open_ewf(path)
 
 
+def _dirty_log_entry(data):
+    """(offset, entry bytes) of the constructed dirty-log disk's one log entry."""
+    log_at = struct.unpack_from("<Q", data, 65536 + 72)[0]
+    length = struct.unpack_from("<I", data, log_at + 8)[0]
+    return log_at, bytearray(data[log_at:log_at + length])
+
+
+def _put_entry(data, log_at, entry):
+    struct.pack_into("<I", entry, 4, 0)
+    struct.pack_into("<I", entry, 4, _crc32c(bytes(entry)))
+    data[log_at:log_at + len(entry)] = entry
+
+
+def test_a_vhdx_log_update_to_payload_is_read(tmp_path):
+    # MS-VHDX lets a log descriptor name any 4 KiB of the file, payload included;
+    # a zero descriptor over block 0's first 8 KiB must read as zeros
+    case = BY_NAME["constructed-dirty-log"]
+    path = _unpack(case, str(tmp_path))
+    with ewfprobe.open_ewf(path) as img:
+        img.seek(0)
+        before = img.read()
+        block0 = (img._vhdx_bat[0] >> 20) << 20
+    data = bytearray(open(path, "rb").read())
+    log_at, entry = _dirty_log_entry(data)
+    count = struct.unpack_from("<I", entry, 24)[0]
+    seq = struct.unpack_from("<Q", entry, 16)[0]
+    struct.pack_into("<4sIQQQ", entry, 64 + 32 * count, b"zero", 0, 8192, block0, seq)
+    struct.pack_into("<I", entry, 24, count + 1)
+    _put_entry(data, log_at, entry)
+    open(path, "wb").write(data)
+    with ewfprobe.open_ewf(path) as img:
+        assert img.vhdx["log_entries_replayed"] == 1
+        img.seek(0)
+        assert img.read() == bytes(8192) + before[8192:]
+
+
+def test_a_vhdx_block_the_log_places_past_the_end_of_the_file_is_read(tmp_path):
+    # a replayed log extends the file to its LastFileOffset; a block it places there
+    # is in the disk, not past a cut
+    case = BY_NAME["constructed-dirty-log"]
+    path = _unpack(case, str(tmp_path))
+    data = bytearray(open(path, "rb").read())
+    with ewfprobe.open_ewf(path) as img:
+        img.seek(0)
+        before = img.read()
+        absent = next(i for i in range(16) if img._vhdx_bat[i] & 7 != 6)
+    log_at, entry = _dirty_log_entry(data)
+    off = struct.unpack_from("<Q", entry, 64 + 16)[0]
+    assert off == 2 << 20                         # the descriptor rewrites the BAT sector
+    # its data sector: "data", 4 bytes, then the sector's bytes 8 to 4092
+    sector = 4096
+    end = len(data)
+    struct.pack_into("<Q", entry, sector + 8 + 8 * absent - 8, (end >> 20 << 20) | 6)
+    struct.pack_into("<Q", entry, 56, end + (1 << 20))      # LastFileOffset
+    _put_entry(data, log_at, entry)
+    open(path, "wb").write(data)
+    with ewfprobe.open_ewf(path) as img:
+        img.seek(0)
+        after = img.read()
+    block = 1 << 20
+    assert after[absent * block:(absent + 1) * block] == bytes(block)
+    assert after[:absent * block] == before[:absent * block]
+
+
 def test_a_vhdx_log_that_says_the_file_was_longer_is_refused(tmp_path):
     case = BY_NAME["constructed-dirty-log"]
     path = _unpack(case, str(tmp_path))
@@ -521,6 +585,37 @@ def test_a_zstd_qcow_reads_with_the_zstandard_fallback(tmp_path, monkeypatch):
     case = BY_NAME["qemu-qcow2-zstd"]
     with ewfprobe.open_ewf(_unpack(case, str(tmp_path))) as img:
         assert _digest(img) == case["sha256"]
+
+
+def _rename_backing(path, new_name):
+    """Point a qcow2's header at ``new_name`` as its backing file, in place."""
+    data = bytearray(open(path, "rb").read())
+    at, size = struct.unpack_from(">QI", data, 8)
+    name = new_name.encode()
+    assert len(name) <= 1024 and at + len(name) < 65536
+    data[at:at + max(size, len(name))] = name.ljust(max(size, len(name)), b"\0")
+    struct.pack_into(">I", data, 16, len(name))
+    open(path, "wb").write(bytes(data))
+
+
+def test_a_qcow_backing_file_beside_it_wins_over_an_absolute_name(tmp_path):
+    # qcow records no identity for its backing file: a file at the absolute name on
+    # the examiner's machine must not be read ahead of the one shipped beside it
+    case = BY_NAME["qemu-qcow2-overlay"]
+    evidence, elsewhere = tmp_path / "evidence", tmp_path / "elsewhere"
+    evidence.mkdir()
+    elsewhere.mkdir()
+    path = _unpack(case, str(evidence))
+    base = os.path.join(str(evidence), "qcow2-base.qcow2")
+    other = os.path.join(str(elsewhere), "qcow2-base.qcow2")
+    shutil.copy(_unpack(BY_NAME["qemu-qcow2-zlib"], str(elsewhere)), other)
+    _rename_backing(path, other)
+    with ewfprobe.open_ewf(path) as img:
+        assert _digest(img) == case["sha256"]
+        assert img.qcow["backing_outside"] is None
+    os.remove(base)                               # only the absolute one is left
+    with ewfprobe.open_ewf(path) as img:
+        assert os.path.samefile(img.qcow["backing_outside"], other)
 
 
 def test_a_qcow_needs_its_backing_file_and_its_data_file(tmp_path):

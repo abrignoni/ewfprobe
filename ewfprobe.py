@@ -3996,6 +3996,7 @@ class EwfImage:
         self.vhdx = None
         self._vhdx_bat: list[int] = []
         self._vhdx_overlay: dict[int, bytes | None] = {}
+        self._vhdx_extent = 0                      # the file's size once its log is replayed
         self.vmdk = None
         self._vmdk_extents: list[dict] = []
         self.qcow = None
@@ -6018,7 +6019,7 @@ class EwfImage:
         self.qcow = {"version": version, "cluster_size": cluster, "disk_size": disk,
                      "features": features, "snapshots": snapshots,
                      "backing_file": None, "backing_format": None, "backing_opened": None,
-                     "external_data_file": None, "compression": compression_name,
+                     "backing_outside": None, "external_data_file": None, "compression": compression_name,
                      "modified": (datetime.datetime.fromtimestamp(
                          mtime, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                          if mtime else None)}
@@ -6065,17 +6066,22 @@ class EwfImage:
         self.chunk_count = self._indexed_chunks = self._needed_chunks()
 
     def _qcow_open_backing(self, name, here, backing, fmt):
-        """Open a QCOW's backing file by its recorded name, relative to this file or
-        (when absolute and present) where it names, then by file name beside it. QCOW
-        records no identity for its backing file, so only the name ties them."""
+        """Open a QCOW's backing file by its recorded name: relative to this file, then
+        by file name beside it, and only then, when the name is absolute, where it
+        points. QCOW records no identity for its backing file, so only the name ties
+        them, and a file of that name elsewhere on the examiner's machine would be read
+        as the evidence's own; the evidence's folder is looked in first, and a backing
+        file found outside it is said in ``backing_outside``."""
         parts = [part for part in re.split(r"[\\/]", backing) if part not in ("", ".")]
         candidates = []
-        if os.path.isabs(backing):
-            candidates.append(backing)
-        elif not re.match(r"^[A-Za-z]:", backing) and not re.match(r"^[a-z]+:", backing):
+        absolute = os.path.isabs(backing)
+        if (not absolute and not re.match(r"^[A-Za-z]:", backing)
+                and not re.match(r"^[a-z]+:", backing)):
             candidates.append(os.path.join(here, *parts))
         if parts:
             candidates.append(os.path.join(here, parts[-1]))
+        if absolute:
+            candidates.append(backing)
         if len(_opening_parents) >= _VIRTUAL_MAX_PARENTS:
             raise EwfFormatError(f"{name} is more than {_VIRTUAL_MAX_PARENTS} backing files "
                                  f"deep")
@@ -6095,6 +6101,8 @@ class EwfImage:
                 else:
                     self.parent = EwfImage(real)
                 self.qcow["backing_opened"] = os.path.basename(real)
+                if path == backing and absolute:
+                    self.qcow["backing_outside"] = real
                 return
         finally:
             _opening_parents.pop()
@@ -6703,7 +6711,11 @@ class EwfImage:
                                         f"it was at least {head_entry[3]:,}; the file is "
                                         f"cut short")
         start = next(i for i, (at, _f) in enumerate(best) if at == head_entry[1])
-        for _at, (_seq, _tail, _len, _flushed, _last, updates) in best[start:]:
+        for _at, (_seq, _tail, _len, _flushed, last, updates) in best[start:]:
+            # Replay extends the file to the entry's LastFileOffset (MS-VHDX 2.3.3), so
+            # a block the log places there is in the file, read as zeros where nothing
+            # was written to it.
+            self._vhdx_extent = max(self._vhdx_extent, last)
             for file_off, length, content in updates:
                 for k in range(0, length, 4096):
                     self._vhdx_overlay[file_off + k] = (
@@ -6833,7 +6845,7 @@ class EwfImage:
                 if at < _MIB:
                     raise EwfFormatError(f"{name} places block {i:,} inside its header "
                                          f"section")
-                if at + want > size:
+                if at + want > max(size, self._vhdx_extent):
                     raise EwfIncompleteSetError(f"{name} ends inside block {i:,}; the "
                                                 f"file is cut short")
         self._vhdx_bat = bat
@@ -6945,10 +6957,8 @@ class EwfImage:
         entry = self._vhdx_bat[i + i // ratio]
         state = entry & 7
         if state == _VHDX_FULLY_PRESENT or state == _VHDX_PARTIALLY_PRESENT:
-            fh = self._handle(0)
-            fh.seek((entry >> 20) * _MIB + within)
-            data = fh.read(want)
-            data += bytes(want - len(data))
+            # through the replayed log, which can update payload as well as metadata
+            data = self._vhdx_read((entry >> 20) * _MIB + within, want)
             if state == _VHDX_FULLY_PRESENT:
                 return data
             return self._vhdx_merge(start, want, data)
@@ -7960,6 +7970,9 @@ def _cmd_info(args):
                           f"{' (' + _shown(q['backing_format']) + ')' if q['backing_format'] else ''}"
                           f", opened as {_shown(q['backing_opened'])}; qcow records no "
                           f"identity for it, so only its name ties them")
+                if q.get("backing_outside"):
+                    print(f"                not beside the image: read from "
+                          f"{_shown(q['backing_outside'])}, where its absolute name points")
                 if q["external_data_file"]:
                     print(f"external data   {_shown(q['external_data_file'])}")
                 for snap in q["snapshots"]:

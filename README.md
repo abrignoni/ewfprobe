@@ -586,9 +586,12 @@ these were measured on disks the programs themselves wrote:
   parent's time stamp field, which is shown as not recorded. It writes a VHDX's
   parent_linkage2 as an all-zero GUID, which is taken to name no parent.
 - **A VHDX whose log holds entries is read as it would be after replay**, with the
-  replayed updates kept in memory; the file is not changed. A qemu-io killed after its
-  writes had returned left the log empty, so the replay is tested on a file built to
-  need one.
+  replayed updates kept in memory; the file is not changed. The updates are laid over
+  every read, the disk's own blocks included, since MS-VHDX lets a log entry name any
+  4 KiB of the file, and the file is taken to be as long as the log's last file
+  offset, so a block the log places past its current end is read rather than refused.
+  A qemu-io killed after its writes had returned left the log empty, so the replay is
+  tested on a file built to need one.
 - **VMware's own tools and qemu-img both store stream-optimized grains as zlib streams**,
   although VMware's note names raw deflate; both are read. VMware's tools put the grain
   directory in a footer and name the extent `generated-stream.vmdk` in the embedded
@@ -597,8 +600,11 @@ these were measured on disks the programs themselves wrote:
   the header, and leaves the descriptor area of a twoGbMaxExtentSparse extent empty, so
   an extent opened on its own is read through the descriptor file beside it.
 - **QCOW keeps no identity for its backing file**, so the file of that name is used and
-  `info` says only the name ties them. Internal snapshots are listed with their names
-  and times; the disk read is the active one.
+  `info` says only the name ties them. It is looked for relative to the image, then by
+  its file name beside it, and only then at an absolute name the image records, so a
+  file of that name elsewhere on the examiner's machine is not read ahead of the one
+  that came with the evidence; `info` says when the absolute name was used. Internal
+  snapshots are listed with their names and times; the disk read is the active one.
 
 A differencing disk is only as right as its parent, so a parent that is not the one
 recorded is refused rather than read: a VHD whose disk id, a VHDX whose DataWriteGuid,
