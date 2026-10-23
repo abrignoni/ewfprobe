@@ -7452,6 +7452,9 @@ class EwfImage:
             return self._keep(n, data, want)
         if self.format in (FORMAT_AFF, FORMAT_AFD):
             data = self._chunk_data_aff(n)
+            if len(data) < want:
+                # a stored page cut short, or one that inflates or counts short
+                self._note_padded("page", n, n * self.chunk_size, want, len(data), False)
             return self._keep(n, data, want)
         if self.format == FORMAT_AFM:
             return self._keep(n, self._chunk_data_afm(n), want)
@@ -7526,10 +7529,11 @@ class EwfImage:
 
     @property
     def padded_chunks(self):
-        """The chunks (E01, SMART, Ex01), grains (VMDK) and clusters (QCOW) read so
-        far whose stored data ran out before the bytes they cover, so that zeros were
-        read in its place, or whose compressed stream stopped before its end marker.
-        A list of dicts in disk order: ``unit`` ("chunk", "grain" or "cluster"),
+        """The chunks (E01, SMART, Ex01), grains (VMDK), clusters (QCOW) and pages
+        (AFF, AFD) read so far whose stored data ran out before the bytes they cover,
+        so that zeros were read in its place, or whose compressed stream stopped
+        before its end marker. A list of dicts in disk order: ``unit`` ("chunk",
+        "grain", "cluster" or "page"),
         ``index``, ``offset`` (the byte on the disk where the unit starts),
         ``length`` (the bytes of the disk it covers), ``decoded`` (the bytes its data
         gave), ``zeros`` (the zeros put after them), ``cut`` (True when the stream

@@ -57,10 +57,12 @@ acquisition recorded.
 Some damage is read rather than refused, as earlier versions read it: an E01, SMART or
 Ex01 chunk whose zlib stream is cut or gives fewer bytes than the chunk covers, a stored
 (uncompressed) E01 or SMART chunk cut by the end of its segment file, a VMDK grain or a
-QCOW cluster whose stream gives fewer bytes than it covers. Zeros are read where its
-data ran out. That is no longer silent. Each such chunk, grain or cluster is listed
-once in the image object's `padded_chunks`, in disk order, as a dict: `unit`
-(`chunk`, `grain` or `cluster`), `index`, `offset` (the byte of the disk where it
+QCOW cluster whose stream gives fewer bytes than it covers, and an AFF or AFD page
+stored, inflated or counted shorter than the page (AFFLIB's `af_read` returns nothing
+past such a page's end). Zeros are read where its data ran out. That is no longer
+silent. Each such chunk, grain, cluster or page is listed once in the image object's
+`padded_chunks`, in disk order, as a dict: `unit` (`chunk`, `grain`, `cluster` or
+`page`), `index`, `offset` (the byte of the disk where it
 starts), `length` (the bytes of the disk it covers), `decoded` (the bytes its data
 gave), `zeros` (the zeros read after them), `cut` (its stream stopped before its end
 marker) and, for a VMDK, `file`. It lists what has been read so far, so a caller that

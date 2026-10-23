@@ -126,6 +126,38 @@ def test_a_complete_e01_stream_that_is_short_is_listed(tmp_path, monkeypatch):
                 for p in img.padded_chunks] == [(1, 300, 724, False)]
 
 
+# ---------------------------------------------------------------- AFF
+
+@pytest.mark.parametrize("form", ["stored", "zlib", "zero"])
+def test_a_short_aff_page_reads_as_before_and_is_listed(tmp_path, form):
+    # AFFLIB's af_read returns nothing past a short page's end; ewfprobe reads zeros
+    # there, as it always has, and now lists the page
+    data = ewf.aff_sample(n_pages=5, page_size=1024)
+    short = 300
+    body = {"stored": (data[2048:2048 + short], 0x00),
+            "zlib": (zlib.compress(data[2048:2048 + short]), 0x01),
+            "zero": (struct.pack(">I", short), 0x33)}[form]
+    if form == "zero":
+        data = data[:2048] + bytes(1024) + data[3072:]
+    path = ewf.write_aff(str(tmp_path / "short.aff"), data, drop=(2,),
+                         extra=[("page2", body[0], body[1])], hashes=False)
+    with ewfprobe.open_ewf(path) as img:
+        got = _read_all(img)
+        assert got == data[:2048 + short] + bytes(1024 - short) + data[3072:]
+        assert img.padded_chunks == [{
+            "unit": "page", "index": 2, "offset": 2048, "length": 1024,
+            "decoded": short, "zeros": 1024 - short, "cut": False}]
+        assert img.padded_zeros_read == 1024 - short
+
+
+def test_a_whole_aff_lists_nothing(tmp_path):
+    data = ewf.aff_sample(n_pages=5, page_size=1024) + b"tail"
+    path = ewf.write_aff(str(tmp_path / "whole.aff"), data)
+    with ewfprobe.open_ewf(path) as img:
+        assert _read_all(img) == data              # its short last page is the disk's end
+        assert img.padded_chunks == []
+
+
 # ---------------------------------------------------------------- VMDK
 
 def test_a_short_vmdk_grain_reads_as_before_and_is_listed(tmp_path):
