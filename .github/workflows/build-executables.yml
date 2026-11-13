@@ -99,9 +99,11 @@ jobs:
             macOS) icon=assets/ewfprobe.icns ;;
             *) icon=NONE ;;
           esac
+          # (a tag from before the window had a logo has no assets folder)
+          extra=(); [ -d assets ] && extra=(--add-data "assets:assets" --icon "$icon")
           pyinstaller --noconfirm --clean --onefile --windowed \
             --name ewfprobe_gui --hidden-import ewfprobe --hidden-import ewfprobe_theme \
-            --add-data "assets:assets" --icon "$icon" ewfprobe_gui.py
+            "${extra[@]}" ewfprobe_gui.py
 
       - name: Check the executable writes what the source writes
         shell: bash
@@ -137,6 +139,8 @@ jobs:
         shell: python
         run: |
           import json, os, subprocess, sys
+          if not os.path.isdir(os.path.join("src", "assets")):
+              sys.exit(print("this source is from before the window had a logo; nothing to check"))
           ext = ".exe" if os.name == "nt" else ""
           cmd = [os.path.join("src", "dist", "ewfprobe_gui" + ext), "--smoke",
                  os.path.join("src", "tests", "fixtures", "encase5-fast.E01")]
@@ -209,9 +213,10 @@ jobs:
 
       - name: Checksums of the archives and the source file
         run: |
-          cp src/ewfprobe.py src/ewfprobe_gui.py src/ewfprobe_theme.py artifacts/
-          cd artifacts && sha256sum ewfprobe-* ewfprobe.py ewfprobe_gui.py ewfprobe_theme.py > SHA256SUMS.txt && cat SHA256SUMS.txt
-          test "$(wc -l < SHA256SUMS.txt)" -eq 9
+          cp src/ewfprobe.py src/ewfprobe_gui.py artifacts/
+          [ ! -f src/ewfprobe_theme.py ] || cp src/ewfprobe_theme.py artifacts/   # (not in tags from before the window's theme)
+          cd artifacts && sha256sum ewfprobe-* ewfprobe*.py > SHA256SUMS.txt && cat SHA256SUMS.txt
+          test "$(wc -l < SHA256SUMS.txt)" -eq "$(( 6 + $(ls ewfprobe*.py | wc -l) ))"
 
       - name: Create the release
         env:
