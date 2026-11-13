@@ -40,7 +40,10 @@ def assets_dir(here):
 
 
 def system_dark():
-    """True when the operating system is set to dark, where that can be read; otherwise False."""
+    """True when the operating system is set to dark, where that can be read; otherwise False.
+
+    macOS: AppleInterfaceStyle. Windows: AppsUseLightTheme. Linux: GNOME's color-scheme setting
+    through gsettings, as CustomTkinter's darkdetect reads it; a desktop without it reads as light."""
     try:
         if sys.platform == 'darwin':
             done = subprocess.run(['defaults', 'read', '-g', 'AppleInterfaceStyle'], capture_output=True,
@@ -51,6 +54,10 @@ def system_dark():
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                                 r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize') as key:
                 return not winreg.QueryValueEx(key, 'AppsUseLightTheme')[0]
+        if sys.platform.startswith('linux'):
+            done = subprocess.run(['gsettings', 'get', 'org.gnome.desktop.interface', 'color-scheme'],
+                                  capture_output=True, stdin=subprocess.DEVNULL, timeout=5, check=False)
+            return 'dark' in done.stdout.decode('utf-8', 'replace').lower()
     except (OSError, subprocess.SubprocessError):
         pass
     return False

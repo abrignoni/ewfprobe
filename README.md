@@ -120,8 +120,8 @@ password typed into the window reaches `ewfprobe.py` in an environment variable,
 its command line.
 
 It needs `ewfprobe_theme.py` beside it (colours and the header, also standard library). The
-logo comes from `assets/`; without that folder the window opens with no logo. It starts in
-the system's light or dark mode, and the switch in its header changes it for that session.
+logo comes from `assets/`; without that folder the window opens with no logo. It starts in the system's light or dark mode where it can read it (macOS, Windows, and
+GNOME's setting on Linux), otherwise light, and the switch in its header changes it for that session.
 
 ## What it reads
 
