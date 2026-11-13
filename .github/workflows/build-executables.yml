@@ -91,9 +91,19 @@ jobs:
 
       - name: Build the window executable
         working-directory: src
-        run: >
-          pyinstaller --noconfirm --clean --onefile --windowed
-          --name ewfprobe_gui --hidden-import ewfprobe ewfprobe_gui.py
+        shell: bash
+        run: |
+          # the logo and icons travel inside the build; the program icon is per system
+          case "$RUNNER_OS" in
+            Windows) icon=assets/ewfprobe.ico ;;
+            macOS) icon=assets/ewfprobe.icns ;;
+            *) icon=NONE ;;
+          esac
+          # (a tag from before the window had a logo has no assets folder)
+          extra=(); [ -d assets ] && extra=(--add-data "assets:assets" --icon "$icon")
+          pyinstaller --noconfirm --clean --onefile --windowed \
+            --name ewfprobe_gui --hidden-import ewfprobe --hidden-import ewfprobe_theme \
+            "${extra[@]}" ewfprobe_gui.py
 
       - name: Check the executable writes what the source writes
         shell: bash
@@ -124,6 +134,25 @@ jobs:
               p.terminate()
           print("gui process alive after 20 s:", alive, "| exit code:", p.poll())
           assert alive, "ewfprobe_gui exited early"
+
+      - name: Check the window verifies an image with its logo and icon
+        shell: python
+        run: |
+          import json, os, subprocess, sys
+          if not os.path.isdir(os.path.join("src", "assets")):
+              sys.exit(print("this source is from before the window had a logo; nothing to check"))
+          ext = ".exe" if os.name == "nt" else ""
+          cmd = [os.path.join("src", "dist", "ewfprobe_gui" + ext), "--smoke",
+                 os.path.join("src", "tests", "fixtures", "encase5-fast.E01")]
+          if sys.platform.startswith("linux"):
+              cmd = ["xvfb-run", "-a"] + cmd
+          done = subprocess.run(cmd, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
+          print(done.stdout[-2000:], done.stderr[-2000:])
+          outcome = json.loads(done.stdout.strip().splitlines()[-1])
+          print({k: outcome[k] for k in ("exit", "logo", "icon")})
+          assert done.returncode == 0 and outcome["exit"] == 0, "the window's verify failed"
+          assert "matches the stored hash" in outcome["output"]
+          assert outcome["logo"] and outcome["icon"], "the window has no logo or no icon"
 
       - name: Package
         shell: bash
@@ -185,8 +214,9 @@ jobs:
       - name: Checksums of the archives and the source file
         run: |
           cp src/ewfprobe.py src/ewfprobe_gui.py artifacts/
-          cd artifacts && sha256sum ewfprobe-* ewfprobe.py ewfprobe_gui.py > SHA256SUMS.txt && cat SHA256SUMS.txt
-          test "$(wc -l < SHA256SUMS.txt)" -eq 8
+          [ ! -f src/ewfprobe_theme.py ] || cp src/ewfprobe_theme.py artifacts/   # (not in tags from before the window's theme)
+          cd artifacts && sha256sum ewfprobe-* ewfprobe*.py > SHA256SUMS.txt && cat SHA256SUMS.txt
+          test "$(wc -l < SHA256SUMS.txt)" -eq "$(( 6 + $(ls ewfprobe*.py | wc -l) ))"
 
       - name: Create the release
         env:

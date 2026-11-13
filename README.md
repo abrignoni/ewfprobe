@@ -119,6 +119,10 @@ runs `ewfprobe.py` and shows what it prints, so the results are the same either 
 password typed into the window reaches `ewfprobe.py` in an environment variable, not on
 its command line.
 
+It needs `ewfprobe_theme.py` beside it (colours and the header, also standard library). The
+logo comes from `assets/`; without that folder the window opens with no logo. It starts in the system's light or dark mode where it can read it (macOS, Windows, and
+GNOME's setting on Linux), otherwise light, and the switch in its header changes it for that session.
+
 ## What it reads
 
 Reads EWF-E01, which is what EnCase 6 and 7, FTK Imager and `ewfacquire` write,
