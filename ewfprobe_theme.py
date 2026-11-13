@@ -47,7 +47,7 @@ def system_dark():
                                   stdin=subprocess.DEVNULL, timeout=5, check=False)
             return b'Dark' in done.stdout
         if os.name == 'nt':
-            import winreg  # pylint: disable=import-outside-toplevel
+            import winreg  # pylint: disable=import-outside-toplevel,import-error
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                                 r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize') as key:
                 return not winreg.QueryValueEx(key, 'AppsUseLightTheme')[0]
@@ -132,6 +132,7 @@ class Theme:  # pylint: disable=too-many-instance-attributes
         self._check_size = None
         self._check_images = {}
         self._segments = []
+        self.logo = None
         base = tkfont.nametofont('TkDefaultFont')
         size = abs(base.actual('size')) or 10
         self.font_title = base.copy()
