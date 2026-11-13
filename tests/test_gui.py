@@ -54,3 +54,16 @@ def test_hidden_window_verifies():
     outcome = json.loads(result.stdout.strip().splitlines()[-1])
     assert outcome["exit"] == 0
     assert "MD5" in outcome["output"] and "matches the stored hash" in outcome["output"]
+    assert outcome["logo"] and outcome["icon"]
+
+
+def test_theme_switches_both_ways():
+    if not tk_display_available():
+        pytest.skip("Tk cannot open a display here")
+    code = ("import sys, tkinter as tk; sys.path.insert(0, sys.argv[1]); import ewfprobe_theme as t; "
+            "r = tk.Tk(); th = t.Theme(r); txt = tk.Text(r); "
+            "th.apply(True); d = txt.cget('background'); th.apply(False); l = txt.cget('background'); "
+            "r.destroy(); print(d, l)")
+    result = run("-c", code, ROOT)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["#1F232A", "#FFFFFF"]

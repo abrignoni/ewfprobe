@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """ewfprobe GUI: a tkinter window over ewfprobe.py.
 
-Standard library only, like the tool it drives. The window runs the command line
+Standard library only, like the tool it drives. Its colours, header and logo come
+from ewfprobe_theme.py and assets/ beside it (the logo is left out when assets/ is
+missing). The window runs the command line
 tool as a subprocess with the same options it takes, so what it shows is what the
 command line prints:
 
@@ -36,6 +38,7 @@ import threading
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import ewfprobe  # noqa: E402  pylint: disable=wrong-import-position
+import ewfprobe_theme  # noqa: E402  pylint: disable=wrong-import-position
 
 TITLE = "ewfprobe"
 PERCENT = re.compile(r"(\d+(?:\.\d+)?)%")
@@ -66,59 +69,71 @@ def build_window(initial_image="", smoke=None):
 
     root = tk.Tk()
     root.title(f"{TITLE} {ewfprobe.__version__}")
-    root.geometry("940x640")
-    root.minsize(720, 480)
+    root.geometry("980x700")
+    root.minsize(760, 520)
     if smoke:
         root.attributes("-alpha", 0.0)
-    state = {"proc": None, "streams": 0, "mode": None, "result": None, "out": []}
+    theme = ewfprobe_theme.Theme(root)
+    theme.apply(ewfprobe_theme.system_dark())
+    assets = ewfprobe_theme.assets_dir(HERE)
+    icon = ewfprobe_theme.window_icon(root, assets, TITLE)
+    state = {"proc": None, "streams": 0, "mode": None, "result": None, "out": [], "logo": False, "icon": icon}
     lines = queue.Queue()
 
-    form = ttk.Frame(root, padding=8)
-    form.pack(fill="x")
+    head, _right = theme.header(root, TITLE, f"{ewfprobe.__version__}   reads disk images, never writes them",
+                                logo_folder=assets, on_mode=theme.apply)
+    head.pack(fill="x")
+    state["logo"] = theme.logo is not None
+    page = ttk.Frame(root, padding=(18, 14, 18, 16))
+    page.pack(fill="both", expand=True)
+
+    card, form = theme.card(page, padding=(16, 12))
+    card.pack(fill="x")
     v_image = tk.StringVar(value=initial_image)
     v_password = tk.StringVar()
     v_key = tk.StringVar()
-    ttk.Label(form, text="Image").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
-    ttk.Entry(form, textvariable=v_image).grid(row=0, column=1, sticky="ew", pady=2)
-    pick = ttk.Frame(form)
-    pick.grid(row=0, column=2, sticky="w", padx=(6, 0))
+    ttk.Label(form, text="Image", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
+    ttk.Entry(form, textvariable=v_image).grid(row=0, column=1, sticky="ew", pady=3)
+    pick = ttk.Frame(form, style="Header.TFrame")
+    pick.grid(row=0, column=2, sticky="w", padx=(8, 0))
     ttk.Button(pick, text="File...", command=lambda: v_image.set(
         filedialog.askopenfilename(title="Image") or v_image.get())).pack(side="left")
     ttk.Button(pick, text="Folder...", command=lambda: v_image.set(
         filedialog.askdirectory(title="Image folder (.sparsebundle, .afd)") or v_image.get())
-               ).pack(side="left", padx=(4, 0))
-    ttk.Label(form, text="Password").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
-    ttk.Entry(form, textvariable=v_password, show="*").grid(row=1, column=1, sticky="ew", pady=2)
-    ttk.Label(form, text="only for an encrypted image", foreground="gray").grid(row=1, column=2, sticky="w", padx=(6, 0))
-    ttk.Label(form, text="Private key").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=2)
-    ttk.Entry(form, textvariable=v_key).grid(row=2, column=1, sticky="ew", pady=2)
+               ).pack(side="left", padx=(6, 0))
+    ttk.Label(form, text="Password", style="Card.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
+    ttk.Entry(form, textvariable=v_password, show="*").grid(row=1, column=1, sticky="ew", pady=3)
+    ttk.Label(form, text="only for an encrypted image", style="CardMuted.TLabel").grid(
+        row=1, column=2, sticky="w", padx=(8, 0))
+    ttk.Label(form, text="Private key", style="Card.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=3)
+    ttk.Entry(form, textvariable=v_key).grid(row=2, column=1, sticky="ew", pady=3)
     ttk.Button(form, text="Browse...", command=lambda: v_key.set(
         filedialog.askopenfilename(title="Private key (PEM or DER)") or v_key.get())
-               ).grid(row=2, column=2, sticky="w", padx=(6, 0))
+               ).grid(row=2, column=2, sticky="w", padx=(8, 0))
     form.columnconfigure(1, weight=1)
 
-    buttons = ttk.Frame(root, padding=(8, 0))
-    buttons.pack(fill="x")
+    buttons = ttk.Frame(page)
+    buttons.pack(fill="x", pady=(14, 0))
+    b_verify = ttk.Button(buttons, text="Verify", style="Primary.TButton")
     b_info = ttk.Button(buttons, text="Info")
-    b_verify = ttk.Button(buttons, text="Verify")
     b_files = ttk.Button(buttons, text="List entries")
     b_export = ttk.Button(buttons, text="Export...")
     b_cancel = ttk.Button(buttons, text="Cancel", state="disabled")
     actions = (b_info, b_verify, b_files, b_export)
-    for button in actions + (b_cancel,):
-        button.pack(side="left", padx=(0, 6))
+    for button in (b_verify, b_info, b_files, b_export, b_cancel):
+        button.pack(side="left", padx=(0, 8))
     ttk.Label(buttons, text="List entries is for L01 and AD1; select one to export it alone",
-              foreground="gray").pack(side="left", padx=(6, 0))
+              style="Muted.TLabel").pack(side="left", padx=(6, 0))
 
-    status_bar = ttk.Frame(root, padding=(8, 6))
-    status_bar.pack(fill="x")
+    status_bar = ttk.Frame(page)
+    status_bar.pack(fill="x", pady=(12, 10))
     progress = ttk.Progressbar(status_bar, mode="determinate", maximum=100)
     progress.pack(side="left", fill="x", expand=True)
-    status = ttk.Label(status_bar, text="Choose an image.", width=44)
-    status.pack(side="left", padx=(8, 0))
+    status = ttk.Label(status_bar, text="Choose an image.", width=44, style="Muted.TLabel")
+    status.pack(side="left", padx=(12, 0))
 
-    panes = ttk.PanedWindow(root, orient="vertical")
-    panes.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    panes = ttk.PanedWindow(page, orient="vertical")
+    panes.pack(fill="both", expand=True)
     table_frame = ttk.Frame(panes)
     table = ttk.Treeview(table_frame, show="headings", columns=("kind", "size", "md5", "path"))
     for column, width in (("kind", 70), ("size", 110), ("md5", 260), ("path", 420)):
@@ -128,7 +143,9 @@ def build_window(initial_image="", smoke=None):
     table.configure(yscrollcommand=scroll.set)
     table.pack(side="left", fill="both", expand=True)
     scroll.pack(side="left", fill="y")
-    log = tk.Text(panes, height=12, wrap="none", state="disabled")
+    log = tk.Text(panes, height=12, wrap="none", state="disabled", font="TkFixedFont", padx=10, pady=8,
+                  highlightthickness=1, borderwidth=0, relief="flat")
+    theme.apply(theme.dark)   # colours the Text made after the first apply
     panes.add(log, weight=2)
     panes.add(table_frame, weight=2)
 
@@ -277,7 +294,7 @@ def build_window(initial_image="", smoke=None):
         v_image.set(smoke)
         root.after(100, lambda: start("verify"))
     root.mainloop()
-    return state["result"]
+    return state["result"] + (state["logo"], state["icon"]) if state["result"] else None
 
 
 def main(argv):
@@ -287,8 +304,8 @@ def main(argv):
         if len(argv) != 2:
             print("usage: ewfprobe_gui.py --smoke IMAGE", file=sys.stderr)
             return 2
-        code, output = build_window(smoke=os.path.abspath(argv[1])) or (None, "")
-        print(json.dumps({"exit": code, "output": output}))
+        code, output, logo, icon = build_window(smoke=os.path.abspath(argv[1])) or (None, "", False, False)
+        print(json.dumps({"exit": code, "output": output, "logo": logo, "icon": icon}))
         return 0 if code == 0 else 1
     build_window(os.path.abspath(argv[0]) if argv and os.path.exists(argv[0]) else "")
     return 0
