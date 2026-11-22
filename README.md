@@ -52,7 +52,17 @@ ewfprobe verify  --private-key examiner.pem sealed.aff  # AFF sealed to a certif
 ```
 
 `verify` exits non-zero when the recomputed hash does not match the one the
-acquisition recorded.
+acquisition recorded, and also when a chunk fails its checksum, runs out of data or
+cannot be read, or an entry of logical evidence cannot be read, whether or not any
+hash was stored. `verify()` reports those in `checksum_errors`, `padded_chunks`,
+`unreadable_chunks` and `entry_unreadable`, and counts the entries holding data with
+no stored hash in `entry_no_stored_hash`. After trying the whole image, `verify()`
+raises `EwfFormatError`, with the full result as its `result`, for damage the older keys
+cannot show (a chunk that cannot be read, or an unreadable entry with no stored hash);
+`verify(keep_going=True)` returns the result instead. `export` does not refuse damaged data: it
+writes what it reads, warns on stderr and exits 1 when what it wrote came from a
+damaged chunk. At a chunk it cannot read at all it stops, keeps what came before it,
+and exits 2.
 
 Some damage is read rather than refused, as earlier versions read it: an E01, SMART or
 Ex01 chunk whose zlib stream is cut or gives fewer bytes than the chunk covers, a stored
@@ -251,8 +261,8 @@ names joined by "/", is for display), its size, the MD5 and SHA-1 stored for it
 where set, its flags, the times that are set, its children, and `values`, every
 column exactly as the ltree stores it. `open_entry()` gives an entry's content as
 a seekable file and `read_entry()` reads it whole. `ewfprobe files` lists the
-entries, `ewfprobe export --entry` writes one out, and `verify` checks every MD5
-EnCase stored for an entry.
+entries, `ewfprobe export --entry` writes one out, and `verify` reads every entry
+and checks each MD5 and SHA-1 EnCase stored for it.
 
 Lx01, the EWF2 logical evidence EnCase 7 and later write, opens the same way, in
 segments named `.Lx01`, `.Lx02` and on, with the same entries and the same calls.
@@ -660,8 +670,8 @@ Refused with a message naming the reason rather than read wrongly:
   files disagree about the set, whose margin is not 512 bytes, whose footer does not
   end where its data ends, whose item tree loops or places an item under a parent
   other than the one it names, or whose entry's chunk table does not fit its size. An
-  entry whose chunk does not inflate fails when read, and `verify` reports it as a
-  mismatch.
+  entry whose chunk does not inflate fails when read, and `verify` names it as
+  unreadable, counts it as a mismatch of any hash it stores, and exits non-zero.
 - **A VHD of a version other than 1.0**, a VHDX of a version other than 1, **a VHD split
   into `.v01` files** by Virtual PC 2004 or earlier (no sample has been available), a
   VHD or VHDX cut short, a VHDX with no header or region table whose checksum matches,
@@ -694,6 +704,9 @@ Refused with a message naming the reason rather than read wrongly:
   `diskutil` has no option to write one, so that case has not been compared with macOS.
 - **An ASIF whose header gives a chunk larger than 64 MiB** is refused, because a chunk is
   read into memory whole. The images macOS wrote for the tests use 1 MiB.
+- **An ASIF stores no hash**, and its header can declare far more disk than the file
+  holds, so `verify` computes no hash of the disk. It reads the allocated chunks, once
+  each, and reports any it cannot read.
 - **An older `.dmg` whose block tables are only in a resource fork**, **a sparse image
   of a version other than 3**, and **a sparse bundle of a backing-store version other
   than 1**.
