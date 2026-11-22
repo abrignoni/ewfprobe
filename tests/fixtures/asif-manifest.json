@@ -1,0 +1,23 @@
+{
+  "note": "written and read back by macOS; the data is generated",
+  "images": {
+    "asif-states.asif": {
+      "file": "asif-states.asif.gz",
+      "logical_size": 8000000,
+      "logical_sha256": "ea0b4d0d753feb0b5d99ece42fe441736b1df8066c99059c675887f1a3ddc437",
+      "data_entry_states": {
+        "0": 2043,
+        "1": 1,
+        "2": 1,
+        "3": 3
+      }
+    },
+    "asif-encrypted.asif": {
+      "file": "asif-encrypted.asif.gz",
+      "logical_size": 8000000,
+      "logical_sha256": "ea0b4d0d753feb0b5d99ece42fe441736b1df8066c99059c675887f1a3ddc437",
+      "password": "asif-fixture-test",
+      "stored_head_bytes": 589824
+    }
+  }
+}
