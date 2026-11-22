@@ -143,6 +143,18 @@ def test_a_header_asking_for_a_huge_chunk_is_refused_on_opening(tmp_path):
         ewfprobe.open_ewf(str(path))
 
 
+@pytest.mark.parametrize("extents, md5, collected", [
+    ("1 0 1", "a" * 32, False),         # what EnCase Imager 7.10 stores for such a folder
+    ("1 0 2", "a" * 32, True),          # more than its one byte: incomplete
+    ("2 0 1 1 1", "a" * 32, True),      # two extents: incomplete
+    ("1 0 1", "", True),                # no recorded MD5: incomplete
+    ("", "a" * 32, True),               # no extent at all: incomplete
+])
+def test_only_the_encase_placeholder_reads_as_not_collected(extents, md5, collected):
+    values = {"p": "1", "ls": "100", "be": extents, "ha": md5}
+    assert ewfprobe.LogicalEntry(("folder",), values, None).content_collected is collected
+
+
 def test_equal_versions_with_different_directories_are_refused(tmp_path):
     path = write_asif(tmp_path / "a.asif", [], versions=(1, 1), second_table=2)
     with pytest.raises(ewfprobe.EwfFormatError, match="same version"):
