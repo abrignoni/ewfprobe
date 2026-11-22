@@ -128,6 +128,18 @@ def test_shadow_version_is_refused(tmp_path):
         ewfprobe.open_ewf(path)
 
 
+@pytest.mark.parametrize("version, kind", [
+    (b"\0\0\0\1", ewfprobe.FORMAT_ASIF),   # ASIF
+    (b"\0\0\0\4", ewfprobe.FORMAT_ASIF),   # an hdiutil shadow file, refused by name
+    (b"\0\0\0\0", None),                   # raw bytes
+    (b" is ", None),                         # raw text
+])
+def test_the_version_decides_whether_shdw_is_a_header(tmp_path, version, kind):
+    path = tmp_path / "a.bin"
+    path.write_bytes(b"shdw" + version + bytes(4096))
+    assert ewfprobe.apple_image_kind(str(path)) == kind
+
+
 def test_unknown_flags_are_refused(tmp_path):
     path = write_asif(tmp_path / "a.asif", [], flags=1)
     with pytest.raises(ewfprobe.EwfFormatError, match="unsupported ASIF header"):
