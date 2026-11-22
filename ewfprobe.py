@@ -113,7 +113,7 @@ try:
 except ImportError:
     lzma = None
 
-__version__ = "0.17.0"
+__version__ = "0.17.1"
 
 # ---------------------------------------------------------------- constants
 
@@ -344,6 +344,9 @@ FORMAT_ASIF = "ASIF"
 _ASIF_HEADER = struct.Struct(">4sIIIQQ16sQQIHHQ")
 _ASIF_CHUNK_MASK = (1 << 55) - 1
 _ASIF_UNINITIALIZED, _ASIF_FULL, _ASIF_UNMAPPED, _ASIF_BITMAP = 0, 1, 2, 3
+# A chunk is read into memory whole, and the header alone sets its size, so a tiny file
+# could ask for gigabytes. The images macOS wrote for the tests use 1 MiB.
+_ASIF_MAX_CHUNK = 64 << 20
 # A sparse bundle (.sparsebundle) is a directory: Info.plist, whose band-size is
 # the size of each band in bytes and whose size is the disk's size in bytes, and a
 # bands folder of files named by band number in lowercase hexadecimal, 0 for the
@@ -7172,6 +7175,10 @@ class EwfImage:
         if not block or block % 512 or not chunk or chunk % block:
             raise EwfFormatError(f"{name}: the ASIF header gives a chunk size of {chunk} "
                                  f"and a block size of {block}")
+        if chunk > _ASIF_MAX_CHUNK:
+            raise EwfFormatError(f"{name}: the ASIF header gives a chunk size of {chunk:,} "
+                                 f"bytes, past the {_ASIF_MAX_CHUNK:,} this reader holds "
+                                 f"in memory")
         per_group = 4 * block
         groups = chunk // (8 * (per_group + 1))
         if not groups:

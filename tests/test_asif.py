@@ -134,6 +134,15 @@ def test_unknown_flags_are_refused(tmp_path):
         ewfprobe.open_ewf(path)
 
 
+def test_a_header_asking_for_a_huge_chunk_is_refused_on_opening(tmp_path):
+    # 112 bytes that declare a 3 GiB chunk must not reach an allocation of that size
+    path = tmp_path / "huge.asif"
+    path.write_bytes(struct.pack(">4sIIIQQ16sQQIHHQ", b"shdw", 1, 80, 0, 80, 96,
+                                 bytes(16), 8, 8, 3 << 30, 512, 0, 0).ljust(112, b"\0"))
+    with pytest.raises(ewfprobe.EwfFormatError, match="chunk size"):
+        ewfprobe.open_ewf(str(path))
+
+
 def test_equal_versions_with_different_directories_are_refused(tmp_path):
     path = write_asif(tmp_path / "a.asif", [], versions=(1, 1), second_table=2)
     with pytest.raises(ewfprobe.EwfFormatError, match="same version"):
