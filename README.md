@@ -1,6 +1,6 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`), AFF (`.aff`, `.afd`) and AFF4 (`.aff4`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.sparsebundle`), virtual machine disks (`.vhd`, `.vhdx`, `.vmdk`, `.qcow2`), and logical evidence, EnCase's (`.L01`) and FTK Imager's (`.ad1`). One file, pure
+A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`), AFF (`.aff`, `.afd`) and AFF4 (`.aff4`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.asif`, `.sparsebundle`), virtual machine disks (`.vhd`, `.vhdx`, `.vmdk`, `.qcow2`), and logical evidence, EnCase's (`.L01`) and FTK Imager's (`.ad1`). One file, pure
 Python, standard library only. No compiler, no network, nothing to install (an
 encrypted Apple disk image or an acquisition FTK Imager encrypted with AD encryption
 needs the optional `pycryptodome` package).
@@ -371,6 +371,7 @@ method writes a zip instead.
 | ULFO | LZFSE, whose streams may hold LZVN blocks | this file (the decoder qnxprobe carries; see below) |
 | UDRO, UFBI | stored, not compressed | this file |
 | UDSP (`.sparseimage`) | 1 MiB bands, stored in the order they were written | this file |
+| ASIF (`.asif`, macOS 26 and later) | chunks through two-level tables, with a per-block bitmap | this file |
 | UDSB (`.sparsebundle`) | a folder of band files, 8 MiB by default | this file |
 | any of the UDIF formats, split by `hdiutil segment` | a `.dmg` and `.dmgpart` files | this file |
 
@@ -677,6 +678,8 @@ Refused with a message naming the reason rather than read wrongly:
   older version 1 format** (`cdsaencr`, with its header at the end of the file), which
   is recognised in order to be refused. No sample of either has been available. So is **a header that asks for more than 50 million PBKDF2
   rounds**; the images measured used 344,827 to 588,235.
+- **An ASIF with a block size other than 512 bytes** is read by the same rules, but
+  `diskutil` has no option to write one, so that case has not been compared with macOS.
 - **An older `.dmg` whose block tables are only in a resource fork**, **a sparse image
   of a version other than 3**, and **a sparse bundle of a backing-store version other
   than 1**.

@@ -9,7 +9,8 @@ Advanced Forensic Format that AFFLIB and FTK Imager write, as a single .aff file
 as an AFD directory of them, AFF4 (.aff4), including one striped across several
 files, and Apple disk images: UDIF (.dmg), compressed with
 zlib, bzip2, LZMA, LZFSE or ADC or stored, including one split into .dmgpart
-segments, sparse images (.sparseimage) and sparse bundles (.sparsebundle). An Apple
+segments, sparse images (.sparseimage), ASIF images (.asif) and sparse bundles
+(.sparsebundle). An Apple
 disk image encrypted with a
 password (hdiutil -encryption, AES-128 or AES-256) opens with that password and
 needs the optional pycryptodome package, and so does an E01, SMART or raw (dd) set
@@ -112,7 +113,7 @@ try:
 except ImportError:
     lzma = None
 
-__version__ = "0.15.1"
+__version__ = "0.16.0"
 
 # ---------------------------------------------------------------- constants
 
@@ -327,6 +328,17 @@ FORMAT_UDIF = "UDIF"
 SPARSEIMAGE_SIGNATURE = b"sprs"
 FORMAT_SPARSEIMAGE = "SPARSEIMAGE"
 _SPARSE_HEADER_SIZE = 4096
+# An Apple Sparse Image (.asif, macOS 26 and later) is a big-endian header, two
+# versioned directories of table chunk numbers, tables of chunk groups, and data
+# chunks. A group is 4 * block size data entries and one bitmap entry. A data entry's
+# top two bits are its state and its low 55 bits its physical chunk. A bitmap holds
+# two bits per block, low bits first. Layout from the CC0 community specification
+# (huven/asif-format), read here against what macOS returns for the same images.
+ASIF_SIGNATURE = b"shdw"
+FORMAT_ASIF = "ASIF"
+_ASIF_HEADER = struct.Struct(">4sIIIQQ16sQQIHHQ")
+_ASIF_CHUNK_MASK = (1 << 55) - 1
+_ASIF_UNINITIALIZED, _ASIF_FULL, _ASIF_UNMAPPED, _ASIF_BITMAP = 0, 1, 2, 3
 # A sparse bundle (.sparsebundle) is a directory: Info.plist, whose band-size is
 # the size of each band in bytes and whose size is the disk's size in bytes, and a
 # bands folder of files named by band number in lowercase hexadecimal, 0 for the
@@ -562,7 +574,7 @@ def is_image(path) -> bool:
     overwrote; an encrypted AFF counts, and opening one needs its passphrase or key,
     which EwfPasswordRequiredError's ``needs`` names), an AFF4 container, an AFD
     directory holding AFF files,
-    an Apple UDIF (.dmg), sparse image (.sparseimage) or sparse bundle
+    an Apple UDIF (.dmg), sparse image (.sparseimage), ASIF (.asif) or sparse bundle
     (.sparsebundle), or a virtual disk virtual_disk_kind names (VHD, VHDX, VMDK,
     QCOW). An L01 holds files rather than a disk; is_logical_evidence answers for it. An
     encrypted Apple disk image is not counted, because it opens only with its
@@ -583,7 +595,8 @@ def is_image(path) -> bool:
                 return True
     except OSError:
         return False
-    return (_is_aff(path) or is_aff4(path) or apple_image_kind(path) in (FORMAT_UDIF, FORMAT_SPARSEIMAGE)
+    return (_is_aff(path) or is_aff4(path) or apple_image_kind(path) in (FORMAT_UDIF, FORMAT_SPARSEIMAGE,
+                                                                     FORMAT_ASIF)
             or virtual_disk_kind(path) is not None)
 
 
@@ -1129,6 +1142,15 @@ def _open_content(path, password=None, keys=None, private_key=None):
         with open(path, "rb") as fh:
             key = (_encrcdsa_unlock(fh, name, password, private_key)
                    if fh.read(8) == DMG_ENCRYPTED_SIGNATURE else None)
+        if key is not None and not key.length:
+            # An encrypted ASIF grows, and macOS records its data length as 0: its
+            # data runs to the end of the file.
+            probe = _EncryptedFile(path, key, key.start, key.block, name)
+            try:
+                if probe.read(len(ASIF_SIGNATURE)) == ASIF_SIGNATURE:
+                    key.length = os.path.getsize(path) - key.start
+            finally:
+                probe.close()
         if key is not None and os.path.getsize(path) < key.start + -(
                 -key.length // key.block) * key.block:
             raise EwfIncompleteSetError(f"{name} ends inside its encrypted data; the "
@@ -1144,7 +1166,7 @@ def _open_content(path, password=None, keys=None, private_key=None):
 
 
 def apple_image_kind(path):
-    """``"UDIF"``, ``"SPARSEIMAGE"``, ``"SPARSEBUNDLE"`` or ``"ENCRYPTED"`` for an
+    """``"UDIF"``, ``"SPARSEIMAGE"``, ``"ASIF"``, ``"SPARSEBUNDLE"`` or ``"ENCRYPTED"`` for an
     Apple disk image, else None. A sparse bundle is a directory. A UDIF image is
     recognised by its trailer, so an uncompressed read-write image, which has none,
     is None here: it is plain disk bytes. ``"ENCRYPTED"`` is any encrypted image,
@@ -1169,6 +1191,8 @@ def apple_image_kind(path):
                 return "ENCRYPTED"
             if head[:4] == SPARSEIMAGE_SIGNATURE:
                 return FORMAT_SPARSEIMAGE
+            if head[:4] == ASIF_SIGNATURE:
+                return FORMAT_ASIF
             if size >= UDIF_TRAILER_SIZE:
                 fh.seek(size - UDIF_TRAILER_SIZE)
                 if fh.read(4) == UDIF_TRAILER_SIGNATURE:
@@ -4000,6 +4024,7 @@ class EwfImage:
         self.vmdk = None
         self._vmdk_extents: list[dict] = []
         self.qcow = None
+        self.asif = None
         # AD1: what the image records about itself, and how its logical space maps
         # onto its files.
         self.ad1 = None
@@ -4055,6 +4080,9 @@ class EwfImage:
             return
         if kind == FORMAT_SPARSEIMAGE:
             self._index_sparseimage()
+            return
+        if kind == FORMAT_ASIF:
+            self._index_asif()
             return
         if kind == FORMAT_UDIF:
             self._index_udif()
@@ -4948,8 +4976,8 @@ class EwfImage:
 
     def _index_encrypted(self):
         """Unlock an encrypted Apple disk image and index what it decrypts to: a UDIF
-        image, a sparse image, or the disk itself (an encrypted read-write image), or,
-        for a sparse bundle, what its bands decrypt to."""
+        image, a sparse image, an ASIF, or the disk itself (an encrypted read-write
+        image), or, for a sparse bundle, what its bands decrypt to."""
         path = self.paths[0]
         name = os.path.basename(path)
         if os.path.isdir(path):
@@ -4975,6 +5003,8 @@ class EwfImage:
                 tail = fh.read(4)
         if head == SPARSEIMAGE_SIGNATURE:
             self._index_sparseimage()
+        elif head == ASIF_SIGNATURE:
+            self._index_asif()
         elif tail == UDIF_TRAILER_SIGNATURE:
             self._index_udif()
         else:
@@ -7069,6 +7099,140 @@ class EwfImage:
         self.chunk_size = band
         self._apple_finish(sectors, FORMAT_SPARSEIMAGE)
 
+    def _index_asif(self):
+        """Read an ASIF header and choose its current directory. Tables are read
+        when a chunk needs them: the directory can address petabytes."""
+        path = self.paths[0]
+        name = os.path.basename(path)
+        fh = self._handle(0)
+        size = self._content_size(path)
+        fh.seek(0)
+        raw = fh.read(_ASIF_HEADER.size)
+        if len(raw) != _ASIF_HEADER.size:
+            raise EwfIncompleteSetError(f"{name} ends inside its ASIF header")
+        (_magic, version, header_size, flags, first, second, image_id, sectors, maximum,
+         chunk, block, segments, metadata) = _ASIF_HEADER.unpack(raw)
+        if version != 1:
+            # hdiutil's -shadow files start with the same four bytes (version 4 seen)
+            raise EwfFormatError(f"{name} starts with the signature ASIF and hdiutil "
+                                 f"shadow files share, at header version {version}; "
+                                 f"only ASIF version 1 is read")
+        if header_size < _ASIF_HEADER.size or flags or segments:
+            raise EwfFormatError(
+                f"{name}: unsupported ASIF header (size {header_size}, flags "
+                f"{flags:#x}, segments {segments})")
+        if not block or block % 512 or not chunk or chunk % block:
+            raise EwfFormatError(f"{name}: the ASIF header gives a chunk size of {chunk} "
+                                 f"and a block size of {block}")
+        per_group = 4 * block
+        groups = chunk // (8 * (per_group + 1))
+        if not groups:
+            raise EwfFormatError(f"{name}: an ASIF chunk of {chunk} bytes cannot hold "
+                                 f"a chunk group")
+        if sectors > maximum:
+            raise EwfFormatError(f"{name}: the ASIF header gives {sectors} sectors, past "
+                                 f"its maximum of {maximum}")
+        per_table = groups * per_group * chunk
+        tables = -(-maximum * block // per_table)
+        length = 8 + tables * 8
+        versions = []
+        for offset in (first, second):
+            if offset < header_size or offset + length > size:
+                raise EwfIncompleteSetError(
+                    f"{name}: an ASIF directory at offset {offset} does not fit in "
+                    f"the file")
+            fh.seek(offset)
+            versions.append(struct.unpack(">Q", _read_exactly(fh, 8))[0])
+        if versions[0] == versions[1] and first != second:
+            fh.seek(first)
+            one = _read_exactly(fh, length)
+            fh.seek(second)
+            if one != _read_exactly(fh, length):
+                raise EwfFormatError(f"{name}: its two ASIF directories have the same "
+                                     f"version, {versions[0]}, and different contents")
+        current = first if versions[0] >= versions[1] else second
+        self.asif = {
+            "version": version, "uuid": str(uuid.UUID(bytes=image_id)),
+            "chunk_size": chunk, "block_size": block, "max_sectors": maximum,
+            "directory_offset": current, "directory_version": max(versions),
+            "metadata_chunk": metadata,
+        }
+        self._asif = {"chunk": chunk, "block": block, "per_group": per_group,
+                      "groups": groups, "directory": current, "tables": tables,
+                      "file_size": size, "bitmap_chunk": None, "bitmap": b""}
+        self.compression_level = "none"
+        self.chunk_size = chunk
+        if sectors * block % 512:
+            raise EwfFormatError(f"{name}: the ASIF disk is not whole 512-byte sectors")
+        self._apple_finish(sectors * block // 512, FORMAT_ASIF)
+
+    def _asif_stored(self, fh, chunk_number, offset, want):
+        """``want`` bytes at ``offset`` into a stored physical chunk."""
+        a = self._asif
+        start = chunk_number * a["chunk"] + offset
+        if start + want > a["file_size"]:
+            raise EwfIncompleteSetError(
+                f"{os.path.basename(self.paths[0])} ends inside ASIF chunk "
+                f"{chunk_number}; the file is cut short")
+        fh.seek(start)
+        return _read_exactly(fh, want)
+
+    def _chunk_data_asif(self, n):
+        a = self._asif
+        name = os.path.basename(self.paths[0])
+        chunk, block, per_group = a["chunk"], a["block"], a["per_group"]
+        want = min(chunk, self.media_size - n * chunk)
+        fh = self._handle(0)
+        table, within = divmod(n, a["groups"] * per_group)
+        fh.seek(a["directory"] + 8 + table * 8)
+        table_chunk = struct.unpack(">Q", _read_exactly(fh, 8))[0]
+        if not table_chunk:
+            return bytes(want)
+        group, slot = divmod(within, per_group)
+        base = group * 8 * (per_group + 1)
+        entry = struct.unpack(">Q", self._asif_stored(fh, table_chunk, base + slot * 8, 8))[0]
+        state, physical = entry >> 62, entry & _ASIF_CHUNK_MASK
+        if state in (_ASIF_UNINITIALIZED, _ASIF_UNMAPPED):
+            if physical:
+                raise EwfFormatError(f"{name}: ASIF chunk {n} has state {state} and a "
+                                     f"physical chunk, which is not a documented state")
+            return bytes(want)
+        if not physical:
+            raise EwfFormatError(f"{name}: ASIF chunk {n} is stored but names chunk 0, "
+                                 f"which holds the header")
+        if state == _ASIF_FULL:
+            return self._asif_stored(fh, physical, 0, want)
+        bitmap_entry = struct.unpack(
+            ">Q", self._asif_stored(fh, table_chunk, base + per_group * 8, 8))[0]
+        bitmap_chunk = bitmap_entry & _ASIF_CHUNK_MASK
+        if not bitmap_chunk:
+            raise EwfFormatError(f"{name}: ASIF chunk {n} uses a bitmap its group "
+                                 f"does not have")
+        if a["bitmap_chunk"] != bitmap_chunk:
+            a["bitmap"] = self._asif_stored(fh, bitmap_chunk, 0, chunk)
+            a["bitmap_chunk"] = bitmap_chunk
+        bitmap = a["bitmap"]
+        first = slot * (chunk // block)
+        blocks = want // block
+        out = bytearray(want)
+        run = None
+        for index in range(blocks + 1):
+            written = False
+            if index < blocks:
+                sector = first + index
+                value = (bitmap[sector // 4] >> ((sector % 4) * 2)) & 3
+                if value == 3:
+                    raise EwfFormatError(f"{name}: ASIF chunk {n} has an invalid bitmap "
+                                         f"state at block {index}")
+                written = value == 1
+            if written and run is None:
+                run = index
+            elif not written and run is not None:
+                out[run * block:index * block] = self._asif_stored(
+                    fh, physical, run * block, (index - run) * block)
+                run = None
+        return bytes(out)
+
     def _index_sparsebundle(self):
         """Read a sparse bundle's Info.plist and list its band files."""
         directory = self.paths[0]
@@ -7462,6 +7626,8 @@ class EwfImage:
             return self._keep(n, self._chunk_data_udif(n), want)
         if self.format == FORMAT_SPARSEIMAGE:
             return self._keep(n, self._chunk_data_sparse(n), want)
+        if self.format == FORMAT_ASIF:
+            return self._keep(n, self._chunk_data_asif(n), want)
         if self.format == FORMAT_SPARSEBUNDLE:
             return self._keep(n, self._chunk_data_bundle(n), want)
         if self.format == FORMAT_UDRW:
@@ -7782,6 +7948,7 @@ class EwfImage:
             "vhdx": None if self.vhdx is None else dict(self.vhdx),
             "vmdk": None if self.vmdk is None else dict(self.vmdk),
             "qcow": None if self.qcow is None else dict(self.qcow),
+            "asif": None if self.asif is None else dict(self.asif),
             "ad1": None if self.ad1 is None else {
                 key: value for key, value in self.ad1.items()
                 if key not in ("first_item", "footer")},
@@ -7925,6 +8092,11 @@ def _cmd_info(args):
             elif d["format"] == FORMAT_SPARSEIMAGE:
                 print(f"band size       {d['chunk_size']:,} bytes")
                 print(f"bands stored    {d['stored_bands']:,} of {d['chunk_count']:,}")
+            elif d["format"] == FORMAT_ASIF:
+                a = d["asif"]
+                print(f"chunk size      {a['chunk_size']:,} bytes")
+                print(f"block size      {a['block_size']:,} bytes")
+                print(f"image uuid      {a['uuid']}")
             elif d["format"] == FORMAT_SPARSEBUNDLE:
                 b = d["sparsebundle"]
                 print(f"band size       {b['band_size']:,} bytes")
@@ -8259,7 +8431,7 @@ def main(argv=None):
         prog="ewfprobe",
         description="Read an EnCase/EWF (.E01, .Ex01), SMART (.s01), AFF (.aff, "
                     ".afd) or AFF4 (.aff4) forensic image, an Apple disk image (.dmg, .sparseimage, "
-                    ".sparsebundle), a virtual machine disk (.vhd, .vhdx, .vmdk, .qcow2), "
+                    ".asif, .sparsebundle), a virtual machine disk (.vhd, .vhdx, .vmdk, .qcow2), "
                     "an E01, SMART or raw set FTK Imager encrypted "
                     "with AD encryption, or logical evidence: EnCase's (.L01) or "
                     "FTK Imager's (.ad1). Read only.")
