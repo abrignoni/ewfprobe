@@ -692,6 +692,8 @@ Refused with a message naming the reason rather than read wrongly:
   rounds**; the images measured used 344,827 to 588,235.
 - **An ASIF with a block size other than 512 bytes** is read by the same rules, but
   `diskutil` has no option to write one, so that case has not been compared with macOS.
+- **An ASIF whose header gives a chunk larger than 64 MiB** is refused, because a chunk is
+  read into memory whole. The images macOS wrote for the tests use 1 MiB.
 - **An older `.dmg` whose block tables are only in a resource fork**, **a sparse image
   of a version other than 3**, and **a sparse bundle of a backing-store version other
   than 1**.
