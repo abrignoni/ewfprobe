@@ -698,17 +698,6 @@ def test_a_corrupt_ex01_chunk_table_is_refused(tmp_path):
         ewfprobe.open_ewf(path)
 
 
-def test_lx01_logical_evidence_is_named_not_misread(tmp_path):
-    (tmp_path / "y.Lx01").write_bytes(b"LEF2\r\n\x81\x00" + b"\x00" * 120)
-    with pytest.raises(ewfprobe.EwfFormatError, match="Lx01"):
-        ewfprobe.open_ewf(str(tmp_path / "y.Lx01"), segments=[str(tmp_path / "y.Lx01")])
-    with pytest.raises(ewfprobe.EwfFormatError, match="Lx01"):
-        ewfprobe.open_ewf(str(tmp_path / "y.Lx01"))
-    (tmp_path / "z.Lx01").write_bytes(b"\x00" * 128)      # refused by its name alone
-    with pytest.raises(ewfprobe.EwfFormatError, match="has an Lx01 name"):
-        ewfprobe.open_ewf(str(tmp_path / "z.Lx01"))
-
-
 def test_ex01_extension_sequence_and_detection(tmp_path):
     seq = list(ewfprobe._extension_sequence_v2())
     assert seq[0] == "Ex01" and seq[98] == "Ex99" and seq[99] == "ExAA"

@@ -1,6 +1,6 @@
 # ewfprobe
 
-A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`), AFF (`.aff`, `.afd`) and AFF4 (`.aff4`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.asif`, `.sparsebundle`), virtual machine disks (`.vhd`, `.vhdx`, `.vmdk`, `.qcow2`), and logical evidence, EnCase's (`.L01`) and FTK Imager's (`.ad1`). One file, pure
+A read-only reader for EnCase/EWF (`.E01`, `.Ex01`), SMART (`.s01`), AFF (`.aff`, `.afd`) and AFF4 (`.aff4`) forensic images, Apple disk images (`.dmg`, including one split into `.dmgpart` files, `.sparseimage`, `.asif`, `.sparsebundle`), virtual machine disks (`.vhd`, `.vhdx`, `.vmdk`, `.qcow2`), and logical evidence, EnCase's (`.L01`, `.Lx01`) and FTK Imager's (`.ad1`). One file, pure
 Python, standard library only. No compiler, no network, nothing to install (an
 encrypted Apple disk image or an acquisition FTK Imager encrypted with AD encryption
 needs the optional `pycryptodome` package).
@@ -253,6 +253,18 @@ column exactly as the ltree stores it. `open_entry()` gives an entry's content a
 a seekable file and `read_entry()` reads it whole. `ewfprobe files` lists the
 entries, `ewfprobe export --entry` writes one out, and `verify` checks every MD5
 EnCase stored for an entry.
+
+Lx01, the EWF2 logical evidence EnCase 7 and later write, opens the same way, in
+segments named `.Lx01`, `.Lx02` and on, with the same entries and the same calls.
+Measured on files EnCase Forensic Imager 7.10 wrote: the file tree is the L01's
+UTF-16 text with no ltree header, followed by an Adler-32 of the text, and the
+section descriptor's MD5 covers both. The device information leaves the sector
+count empty, so the media size comes from the tree. Chunks are 256 KiB.
+
+With "Include contents of folder objects" off, which is the Imager's default, a
+folder records a size and an MD5 and stores one placeholder byte. Its entry's
+`content_collected` is False, reading it raises an error rather than returning
+something that is not the folder's content, and `verify` counts it as not checked.
 
 Measured on the five real L01s described under validation:
 
@@ -632,16 +644,16 @@ acquisition for the same reason; `is_adcrypt()` and `adcrypt_set()` answer for i
 
 Refused with a message naming the reason rather than read wrongly:
 
-- **Encrypted Ex01.** EnCase can encrypt an Ex01, and the encryption is not
+- **Encrypted Ex01 and Lx01.** EnCase can encrypt both, and the encryption is not
   publicly documented.
-- **Ex01 compressed with bzip2.** The format allows it, EnCase does not appear to
-  offer it, and no sample exists to check a reader against.
-- **Lx01**, the logical evidence EnCase 7 writes in the EWF2 format. No sample
-  has been available.
+- **Ex01 or Lx01 compressed with bzip2.** The format allows it, EnCase Imager 7.10
+  does not offer it for Lx01, and no sample exists to check a reader against.
+- **An Lx01 whose file tree fails its MD5 or Adler-32**, or that has no file tree.
 - **An L01 whose ltree fails its own MD5, Adler-32 or size**, or lacks the total
   size or the entry list, and **an L01 entry** whose extents are shorter than its
   size, reach past the media data, carry an extent type, or give a duplicate
-  offset without the sparse flag. None of those occur in the tested files.
+  offset without the sparse flag. Apart from the uncollected folders described
+  above, none of those occur in the tested files.
 - **AD1 other than version 4**, the version FTK Imager 3.4.3.3 and 4.7.3.61 write.
   pyad1's notes describe a version 3 with a different header; no sample has been
   available. Also **an AD1 set with a file missing, cut short or out of place**, whose
@@ -742,9 +754,9 @@ Ex01 is covered by two fixtures written by `ewfacquire -f encase7-v2` (libewf
 20260924; the libewf 20140817 that Homebrew installs writes an ordinary E01 when
 asked for Ex01), which between them hold all three chunk forms, and by a
 multi-segment set built by the test suite's own writer. A nine-segment set from
-libewf was also checked by hand. No Ex01 written by EnCase itself has been
-available, so Ex01 support rests on the EWF2 documentation and on libewf's writer
-until one is.
+libewf was also checked by hand. One Ex01 written by EnCase Forensic Imager 7.10,
+three segments of a 127 MiB test volume, also reads with every chunk checksum
+passing and its MD5 matching the one the Imager stored. It is not committed.
 
 AFF is covered by three fixtures written by `affconvert` from AFFLIB 3.7.22, with
 a 64 KiB page so that zero pages, deflated pages, LZMA pages and stored pages all
@@ -823,6 +835,14 @@ publishes its scenario data under CC0, excluding any material inside an image th
 claims its own copyright. No L01 from another writer has been available; a writer
 in the suite built from the specification and from the layout of these files
 covers the behaviours that file does not exercise.
+
+Lx01 was checked against sets EnCase Forensic Imager 7.10 (x64) wrote from synthetic
+files whose MD5 and SHA-1 were recorded first: compressed, with compression disabled,
+and split into three segments. Every file's content matches both hashes, and so does
+an L01 the Imager wrote of the same files. Two small sets, compressed and not, are
+committed under `tests/fixtures` with those known answers. This is one writer and
+one version, run under x64 emulation on Windows on ARM. Lx01 from another EnCase
+version or from Tableau hardware has not been tested.
 
 AD1 was checked against images FTK Imager wrote, with FTK Imager as the oracle. Three
 were made with FTK Imager 4.7.3.61 from a folder of known content, recorded file by file

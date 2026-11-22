@@ -16,7 +16,7 @@ ewfprobe, built as a standalone executable
                       .sparseimage and .sparsebundle disk images, the
                       virtual machine disks .vhd, .vhdx, .vmdk, .qcow and
                       .qcow2 (a differencing disk, delta or overlay with its parent
-                      in the same folder), and the files in an .L01 or an
+                      in the same folder), and the files in an .L01, .Lx01 or an
                       FTK Imager .ad1. For a split
                       set, keep every segment (.E01, .E02, ..., .ad1, .ad2,
                       ..., a .dmg and its .dmgpart files, or the files of a

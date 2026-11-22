@@ -10,7 +10,7 @@ command line prints:
   Info           the acquisition's geometry and metadata.
   Verify         recomputes the media hash and compares it with the stored one; the
                  progress bar follows the percentage ewfprobe prints on stderr.
-  List entries   the entries of an L01 or AD1, in a table.
+  List entries   the entries of an L01, Lx01 or AD1, in a table.
   Export...      writes the acquired disk out as a raw image, or, when an entry is
                  selected in the table, that entry's content.
 
@@ -122,7 +122,7 @@ def build_window(initial_image="", smoke=None):
     actions = (b_info, b_verify, b_files, b_export)
     for button in (b_verify, b_info, b_files, b_export, b_cancel):
         button.pack(side="left", padx=(0, 8))
-    ttk.Label(buttons, text="List entries is for L01 and AD1; select one to export it alone",
+    ttk.Label(buttons, text="List entries is for L01, Lx01 and AD1; select one to export it alone",
               style="Muted.TLabel").pack(side="left", padx=(6, 0))
 
     status_bar = ttk.Frame(page)
