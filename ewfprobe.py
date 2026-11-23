@@ -8202,7 +8202,9 @@ class EwfImage:
         has been tried, with this dict as the error's ``result``, so that a caller
         reading only the older keys cannot take it for a pass. The last three do not
         raise when a stored hash of the whole matches, which proves what was read.
-        With ``keep_going`` the dict is returned instead.
+        With ``keep_going`` the dict is returned instead. This holds for L01, Lx01, AD1
+        and ASIF. Another format raises at the first chunk it cannot read, with no
+        ``result``, with or without ``keep_going``.
         """
         names = ["MD5", "SHA1"] + [n for n in ("SHA256", "SHA512", "BLAKE2B")
                                    if n in self.stored_hashes]
