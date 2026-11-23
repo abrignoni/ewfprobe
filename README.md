@@ -56,13 +56,18 @@ acquisition recorded, and also when a chunk fails its checksum, runs out of data
 cannot be read, or an entry of logical evidence cannot be read, whether or not any
 hash was stored. `verify()` reports those in `checksum_errors`, `padded_chunks`,
 `unreadable_chunks` and `entry_unreadable`, and counts the entries holding data with
-no stored hash in `entry_no_stored_hash`. After trying the whole image, `verify()`
-raises `EwfFormatError`, with the full result as its `result`, for damage the older keys
-cannot show (a chunk that cannot be read, or an unreadable entry with no stored hash);
-`verify(keep_going=True)` returns the result instead. `export` does not refuse damaged data: it
-writes what it reads, warns on stderr and exits 1 when what it wrote came from a
-damaged chunk. At a chunk it cannot read at all it stops, keeps what came before it,
-and exits 2.
+no stored hash in `entry_no_stored_hash`. Unless a stored hash of the whole matches,
+it also exits non-zero for a chunk table with no copy that passes (`table_errors`), AD1
+bytes its item tree does not reach (`logical_unreached_bytes`) and an L01 segment whose
+set GUID differs from the others (`segment_set_errors`). After trying the whole image,
+`verify()` raises `EwfFormatError`, with the full result as its `result`, for damage the
+older keys cannot show (a chunk that cannot be read, an unreadable entry with no stored
+hash, unreached AD1 bytes or a differing set GUID); `verify(keep_going=True)` returns the
+result instead. `export` does not refuse damaged data: it writes what it reads, warns on
+stderr and exits 1 when what it wrote came from a damaged chunk or table, or from a set
+whose segments disagree. At a chunk it cannot read at all it stops, keeps what came
+before it, and exits 2. `export --entry` writes the whole entry and refuses `--offset`
+and `--length`.
 
 Some damage is read rather than refused, as earlier versions read it: an E01, SMART or
 Ex01 chunk whose zlib stream is cut or gives fewer bytes than the chunk covers, a stored

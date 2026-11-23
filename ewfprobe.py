@@ -3595,6 +3595,37 @@ def _ad1_time(text):
     return when.timestamp() + (int(frac.ljust(6, "0")) / 1e6 if frac else 0)
 
 
+# verify() joins the spans of an AD1 it has reached whenever it holds this many, so a
+# tree of millions of items costs a few joined spans and not a list of all of them.
+_AD1_SPANS_HELD = 1 << 16
+
+
+def _joined_spans(spans):
+    """(start, end) spans, sorted, with those that touch or overlap made one."""
+    out = []
+    for low, high in sorted(spans):
+        if out and low <= out[-1][1]:
+            if high > out[-1][1]:
+                out[-1] = (out[-1][0], high)
+        elif high > low:
+            out.append((low, high))
+    return out
+
+
+def _spans_missing(spans, total):
+    """The (offset, length) runs of [0, total) that ``spans`` leave out."""
+    missing, at = [], 0
+    for low, high in _joined_spans(spans):
+        if low > at:
+            missing.append((at, min(low, total) - at))
+        at = max(at, high)
+        if at >= total:
+            break
+    if at < total:
+        missing.append((at, total - at))
+    return [(offset, length) for offset, length in missing if length > 0]
+
+
 class Ad1Entry:
     """One item of an AD1's file tree.
 
@@ -4076,6 +4107,10 @@ class EwfImage:
         # E01/L01 chunk tables that failed their Adler-32, and whether the table2
         # copy was read in their place; see _add_table.
         self.table_errors: list[dict] = []
+        # The chunks of the tables above with no copy that passes, (first, count).
+        self._unproven_tables: list[tuple[int, int]] = []
+        # L01 segments whose set GUID differs from the first segment's that has one.
+        self.segment_set_errors: list[dict] = []
         self.chunk_size = 0
         self.media_size = 0
         self.size = 0
@@ -4216,6 +4251,7 @@ class EwfImage:
         chunks = 0
         volume_seen = False
         last_name = None
+        set_guids, set_file = None, None
         for i, path in enumerate(self.paths):
             fh = self._handle(i)
             size_on_disk = (os.path.getsize(path) if self.encryption is None
@@ -4224,12 +4260,18 @@ class EwfImage:
             # A table is indexed once the section after it is known: a table2
             # there is its copy, read only when the table fails a checksum.
             pending = None
+            guids = set()
             for segno, name, offset, size, _next in _sections(fh, path):
                 if segno != expect_segment:
                     raise EwfFormatError(
                         f"{os.path.basename(path)} says it is segment {segno}, "
                         f"but it sits at position {expect_segment} of the set")
                 last_name = name
+                if logical and name in ("volume", "disk", "data") and size >= 80:
+                    fh.seek(offset + 64)
+                    guid = _read_exactly(fh, 16)
+                    if any(guid):               # an all-zero value is not compared
+                        guids.add(guid)
                 if pending is not None:
                     copy = (self._read_table(fh, name, offset, size)
                             if name == "table2" and pending["failed"] else None)
@@ -4257,6 +4299,13 @@ class EwfImage:
                     self._parse_ltree(_read_exactly(fh, size))
             if pending is not None:
                 chunks += self._add_table(i, pending, chunks, size_on_disk)
+            # Recorded and not refused: no real multi-segment L01 was available to show
+            # that every writer keeps this value the same across a set.
+            if guids and set_guids is None:
+                set_guids, set_file = guids, os.path.basename(path)
+            elif guids and not guids & set_guids:
+                self.segment_set_errors.append({"file": os.path.basename(path),
+                                                "expected_file": set_file})
 
             if last_name == "next" and i == len(self.paths) - 1:
                 raise EwfIncompleteSetError(
@@ -5541,10 +5590,23 @@ class EwfImage:
         mismatched = {"md5": [], "sha1": []}
         unreadable = []
         no_hash = 0
+        reached = self._ad1_fixed_spans()
         for entry in sorted(self.logical_entries, key=lambda e: e.address):
             item = self._ad1_read(entry.address, entry.header_length)
             for h in image.values():
                 h.update(item)
+            reached.append((entry.address, entry.address + entry.header_length))
+            if entry.chunk_table:
+                try:
+                    bounds = self._ad1_chunks(entry)
+                except EwfError:
+                    pass                    # its bytes stay unreached; the read reports it
+                else:
+                    reached.append((entry.chunk_table,
+                                    entry.chunk_table + 8 + 8 * len(bounds)))
+                    reached.append((bounds[0], bounds[-1]))
+            if len(reached) > _AD1_SPANS_HELD:
+                reached = _joined_spans(reached)
             own = {"md5": hashlib.md5(), "sha1": hashlib.sha1()}
             failed = False
             if entry.size and entry.md5 is None and entry.sha1 is None:
@@ -5570,6 +5632,7 @@ class EwfImage:
             for addr, length, *_rest in self._ad1_records(
                     entry.metadata_address, _Lazy(lambda: entry.path), keep=()):
                 data = self._ad1_read(addr, length)
+                reached.append((addr, addr + length))
                 for h in image.values():
                     h.update(data)
             for algo, stored in (("md5", entry.md5), ("sha1", entry.sha1)):
@@ -5580,7 +5643,22 @@ class EwfImage:
         for algo in algos:
             image[algo].update(content[algo].digest())
         return ({a: h.hexdigest() for a, h in image.items()}, done, checked, mismatched,
-                unreadable, no_hash)
+                unreadable, no_hash, _spans_missing(reached, total))
+
+    def _ad1_fixed_spans(self):
+        """The parts of an AD1's logical space that no item names: its header with the
+        eight bytes after it, its source name, its image metadata and its footer, as
+        (start, end). The header stops at the source name and not at the first item,
+        so that a first-item address moved forward does not count what it skips."""
+        (_sig, _version, _one, _chunk, meta_addr, first_item, name_length, _tag, name_addr,
+         footer, _zero, _footer2) = _AD1_HEADER.unpack(self._ad1_read(0, _AD1_HEADER.size))
+        spans = [(0, max(_AD1_HEADER.size, min(first_item, name_addr))),
+                 (name_addr, name_addr + name_length)]
+        spans += [(addr, addr + length) for addr, length, *_rest in
+                  self._ad1_records(meta_addr, "the image", keep=())]
+        if footer:
+            spans.append((footer, self.ad1["logical_size"]))
+        return spans
 
     def _note_encryption(self, key):
         if key.rounds is None:                  # opened with a certificate's private key
@@ -7322,21 +7400,24 @@ class EwfImage:
             raise EwfFormatError(f"{name}: the ASIF disk is not whole 512-byte sectors")
         self._apple_finish(sectors * block // 512, FORMAT_ASIF)
 
-    def _asif_stored(self, fh, chunk_number, offset, want):
-        """``want`` bytes at ``offset`` into a stored physical chunk."""
+    def _asif_stored(self, fh, chunk_number, offset, want, read=True):
+        """``want`` bytes at ``offset`` into a stored physical chunk. With ``read``
+        False, only that the file holds them is checked."""
         a = self._asif
         start = chunk_number * a["chunk"] + offset
         if start + want > a["file_size"]:
             raise EwfIncompleteSetError(
                 f"{os.path.basename(self.paths[0])} ends inside ASIF chunk "
                 f"{chunk_number}; the file is cut short")
+        if not read:
+            return b""
         fh.seek(start)
         return _read_exactly(fh, want)
 
     def _chunk_data_asif(self, n, check_only=False):
-        """A chunk's bytes. With ``check_only``, its table entry and bitmap are checked
-        and its data is not read, for a stored chunk already read through another
-        entry."""
+        """A chunk's bytes. With ``check_only``, its table entry and bitmap are checked,
+        and that the file holds the blocks it names, and its data is not read, for a
+        stored chunk already read through another entry."""
         a = self._asif
         name = os.path.basename(self.paths[0])
         chunk, block, per_group = a["chunk"], a["block"], a["per_group"]
@@ -7360,7 +7441,7 @@ class EwfImage:
             raise EwfFormatError(f"{name}: ASIF chunk {n} is stored but names chunk 0, "
                                  f"which holds the header")
         if state == _ASIF_FULL:
-            return b"" if check_only else self._asif_stored(fh, physical, 0, want)
+            return self._asif_stored(fh, physical, 0, want, read=not check_only)
         bitmap_entry = struct.unpack(
             ">Q", self._asif_stored(fh, table_chunk, base + per_group * 8, 8))[0]
         bitmap_chunk = bitmap_entry & _ASIF_CHUNK_MASK
@@ -7387,9 +7468,10 @@ class EwfImage:
             if written and run is None:
                 run = index
             elif not written and run is not None:
+                stored = self._asif_stored(fh, physical, run * block, (index - run) * block,
+                                           read=not check_only)
                 if not check_only:
-                    out[run * block:index * block] = self._asif_stored(
-                        fh, physical, run * block, (index - run) * block)
+                    out[run * block:index * block] = stored
                 run = None
         return bytes(out)
 
@@ -7677,6 +7759,9 @@ class EwfImage:
                                   len(data), True)
             return data
         if flags & V2_CHUNK_CHECKSUMED:
+            if len(raw) < 4:
+                raise EwfFormatError(f"chunk {n:,} stores {len(raw)} bytes, too few to "
+                                     f"hold its 4-byte checksum")
             data, stored = raw[:-4], struct.unpack("<I", raw[-4:])[0]
             if zlib.adler32(data) & 0xFFFFFFFF != stored and n not in self.checksum_errors:
                 self.checksum_errors.append(n)
@@ -7761,6 +7846,8 @@ class EwfImage:
                     f"{os.path.basename(self.paths[segment_index])}: its chunk table "
                     f"fails its checksum, counts {used['count']:,} entries, more than "
                     f"its section holds, and has no table2 copy that passes")
+            if not good and used["count"]:
+                self._unproven_tables.append((first_chunk, used["count"]))
         if used["count"] == 0:
             return 0
         self._table_starts.append(first_chunk)
@@ -7943,6 +8030,14 @@ class EwfImage:
                                 f"gave {p['decoded']:,} of {p['length']:,} bytes"
                    + (", its stream cut" if p["cut"] else ""))
                   for p in self._padded.values() if hit(p["offset"], p["length"])]
+        found += [(first * self.chunk_size,
+                   f"the chunk table of chunks {first:,} to {first + count - 1:,} fails its "
+                   f"checksum and has no copy that passes")
+                  for first, count in self._unproven_tables
+                  if hit(first * self.chunk_size, count * self.chunk_size)]
+        if merged:      # which segment is the foreign one is not known, so any read counts
+            found += [(0, f"{e['file']} records a different acquisition than "
+                          f"{e['expected_file']}") for e in self.segment_set_errors]
         return [text for _offset, text in sorted(found)]
 
     def _entry_damage(self, entry):
@@ -8087,10 +8182,12 @@ class EwfImage:
         Every entry is tried and every failure is listed in ``unreadable_chunks`` and
         ``entry_unreadable``. An unreadable entry that stores a hash also counts as a
         mismatch of it. Damage no older key can show (a chunk that cannot be read, an
-        entry with no stored hash that cannot be read) raises EwfFormatError once the
+        entry with no stored hash that cannot be read, AD1 bytes the item tree does not
+        reach, an L01 segment naming another acquisition) raises EwfFormatError once the
         whole image has been tried, with this dict as the error's ``result``, so that
-        a caller reading only the older keys cannot take it for a pass. With
-        ``keep_going`` the dict is returned instead.
+        a caller reading only the older keys cannot take it for a pass. The last two do
+        not raise when a stored hash of the whole matches, which proves what was read.
+        With ``keep_going`` the dict is returned instead.
         """
         names = ["MD5", "SHA1"] + [n for n in ("SHA256", "SHA512", "BLAKE2B")
                                    if n in self.stored_hashes]
@@ -8156,11 +8253,11 @@ class EwfImage:
         checked, mismatched = 0, []
         sha1_checked, sha1_mismatched = 0, []
         not_collected = []
-        unreadable, no_hash = [], 0
+        unreadable, no_hash, unreached = [], 0, []
         if ad1:
             checked, mismatched = ad1[2]["md5"], ad1[3]["md5"]
             sha1_checked, sha1_mismatched = ad1[2]["sha1"], ad1[3]["sha1"]
-            unreadable, no_hash = ad1[4], ad1[5]
+            unreadable, no_hash, unreached = ad1[4], ad1[5], ad1[6]
         for entry in [] if ad1 else self.logical_entries:
             if not entry.content_collected:
                 not_collected.append(entry.path)
@@ -8215,14 +8312,28 @@ class EwfImage:
             "entry_no_stored_hash": no_hash,
             "unreadable_chunks": unreadable_chunks,
             "container_checks": container,
+            "logical_unreached_bytes": sum(length for _offset, length in unreached),
+            "logical_unreached_spans": [{"offset": offset, "length": length}
+                                        for offset, length in unreached[:5]],
+            "segment_set_errors": [dict(e) for e in self.segment_set_errors],
         }
         shown = {*mismatched, *sha1_mismatched}
         hidden = [e for e in unreadable if e["path"] not in shown]
-        if (unreadable_chunks or hidden) and not keep_going:
-            first = (unreadable_chunks or hidden)[0]["error"]
-            error = EwfFormatError(f"{len(unreadable_chunks):,} chunks and "
-                                   f"{len(unreadable):,} entries could not be read; "
-                                   f"the first: {first}")
+        # A stored hash of the whole that matches proves what was read, so these two
+        # are damage only without one.
+        structure = [] if match is True else [
+            *([f"{result['logical_unreached_bytes']:,} bytes of the AD1's logical space "
+               f"were not reached from its item tree"] if unreached else []),
+            *[f"{e['file']} records a different acquisition than {e['expected_file']}"
+              for e in self.segment_set_errors]]
+        if (unreadable_chunks or hidden or structure) and not keep_going:
+            if unreadable_chunks or hidden:
+                first = (unreadable_chunks or hidden)[0]["error"]
+                text = (f"{len(unreadable_chunks):,} chunks and {len(unreadable):,} "
+                        f"entries could not be read; the first: {first}")
+            else:
+                text = structure[0]
+            error = EwfFormatError(text)
             error.result = result
             raise error
         return result
@@ -8233,6 +8344,7 @@ class EwfImage:
             # only what has been read so far; verify() reads every chunk
             "padded_chunks": self.padded_chunks,
             "table_errors": [dict(e) for e in self.table_errors],
+            "segment_set_errors": [dict(e) for e in self.segment_set_errors],
             "segments": [os.path.basename(p) for p in self.paths],
             "segment_count": len(self.paths),
             "format": self.format,
@@ -8646,9 +8758,23 @@ def _cmd_verify(args):
         if img.format == FORMAT_ASIF and not result["stored"]:
             print(f"an ASIF stores no hash; {result['bytes']:,} bytes of allocated chunks "
                   f"were read, {len(result['unreadable_chunks']):,} chunks could not be")
+        unreached = result["logical_unreached_bytes"]
+        if unreached:
+            print(f"bytes of the AD1's logical space not reached from its item tree, so "
+                  f"entries may be missing: {unreached:,}")
+            for s in result["logical_unreached_spans"]:
+                print(f"  {s['length']:,} bytes at logical offset {s['offset']:,}")
+        for e in result["segment_set_errors"]:
+            print(f"{_shown(e['file'])} records a different acquisition than "
+                  f"{_shown(e['expected_file'])}")
         # padded_zeros_read also counts zeros read from a differencing disk's parent
         damaged = bool(result["checksum_errors"] or padded or result["unreadable_chunks"]
                        or result["entry_unreadable"] or img.padded_zeros_read)
+        # A stored hash of the whole that matches proves what these could have changed.
+        if result["match"] is not True and (
+                unreached or result["segment_set_errors"]
+                or any(t["used"] != "table2" for t in tables)):
+            damaged = True
         failed = [c for c in result["container_checks"] if not c["match"]]
         for c in result["container_checks"]:
             verdict = "matches" if c["match"] else f"DOES NOT MATCH stored {c['stored']}"
@@ -8778,6 +8904,9 @@ def _cmd_export(args):
 
 
 def _export_entry(args):
+    if args.offset or args.length is not None:
+        raise EwfError("--offset and --length apply to an export of the whole image; "
+                       "--entry writes the whole entry, so use one or the other")
     with _open_cli(args) as img:
         entry = img.find_entry(args.entry)
         with img.open_entry(entry) as fh:
@@ -8839,8 +8968,10 @@ def main(argv=None):
                    help="the path of an L01, Lx01 or AD1 entry, as the files command "
                         "lists it")
     s.add_argument("-o", "--output", default="-", help="output file, or - for stdout")
-    s.add_argument("--offset", type=int, default=0, help="start at this byte offset")
-    s.add_argument("--length", type=int, default=None, help="write this many bytes")
+    s.add_argument("--offset", type=int, default=0,
+                   help="start at this byte offset (not with --entry)")
+    s.add_argument("--length", type=int, default=None,
+                   help="write this many bytes (not with --entry)")
     s.add_argument("-q", "--quiet", action="store_true", help="no progress output")
     s.set_defaults(func=_cmd_export)
 
