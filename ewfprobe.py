@@ -7959,6 +7959,20 @@ class EwfImage:
             if not ended or len(data) < want:
                 self._note_padded("chunk", n, n * self.chunk_size, want, len(data),
                                   not ended)
+        elif self.format == FORMAT_L01 and want < self.chunk_size:
+            # An L01 writer fills the last chunk up to a whole sector and takes the
+            # Adler-32 over the filled bytes. A tail stored with its Adler-32 straight
+            # after it is also accepted. The first ``want`` bytes are the data in both.
+            filled = -(-want // self.sector_size) * self.sector_size
+            raw = fh.read(filled + 4)
+            data = raw[:want]
+            if len(data) < want:
+                self._note_padded("chunk", n, n * self.chunk_size, want, len(data), False)
+            if len(raw) >= want + 4 and not any(
+                    len(raw) >= size + 4 and zlib.adler32(raw[:size]) & 0xFFFFFFFF
+                    == struct.unpack_from("<I", raw, size)[0] for size in (filled, want)):
+                if n not in self.checksum_errors:
+                    self.checksum_errors.append(n)
         else:
             data = fh.read(want)
             if len(data) < want:
@@ -8183,10 +8197,11 @@ class EwfImage:
         ``entry_unreadable``. An unreadable entry that stores a hash also counts as a
         mismatch of it. Damage no older key can show (a chunk that cannot be read, an
         entry with no stored hash that cannot be read, AD1 bytes the item tree does not
-        reach, an L01 segment naming another acquisition) raises EwfFormatError once the
-        whole image has been tried, with this dict as the error's ``result``, so that
-        a caller reading only the older keys cannot take it for a pass. The last two do
-        not raise when a stored hash of the whole matches, which proves what was read.
+        reach, an L01 segment naming another acquisition, a chunk table that fails its
+        checksum with no copy that passes) raises EwfFormatError once the whole image
+        has been tried, with this dict as the error's ``result``, so that a caller
+        reading only the older keys cannot take it for a pass. The last three do not
+        raise when a stored hash of the whole matches, which proves what was read.
         With ``keep_going`` the dict is returned instead.
         """
         names = ["MD5", "SHA1"] + [n for n in ("SHA256", "SHA512", "BLAKE2B")
@@ -8325,7 +8340,11 @@ class EwfImage:
             *([f"{result['logical_unreached_bytes']:,} bytes of the AD1's logical space "
                f"were not reached from its item tree"] if unreached else []),
             *[f"{e['file']} records a different acquisition than {e['expected_file']}"
-              for e in self.segment_set_errors]]
+              for e in self.segment_set_errors],
+            # the same test the verify command applies, a table of no entries included
+            *[f"the chunk table at byte {e['offset']:,} of {e['file']} fails its checksum "
+              f"and has no copy that passes"
+              for e in self.table_errors if e["used"] != "table2"]]
         if (unreadable_chunks or hidden or structure) and not keep_going:
             if unreadable_chunks or hidden:
                 first = (unreadable_chunks or hidden)[0]["error"]

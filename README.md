@@ -62,12 +62,12 @@ bytes its item tree does not reach (`logical_unreached_bytes`) and an L01 segmen
 set GUID differs from the others (`segment_set_errors`). After trying the whole image,
 `verify()` raises `EwfFormatError`, with the full result as its `result`, for damage the
 older keys cannot show (a chunk that cannot be read, an unreadable entry with no stored
-hash, unreached AD1 bytes or a differing set GUID); `verify(keep_going=True)` returns the
-result instead. `export` does not refuse damaged data: it writes what it reads, warns on
-stderr and exits 1 when what it wrote came from a damaged chunk or table, or from a set
-whose segments disagree. At a chunk it cannot read at all it stops, keeps what came
-before it, and exits 2. `export --entry` writes the whole entry and refuses `--offset`
-and `--length`.
+hash, unreached AD1 bytes, a differing set GUID or a chunk table with no copy that
+passes); `verify(keep_going=True)` returns the result instead. `export` does not refuse
+damaged data: it writes what it reads, warns on stderr and exits 1 when what it wrote
+came from a damaged chunk or table, or from a set whose segments disagree. At a chunk it
+cannot read at all it stops, keeps what came before it, and exits 2. `export --entry`
+writes the whole entry and refuses `--offset` and `--length`.
 
 Some damage is read rather than refused, as earlier versions read it: an E01, SMART or
 Ex01 chunk whose zlib stream is cut or gives fewer bytes than the chunk covers, a stored
