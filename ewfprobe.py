@@ -93,6 +93,7 @@ import getpass
 import hashlib
 import hmac
 import io
+import operator
 import os
 import plistlib
 import re
@@ -4590,6 +4591,14 @@ class EwfImage:
         if not found:
             raise EwfFormatError(f"no {kind} entry has the path {path!r}")
         if match is not None:
+            try:
+                if isinstance(match, bool):
+                    raise TypeError
+                match = operator.index(match)
+            except TypeError:
+                raise EwfFormatError(f"a match number picks one {kind} entry by its "
+                                     f"place, so it is a whole number, not "
+                                     f"{match!r}") from None
             if not 1 <= match <= len(found):
                 raise EwfFormatError(f"{len(found):,} {kind} entries have the path "
                                      f"{path!r}, so a match from 1 to {len(found):,} "
