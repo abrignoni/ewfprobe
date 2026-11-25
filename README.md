@@ -45,6 +45,7 @@ ewfprobe verify  image.aff4       # and the hashes an AFF4 records about its str
 ewfprobe files   evidence.L01     # an L01's entries: kind, size, stored MD5, path
 ewfprobe export  evidence.L01 --entry "Folder/photo.jpg" -o photo.jpg
 ewfprobe files   evidence.ad1     # an AD1's entries, with their item types
+ewfprobe export  evidence.ad1 --entry "Folder/a.txt" --match 2 -o a.txt  # a path two entries share
 ewfprobe verify  evidence.ad1     # FTK Imager's image hash, and every entry's
 ewfprobe info    --password-file pw.txt encrypted.dmg
 ewfprobe verify  --password-env CASE_PW evidence.E01   # FTK Imager AD encryption
@@ -270,6 +271,14 @@ column exactly as the ltree stores it. `open_entry()` gives an entry's content a
 a seekable file and `read_entry()` reads it whole. `ewfprobe files` lists the
 entries, `ewfprobe export --entry` writes one out, and `verify` reads every entry
 and checks each MD5 and SHA-1 EnCase stored for it.
+
+An image can hold more than one entry at a path (an AD1 can hold a live file and a
+deleted one, for example). `find_entry(path)` then raises `EwfAmbiguousEntryError`,
+which names each match with its kind, size and stored MD5, and `find_entry(path,
+match=n)` picks the nth in tree order, counted from 1. `export --entry` does the same:
+it refuses such a path and lists the matches, and `--match n` writes one. Up to 0.17.3,
+the first in tree order was returned and nothing said another existed. `export` also
+refuses a negative `--offset` or `--length` and an offset past the end of the image.
 
 Lx01, the EWF2 logical evidence EnCase 7 and later write, opens the same way, in
 segments named `.Lx01`, `.Lx02` and on, with the same entries and the same calls.

@@ -424,3 +424,80 @@ def test_pyad1s_sample_from_ftk_imager_3_4():
                                 "SHA1": "0608982ed40664ec922f1991ac7ccf07d239ada1"}
     assert result["match"] is True
     assert result["entry_sha1_checked"] == 8 and not result["entry_sha1_mismatched"]
+
+
+# ---- one path, two entries (issue 35) ------------------------------------------
+
+KNOWN = "U:\\:AD1LEAN [NTFS]/[root]/known"
+
+
+def _collide(img):
+    """Give the deleted file of the multi-source image the name of the live file beside
+    it, so two real entries, with their own content, share one path. No fixture FTK
+    Imager wrote holds such a pair, though an AD1 can."""
+    gone = next(e for e in img.logical_entries if e.path == f"{KNOWN}/to-delete.txt")
+    if gone._names is None:
+        gone._name = "readme.txt"
+    else:
+        gone._names = gone._names[:-1] + ("readme.txt",)
+    return gone
+
+
+def test_a_path_two_entries_share_is_refused_and_each_can_be_picked():
+    with _open(MULTI) as img:
+        gone = _collide(img)
+        live = next(e for e in img.logical_entries
+                    if e.path == f"{KNOWN}/readme.txt" and e is not gone)
+        with pytest.raises(ewfprobe.EwfAmbiguousEntryError) as caught:
+            img.find_entry(f"{KNOWN}/readme.txt")
+        said = str(caught.value)
+        assert "2 AD1 entries have the path" in said and "match 2: file, deleted" in said
+        assert caught.value.matches == [e for e in img.logical_entries
+                                        if e.path == f"{KNOWN}/readme.txt"]
+        picked = {img.find_entry(f"{KNOWN}/readme.txt", n) for n in (1, 2)}
+        assert picked == {live, gone}
+        assert img.read_entry(img.find_entry(f"{KNOWN}/readme.txt", 2)) == \
+            img.read_entry(gone)
+        with pytest.raises(ewfprobe.EwfFormatError, match="from 1 to 2"):
+            img.find_entry(f"{KNOWN}/readme.txt", 3)
+        # a path one entry holds is found as before, with or without a match number
+        assert img.find_entry(f"{KNOWN}/readme.txt/extra").name == "extra"
+
+
+def test_export_of_a_shared_path_needs_a_match(capsys, tmp_path, monkeypatch):
+    index = ewfprobe.EwfImage._index_ad1
+
+    def colliding(self):
+        index(self)
+        _collide(self)
+
+    monkeypatch.setattr(ewfprobe.EwfImage, "_index_ad1", colliding)
+    out = tmp_path / "picked.bin"
+    path = f"{KNOWN}/readme.txt"
+    assert ewfprobe.main(["export", MULTI, "--entry", path, "-o", str(out)]) == 2
+    err = capsys.readouterr().err
+    assert "pick one by its match number" in err and "match 1:" in err and not out.exists()
+    for n in (1, 2):
+        assert ewfprobe.main(["export", MULTI, "--entry", path, "--match", str(n),
+                              "-o", str(out)]) == 0
+        with _open(MULTI) as img:                    # opened through the patch too
+            assert out.read_bytes() == img.read_entry(img.find_entry(path, n))
+    assert ewfprobe.main(["export", MULTI, "--match", "1", "-o", str(out)]) == 2
+    assert "--match picks among" in capsys.readouterr().err
+
+
+def test_export_refuses_a_negative_offset_or_length_and_an_offset_past_the_end(
+        capsys, tmp_path):
+    out = tmp_path / "raw.bin"
+    image = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+    e01 = next(os.path.join(root, f) for root, _d, files in os.walk(image)
+               for f in sorted(files) if f.lower().endswith(".e01"))
+    with ewfprobe.open_ewf(e01) as img:
+        size = img.media_size
+    for argv, said in ((["--offset", "-1"], "cannot be negative"),
+                       (["--length", "-5"], "cannot be negative"),
+                       (["--offset", str(size + 1)], "past the end")):
+        assert ewfprobe.main(["export", e01, *argv, "-o", str(out)]) == 2, argv
+        assert said in capsys.readouterr().err
+    assert ewfprobe.main(["export", e01, "--offset", str(size), "-q", "-o", str(out)]) == 0
+    assert out.read_bytes() == b""

@@ -508,6 +508,15 @@ class EwfFormatError(EwfError):
     """The bytes are not a valid EWF image, or carry something unsupported."""
 
 
+class EwfAmbiguousEntryError(EwfFormatError):
+    """More than one logical entry has the path asked for. ``matches`` holds them in
+    tree order; ``find_entry(path, match=n)`` picks the nth, counted from 1."""
+
+    def __init__(self, message, matches=()):
+        super().__init__(message)
+        self.matches = list(matches)
+
+
 class EwfIncompleteSetError(EwfError):
     """A segment of a multi-segment acquisition is missing.
 
@@ -4568,15 +4577,35 @@ class EwfImage:
         with self.open_entry(entry) as fh:
             return fh.read()
 
-    def find_entry(self, path):
-        """The first L01, Lx01 or AD1 entry, in tree order, whose path (its names joined by
-        "/") is ``path``."""
+    def find_entry(self, path, match=None):
+        """The L01, Lx01 or AD1 entry whose path (its names joined by "/") is ``path``.
+
+        An image can hold several entries at one path, an AD1 a live file and a deleted
+        one for example. Then ``match`` picks one, counted from 1 in tree order, and
+        without it ``EwfAmbiguousEntryError`` is raised naming each, so the first is
+        never handed back in place of the one asked for."""
         path = path.strip("/")
-        for entry in self.logical_entries:
-            if entry.path == path:
-                return entry
         kind = {FORMAT_AD1: "AD1", FORMAT_LX01: "Lx01"}.get(self.format, "L01")
-        raise EwfFormatError(f"no {kind} entry has the path {path!r}")
+        found = [entry for entry in self.logical_entries if entry.path == path]
+        if not found:
+            raise EwfFormatError(f"no {kind} entry has the path {path!r}")
+        if match is not None:
+            if not 1 <= match <= len(found):
+                raise EwfFormatError(f"{len(found):,} {kind} entries have the path "
+                                     f"{path!r}, so a match from 1 to {len(found):,} "
+                                     f"picks one, not {match}")
+            return found[match - 1]
+        if len(found) == 1:
+            return found[0]
+        lines = []
+        for n, entry in enumerate(found, 1):
+            what = ("folder" if entry.is_folder else "file") + (
+                ", deleted" if getattr(entry, "is_deleted", False) else "")
+            lines.append(f"  match {n}: {what}, {entry.size:,} bytes, md5 "
+                         f"{entry.md5 or '-'}")
+        raise EwfAmbiguousEntryError(
+            f"{len(found):,} {kind} entries have the path {path!r}; pick one by its "
+            f"match number:\n" + "\n".join(lines), found)
 
     def _walk_aff(self, i):
         """One AFF file's segments, walked once: where each page is, and the content
@@ -8880,10 +8909,20 @@ def _warn_damage(what, damage):
 
 
 def _cmd_export(args):
+    if args.match is not None and args.entry is None:
+        raise EwfError("--match picks among the entries of an --entry path")
     if args.entry is not None:
         return _export_entry(args)
+    if args.offset < 0:
+        raise EwfError(f"--offset is {args.offset:,}; it counts bytes from the start, "
+                       f"so it cannot be negative")
+    if args.length is not None and args.length < 0:
+        raise EwfError(f"--length is {args.length:,}; it cannot be negative")
     with _open_cli(args) as img:
         total = img.media_size
+        if args.offset > total:
+            raise EwfError(f"--offset {args.offset:,} is past the end of the "
+                           f"{total:,}-byte image")
         img.seek(args.offset)
         remaining = total - args.offset if args.length is None else args.length
         out = sys.stdout.buffer if args.output == "-" else open(args.output, "wb")
@@ -8929,7 +8968,7 @@ def _export_entry(args):
         raise EwfError("--offset and --length apply to an export of the whole image; "
                        "--entry writes the whole entry, so use one or the other")
     with _open_cli(args) as img:
-        entry = img.find_entry(args.entry)
+        entry = img.find_entry(args.entry, args.match)
         with img.open_entry(entry) as fh:
             out = sys.stdout.buffer if args.output == "-" else open(args.output, "wb")
             done = 0
@@ -8988,6 +9027,9 @@ def main(argv=None):
     s.add_argument("--entry", default=None,
                    help="the path of an L01, Lx01 or AD1 entry, as the files command "
                         "lists it")
+    s.add_argument("--match", type=int, default=None,
+                   help="when several entries have the --entry path, the one to write, "
+                        "counted from 1 in the order the files command lists them")
     s.add_argument("-o", "--output", default="-", help="output file, or - for stdout")
     s.add_argument("--offset", type=int, default=0,
                    help="start at this byte offset (not with --entry)")
