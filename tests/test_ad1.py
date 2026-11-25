@@ -501,3 +501,13 @@ def test_export_refuses_a_negative_offset_or_length_and_an_offset_past_the_end(
         assert said in capsys.readouterr().err
     assert ewfprobe.main(["export", e01, "--offset", str(size), "-q", "-o", str(out)]) == 0
     assert out.read_bytes() == b""
+
+
+def test_a_match_that_is_not_a_whole_number_is_refused_as_a_format_error():
+    """Issue 40: a float, a string or a bool raised TypeError from the list index."""
+    with _open(MULTI) as img:
+        _collide(img)
+        for bad in (1.0, "1", True, None.__class__):
+            with pytest.raises(ewfprobe.EwfFormatError, match="a whole number"):
+                img.find_entry(f"{KNOWN}/readme.txt", bad)
+        assert img.find_entry(f"{KNOWN}/readme.txt", 2).is_deleted
