@@ -114,7 +114,7 @@ try:
 except ImportError:
     lzma = None
 
-__version__ = "0.17.3"
+__version__ = "0.17.4"
 
 # ---------------------------------------------------------------- constants
 
